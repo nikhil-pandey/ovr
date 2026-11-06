@@ -1,0 +1,37 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    "customManagers:githubActionsVersions"
+  ],
+  "rangeStrategy": "bump",
+  "lockFileMaintenance": {
+    "enabled": true
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Rust toolchain for rules_rust and the crate MSRV; rust-toolchain.toml is handled natively",
+      "managerFilePatterns": [
+        "/^MODULE\\.bazel$/",
+        "/^Cargo\\.toml$/"
+      ],
+      "matchStrings": [
+        "versions = \\[\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\"\\]",
+        "rust-version = \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
+      ],
+      "depNameTemplate": "rust",
+      "packageNameTemplate": "rust-lang/rust",
+      "datasourceTemplate": "github-releases"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchDepNames": [
+        "rust"
+      ],
+      "groupName": "Rust toolchain"
+    }
+  ]
+}

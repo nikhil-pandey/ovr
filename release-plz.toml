@@ -1,0 +1,26 @@
+# Release PRs bump the shared version and CHANGELOG.md. Merging one tags `v<version>`; the release workflow then
+# publishes with GoReleaser. Versions come from git tags, and nothing is published to crates.io.
+[workspace]
+git_only = true
+git_release_enable = false
+git_tag_name = "v{{ version }}"
+git_tag_enable = false
+release_always = false
+semver_check = false
+changelog_update = false
+
+[[package]]
+name = "ovr"
+git_tag_enable = true
+changelog_update = true
+changelog_path = "CHANGELOG.md"
+changelog_include = ["ovrd", "ovr-proto"]
+version_group = "ovr"
+
+[[package]]
+name = "ovrd"
+version_group = "ovr"
+
+[[package]]
+name = "ovr-proto"
+version_group = "ovr"

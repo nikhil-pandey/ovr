@@ -1,0 +1,155 @@
+name: CI
+
+# Pull requests run the full checks. Pushes to main only refresh the caches pull requests restore from: Bazel runs
+# its tests too, because it caches test results; Cargo only compiles.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # renovate: datasource=pypi depName=ziglang
+  ZIG_VERSION: 0.17.1
+  # renovate: datasource=crate depName=cargo-zigbuild
+  CARGO_ZIGBUILD_VERSION: 0.24.1
+  # renovate: datasource=github-releases depName=goreleaser/goreleaser
+  GORELEASER_VERSION: v2.20.0
+
+# GitHub scopes caches saved by a pull request to that pull request, so only main's caches are shared, and a branch
+# cannot poison them.
+jobs:
+  # Every platform a release ships for, tested natively.
+  cargo:
+    name: cargo (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, ubuntu-26.04-arm, macos-26, macos-26-intel, windows-2025-vs2026, windows-11-vs2026-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+      - if: github.event_name == 'pull_request' && matrix.os == 'ubuntu-26.04'
+        run: cargo fmt --all --check
+      - if: github.event_name == 'pull_request'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - if: github.event_name == 'pull_request'
+        run: cargo test --workspace --locked
+      - if: github.event_name == 'push'
+        run: |
+          cargo clippy --workspace --all-targets --locked
+          cargo test --workspace --locked --no-run
+
+  # The release build, exactly as the release workflow runs it, without publishing.
+  dist:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
+        with:
+          tool: cargo-zigbuild@${{ env.CARGO_ZIGBUILD_VERSION }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: zigbuild
+          cache-on-failure: true
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          version: ${{ env.GORELEASER_VERSION }}
+          args: release --snapshot --clean
+      - if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.deb
+            dist/*.rpm
+          retention-days: 3
+
+  # Installs each release artifact on the OS it targets and runs it.
+  smoke:
+    name: smoke (${{ matrix.name }})
+    if: github.event_name == 'pull_request'
+    needs: dist
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: ubuntu x64 deb, os: ubuntu-26.04, target: x86_64-unknown-linux-musl, pkg: deb }
+          - { name: ubuntu arm64 deb, os: ubuntu-26.04-arm, target: aarch64-unknown-linux-musl, pkg: deb }
+          - name: azure linux x64 rpm
+            os: ubuntu-26.04
+            target: x86_64-unknown-linux-musl
+            pkg: rpm
+            container: mcr.microsoft.com/azurelinux/base/core:3.0
+          - name: azure linux arm64 rpm
+            os: ubuntu-26.04-arm
+            target: aarch64-unknown-linux-musl
+            pkg: rpm
+            container: mcr.microsoft.com/azurelinux/base/core:3.0
+          - { name: macos arm64, os: macos-26, target: aarch64-apple-darwin, pkg: tar.gz }
+          - { name: macos x64, os: macos-26-intel, target: x86_64-apple-darwin, pkg: tar.gz }
+          - { name: windows x64, os: windows-2025-vs2026, target: x86_64-pc-windows-gnu, pkg: zip }
+          - { name: windows arm64, os: windows-11-vs2026-arm, target: aarch64-pc-windows-gnullvm, pkg: zip }
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    env:
+      ASSET: dist/ovr-${{ matrix.target }}.${{ matrix.pkg }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - if: matrix.pkg == 'deb'
+        run: sudo dpkg -i "$ASSET"
+      - if: matrix.pkg == 'rpm'
+        run: rpm -i "$ASSET"
+      - if: matrix.pkg == 'tar.gz'
+        run: |
+          mkdir bin && tar -xzf "$ASSET" -C bin
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+      - if: matrix.pkg == 'zip'
+        shell: pwsh
+        run: |
+          Expand-Archive $env:ASSET bin
+          "$PWD\bin" >> $env:GITHUB_PATH
+      - run: ovr --version && ovrd --version
+
+  bazel:
+    name: bazel (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, macos-26]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
+        with:
+          bazelisk-cache: true
+          disk-cache: true
+          external-cache: true
+          repository-cache: true
+          bazelrc: |
+            common --color=yes
+            build --experimental_disk_cache_gc_max_size=2G
+            build --experimental_disk_cache_gc_idle_delay=0
+      - run: bazel test //...

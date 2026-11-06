@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+license = "MIT"
+repository = "https://github.com/nikhil-pandey/ovr"
+
+[workspace.dependencies]
+ovr-proto = { path = "crates/ovr-proto", version = "0.1.0" }
+
+clap = "4.6.7"
+crossterm = "0.29.0"
+ed25519-dalek = "3.0.0"
+fd-lock = "4.0.4"
+miette = "7.6.0"
+portable-pty = "0.9.0"
+rustls = { version = "0.23.46", default-features = false }
+serde = "1.0.229"
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = "1.54.1"
+tokio-rustls = { version = "0.26.6", default-features = false }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false }
+windows-sys = "0.61.2"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+expect_used = "deny"
+panic = "deny"
+unwrap_used = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true

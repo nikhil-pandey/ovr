@@ -1,0 +1,6 @@
+common --enable_platform_specific_config
+build --incompatible_strict_action_env
+build -c opt
+test --test_output=errors
+
+try-import %workspace%/user.bazelrc

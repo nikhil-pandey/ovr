@@ -1,0 +1,20 @@
+[package]
+name = "ovr"
+description = "Run your builds over there"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ovr-proto.workspace = true
+
+clap = { workspace = true, features = ["derive"] }
+crossterm.workspace = true
+miette = { workspace = true, features = ["fancy"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt", "signal"] }
+
+[lints]
+workspace = true

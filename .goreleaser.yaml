@@ -1,0 +1,51 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# Cross-compiles every target from one Linux runner with cargo-zigbuild. Asset names carry no version so that
+# `releases/latest/download/...` URLs in the install scripts stay stable.
+version: 2
+project_name: ovr
+
+builds:
+  - id: ovr
+    builder: rust
+    binary: ovr
+    flags: [--release, --locked, --package=ovr]
+    targets: &targets
+      - x86_64-unknown-linux-musl
+      - aarch64-unknown-linux-musl
+      - x86_64-apple-darwin
+      - aarch64-apple-darwin
+      - x86_64-pc-windows-gnu
+      - aarch64-pc-windows-gnullvm
+  - id: ovrd
+    builder: rust
+    binary: ovrd
+    flags: [--release, --locked, --package=ovrd]
+    targets: *targets
+
+archives:
+  - name_template: "{{ .ProjectName }}-{{ .Target }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files: [LICENSE]
+
+nfpms:
+  - file_name_template: "{{ .ProjectName }}-{{ .Target }}"
+    formats: [deb, rpm]
+    maintainer: Nikhil Pandey <nikhil-pandey@users.noreply.github.com>
+    description: Run your builds over there.
+    homepage: https://github.com/nikhil-pandey/ovr
+    license: MIT
+    bindir: /usr/bin
+
+checksum:
+  name_template: SHA256SUMS
+
+changelog:
+  use: github-native
+
+release:
+  extra_files:
+    - glob: install.sh
+    - glob: install.ps1
