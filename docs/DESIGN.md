@@ -253,14 +253,15 @@ allowed on the critical path. Every decision below exists to hit that.
   **parentless commit** over the working tree, so the first sync sends exactly the working tree (compressed, ~size of
   a source tarball), never the repository's history. A ten-year monorepo costs the same as a fresh one.
 - **Thin packs, not bundles.** New objects go out as `git pack-objects --thin --shallow --stdout --revs` with input
-  `<snapshot>\n^<previous snapshot>`. Snapshots have no parents, so `--shallow` is what makes the previous
-  snapshot's trees and blobs count as already sent; without it every changed sync would resend the whole tree. Thin
-  packs may delta against objects the receiver already has, so editing one line of a 1 MB file sends a few bytes of
+  `<snapshot>\n^<base>\n...`, one line for each of up to four bases: the distinct snapshots the host confirmed most
+  recently. Snapshots have no parents, so `--shallow` is what makes the bases' trees and blobs count as already
+  sent; without it every changed sync would resend the whole tree. Objects in any base are left out, so switching
+  branches `A -> B -> A` sends nothing on the return. Thin packs may delta against objects the receiver already has, so editing one line of a 1 MB file sends a few bytes of
   delta, not a recompressed blob. The remote runs `git index-pack --stdin --fix-thin`, which writes a pack directly;
   no loose objects, no `git fetch`, no refs negotiation. The host logs each sync with its checkout, the bytes
   received, and how long receiving and applying took.
-- **Nothing when nothing changed.** If the snapshot tree equals the tree last sent to this host, no pack is built
-  and zero bytes of sync cross the wire; the exec request goes immediately.
+- **Nothing when nothing changed.** If the snapshot equals one of the bases, no pack is built and zero bytes of sync
+  cross the wire; the exec request goes immediately.
 - **Already compressed.** Pack data is zlib-compressed by Git, so SSH compression is disabled and the TLS transport
   does no compression either.
 - **`.gitignore` is the filter.** `git add -A` skips ignored files, so `target/`, `bazel-*`, `bin/`, `obj/`,
@@ -281,7 +282,7 @@ allowed on the critical path. Every decision below exists to hit that.
    unchanged directory costs one `stat`. Only files whose stat changed are rehashed. Where Git's builtin fsmonitor
    is available (macOS, Windows) and enabled in the repository, `git add` uses it and the walk disappears entirely.
 3. `git write-tree`, then `git commit-tree <tree>` with no parent. Nothing touches your branches, `HEAD`, stash, or
-   reflog; snapshots are reachable only from `refs/ovr/`, and all but the latest per host are collected by your
+   reflog; snapshots are reachable only from `refs/ovr/`, and all but the bases of each host are collected by your
    normal `git gc`.
 
 Concurrent `ovr` invocations in one repository take snapshots one at a time under a lock on `.git/ovr/lock`, which
@@ -294,30 +295,39 @@ orders them.
 ```
  t0  ovr: connect to ovrd socket; ovrd: open/reuse host stream ────────┐  (overlaps the snapshot)
  t0  ovr: snapshot: add -A, write-tree, commit-tree                    │
- t1  HELLO{checkout, seq, base, snapshot} ─────────────────────────────►┼─► agent: WELCOME{ok | rebase{have}}
- t1  PACK frames (speculative, vs base) ──────────────────────────────►┼─► agent: index-pack as frames arrive
+ t1  HELLO{checkout, seq, bases, snapshot} ────────────────────────────►┼─► agent: WELCOME{ok | rebase{have}}
+ t1  PACK frames (speculative, vs bases) ─────────────────────────────►┼─► agent: index-pack as frames arrive
  t2  EXEC{argv, cwd, tty, cols, rows} ────────────────────────────────►┼─► agent: apply, SYNCED, start keeper, ATTACHED{run}
      ◄── OUT/ERR frames ... ◄── EXIT{code} ────────────────────────────┘
 ```
 
-- **Speculative send.** `ovr` records, per host, the last snapshot the host confirmed with `SYNCED` as a ref,
-  `refs/ovr/hosts/<host>/<checkout>`, so your local `git gc` cannot prune the delta base out from under the next
-  run (losing it would silently degrade to a full-tree send). It assumes the host still has it and streams the thin
-  pack immediately after `HELLO` without waiting for the reply. The agent answers `WELCOME` as soon as it reads
-  `HELLO`. Without a base (first contact) the pack is already full and the answer is `ok`.
-- **Base recovery.** When the host lacks the base, as after a lost `SYNCED` or a deleted checkout, it answers
+- **Speculative send.** `ovr` records, per host and checkout, the last four distinct snapshots the host confirmed
+  with `SYNCED`, most recent first, as refs `refs/ovr/bases/<host>/<checkout>/<0-3>`, so your local `git gc` cannot
+  prune a delta base out from under the next run (losing it would silently degrade to a full-tree send). A
+  confirmed snapshot moves to the front, so repeating a run takes no other base's slot, and the least recent falls
+  off. It assumes the host still has every base and streams the thin pack immediately after `HELLO` without waiting
+  for the reply. The agent answers `WELCOME` as soon as it reads `HELLO`. Without bases (first contact) the pack is
+  already full and the answer is `ok`.
+- **The host keeps the bases too.** Applying a snapshot makes it the most recent of the checkout's four
+  `refs/ovr/kept/<0-3>`, under the apply lock and before `SYNCED`, even when a newer snapshot stays checked out. The
+  refs keep the snapshots from collection, so the two sets usually match. They need not, as when a `SYNCED` is
+  lost; a mismatch costs a recovery, never a pack against a missing base.
+- **Base recovery.** When the host lacks any base, as after a lost `SYNCED` or a deleted checkout, it answers
   `rebase{have}`, naming the newest snapshot the checkout applied (recorded in its `.git/ovr-applied`) if it still
   has it, and discards the speculative pack and its `EXEC`. The client then sends a thin pack against `have`, once
   it has checked that `have` is an object ID of a commit it still has; nothing at all when `have` is this run's
   snapshot; and otherwise, as when the checkout is gone or `git gc` pruned `have` locally, a full pack. Then it
-  sends `EXEC` again. The common case pays zero extra round trips; a stale base pays one, and usually a small pack.
+  sends `EXEC` again. After such a sync `ovr` records only the snapshot and `have` as bases, the two the host is
+  known to hold. The common case pays zero extra round trips; a stale base pays one, and usually a small pack.
   Reading applied state takes the apply lock, so a concurrent reset cannot leave recovery reading a partial record.
   From base validation through applying the received snapshot, each sync holds a shared `.git/ovr-gc.lock`;
   automatic collection takes it exclusively. Concurrent syncs still receive and apply without waiting for each
-  other's transfers, and cannot lose an accepted or offered base to automatic collection.
-- **A failed sync keeps the base.** An error before `SYNCED` leaves the host's ref alone: the host may have applied
+  other's transfers, and cannot lose an accepted or offered base to automatic collection, even when a concurrent
+  sync evicts it from the kept snapshots.
+- **A failed sync keeps the bases.** An error before `SYNCED` leaves the host's refs alone: the host may have applied
   the snapshot before the reply was lost, and a concurrent run may just have recorded a newer base. The next
-  run's `HELLO` lets the host tell.
+  run's `HELLO` lets the host tell. Concurrent runs read and rewrite the bases under a lock per host and checkout in
+  `.git/ovr/bases/`, held only for that, and rewrite them in one ref transaction, so neither loses the other's.
 - **Pipelined.** `EXEC` follows the pack on the same stream, so the agent starts the command the moment checkout
   finishes without another exchange.
 - **Connections outlive runs.** SSH agents stay up for ten minutes; dial-in connections stay up indefinitely. A
@@ -328,12 +338,12 @@ orders them.
   answers `ERROR` and then reads and discards the rest of the stream, and the client listens to the agent while
   it sends. Either side alone keeps a pack larger than the stream's window from stalling forever on a host that
   stopped reading.
-- **Nothing to record when nothing changed.** After `SYNCED`, `ovr` moves the host's ref to the snapshot only when
-  it differs from the base, so an unchanged tree runs no `git update-ref`.
+- **Nothing to record when nothing changed.** After `SYNCED`, `ovr` rewrites the host's refs only when that changes
+  them, so an unchanged tree runs no `git update-ref`.
 - **Timed.** The client emits `debug` events for the wall-clock time from starting the run to `ATTACHED` and for
-  each phase: opening the host stream, waiting for the snapshot lock, building the snapshot, looking up the base,
+  each phase: opening the host stream, waiting for the snapshot lock, building the snapshot, looking up the bases,
   producing and sending each pack (with its bytes, and whether it was full or cut short by `rebase`), receiving
-  `SYNCED`, recording the base, and receiving `ATTACHED`. Events carry the host, plus the checkout and snapshot
+  `SYNCED`, recording the bases, and receiving `ATTACHED`. Events carry the host, plus the checkout and snapshot
   sequence during sync, and the run number once attached, to match the host's log.
   Phases overlap, so they do not add up to the total, and time until `SYNCED` includes the host's work. The CLI
   installs no subscriber, so its output is unchanged; to see them, run the developer example
@@ -355,10 +365,10 @@ them, exactly as they would when you save files locally mid-build.
    outputs are never touched because they are not in either tree. Tracked files the host changed, for example a
    build rewriting a lockfile, are restored even when the snapshot itself is unchanged: the initiator is the source
    of truth.
-3. Reflogs are off in the checkout, so the previous snapshot becomes unreachable at once. After a command exits,
-   its keeper runs `git gc --auto` unless a sync or another collection holds the object lock. Collection stays
-   under that lock until Git finishes, alongside draining clients; a new sync waits for an already-running
-   collection before validating its base.
+3. Reflogs are off in the checkout, so a snapshot becomes unreachable once it is neither checked out nor among the
+   four kept. After a command exits, its keeper runs `git gc --auto` unless a sync or another collection holds the
+   object lock. Collection stays under that lock until Git finishes, alongside draining clients; a new sync waits
+   for an already-running collection before validating its bases.
 
 The remote never runs `git clean`. The reset already removes files that left the snapshot, and anything the build
 creates that is not tracked stays, exactly as it would locally.
@@ -413,7 +423,7 @@ never touches what is in use:
   be deleted from the trash is retried by the next clean.
 - Agents uploaded over SSH for other versions are removed from `~/.cache/ovr/bin`, and on the initiator, agents
   downloaded for other versions.
-- For each host cleaned, `ovr` forgets the snapshots it recorded for that host in the current repository, so the next
+- For each host cleaned, `ovr` forgets the bases it recorded for that host in the current repository, so the next
   run sends everything without guessing first, including when some checkouts were kept because they were in use.
   Other repositories find out from the host's `WELCOME`.
 

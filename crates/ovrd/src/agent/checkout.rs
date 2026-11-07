@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
-use ovr_proto::git;
+use ovr_proto::{git, retained};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, Command};
 
@@ -16,6 +16,8 @@ pub const LOCKS: &str = ".locks";
 /// In a checkout's Git directory: `<seq> <commit>` of the newest snapshot applied.
 const APPLIED: &str = "ovr-applied";
 const GC_LOCK: &str = "ovr-gc.lock";
+/// Snapshots synced most recently, kept so that the initiator can pack against any of them.
+const KEPT: &str = "refs/ovr/kept/";
 
 pub struct Checkout {
     dir: PathBuf,
@@ -81,6 +83,12 @@ impl Checkout {
         git::has_commit(&self.dir, commit).await
     }
 
+    /// Whether the object database has every one of `commits`.
+    pub async fn has_commits(&self, commits: &[String]) -> bool {
+        let found = git::commits(&self.dir, commits).await;
+        commits.iter().all(|commit| found.contains(commit))
+    }
+
     /// The newest snapshot applied here, if the checkout still has it: what a client lacking its base can send a
     /// pack against instead.
     ///
@@ -108,7 +116,8 @@ impl Checkout {
     }
 
     /// Checks out the newest snapshot this checkout has seen as `HEAD`: `snapshot`, numbered `seq`, or one with a
-    /// higher number that a concurrent run already applied, so a run that arrives late never rolls edits back. Only
+    /// higher number that a concurrent run already applied, so a run that arrives late never rolls edits back. Either
+    /// way `snapshot` becomes the most recent of the snapshots kept for the initiator to pack against. Only
     /// files whose content differs are rewritten, so unchanged files keep their timestamps; tracked files changed on
     /// the host are restored: the initiator is the source of truth. Commands already running carry on.
     ///
@@ -135,6 +144,8 @@ impl Checkout {
         if newest {
             std::fs::write(git_dir.join(APPLIED), format!("{seq} {snapshot}\n"))?;
         }
+        let kept = retained::read(&self.dir, KEPT).await?;
+        retained::keep(&self.dir, KEPT, &kept, snapshot, &kept).await?;
         if !self.dir.join(".gitmodules").is_file() {
             return Ok(None);
         }

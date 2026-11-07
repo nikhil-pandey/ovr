@@ -11,6 +11,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ovr_proto::git::{self, lock};
 use ovr_proto::msg::Hello;
+use ovr_proto::retained;
 use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdout;
 
@@ -29,6 +30,8 @@ const IDENTITY: [(&str, &str); 6] = [
 #[derive(Debug)]
 pub struct Snapshot {
     root: PathBuf,
+    /// `ovr`'s state in the Git directory: `<git-dir>/ovr`.
+    state: PathBuf,
     /// The basename of the repository root.
     repo: String,
     /// Current directory relative to the repository root, `/`-separated with a trailing slash, or empty.
@@ -103,6 +106,7 @@ impl Snapshot {
 
         Ok(Self {
             root,
+            state,
             repo,
             prefix,
             commit: commit.trim().to_owned(),
@@ -114,37 +118,32 @@ impl Snapshot {
     ///
     /// # Errors
     ///
-    /// Returns an error when Git fails.
+    /// Returns an error when the bases cannot be read.
     pub async fn deliver_to(&self, host: &str, initiator: &str) -> Result<Delivery<'_>, Error> {
         let mut key = initiator.as_bytes().to_vec();
         key.push(0);
         key.extend_from_slice(self.root.as_os_str().as_encoded_bytes());
         let checkout = format!("{}-{:08x}", self.repo, ovr_proto::fnv1a(&key) >> 32);
-        let host_ref = format!(
-            "refs/ovr/hosts/{}/{}",
-            ref_component(host),
-            ref_component(&checkout)
-        );
+        let (host, name) = (ref_component(host), ref_component(&checkout));
+        let refs = format!("refs/ovr/bases/{host}/{name}/");
+        let lock_file = self
+            .state
+            .join("bases")
+            .join(host)
+            .join(format!("{name}.lock"));
         let looked = Instant::now();
-        let base = git::run(
-            &self.root,
-            [
-                "rev-parse",
-                "-q",
-                "--verify",
-                &format!("{host_ref}^{{commit}}"),
-            ],
-        )
-        .await
-        .ok()
-        .map(|base| base.trim().to_owned());
-        tracing::debug!(elapsed = ?looked.elapsed(), %checkout, ?base, "looked up the base");
+        let bases = {
+            let _lock = lock_bases(&lock_file).await?;
+            retained::read(&self.root, &refs).await?
+        };
+        tracing::debug!(elapsed = ?looked.elapsed(), %checkout, ?bases, "looked up the bases");
         Ok(Delivery {
             snapshot: self,
             checkout,
             initiator: initiator.to_owned(),
-            base,
-            host_ref,
+            bases,
+            refs,
+            lock_file,
         })
     }
 }
@@ -156,10 +155,12 @@ pub struct Delivery<'a> {
     /// The host's checkout: `<repo>-<key>`, where the key hashes the initiator and the repository root.
     pub checkout: String,
     initiator: String,
-    /// The snapshot this host last acknowledged, if any.
-    pub base: Option<String>,
-    /// Records `base` per host and checkout, and keeps it from being collected by `git gc`.
-    host_ref: String,
+    /// The snapshots this host acknowledged most recently, newest first: what the pack is built against.
+    pub bases: Vec<String>,
+    /// Records the bases per host and checkout, and keeps them from being collected by `git gc`.
+    refs: String,
+    /// Held while reading or rewriting the bases.
+    lock_file: PathBuf,
 }
 
 impl Delivery<'_> {
@@ -168,14 +169,14 @@ impl Delivery<'_> {
         Hello {
             checkout: self.checkout.clone(),
             seq: self.snapshot.seq,
-            base: self.base.clone(),
+            bases: self.bases.clone(),
             snapshot: self.snapshot.commit.clone(),
             initiator: self.initiator.clone(),
         }
     }
 
-    /// Streams the objects of the snapshot that `base` lacks, or the whole snapshot without a base. Returns `None`
-    /// when there is nothing to send.
+    /// Streams the objects of the snapshot that none of `bases` has, or the whole snapshot without bases. Returns
+    /// `None` when there is nothing to send.
     ///
     /// Snapshots have no parents, and Git leaves out the trees and blobs of an excluded commit only when it is a
     /// parent of a sent one, unless told to look at every excluded commit with `--shallow`.
@@ -183,9 +184,9 @@ impl Delivery<'_> {
     /// # Errors
     ///
     /// Returns an error when `git pack-objects` cannot be started.
-    pub async fn pack(&self, base: Option<&str>) -> Result<Option<Pack>, Error> {
+    pub async fn pack(&self, bases: &[String]) -> Result<Option<Pack>, Error> {
         let commit = &self.snapshot.commit;
-        if base == Some(commit.as_str()) {
+        if bases.contains(commit) {
             return Ok(None);
         }
         let mut child = git::Child::spawn(
@@ -200,10 +201,12 @@ impl Delivery<'_> {
                 "-q",
             ],
         )?;
-        let revs = match base {
-            Some(base) => format!("{commit}\n^{base}\n"),
-            None => format!("{commit}\n"),
-        };
+        let mut revs = format!("{commit}\n");
+        for base in bases {
+            revs.push('^');
+            revs.push_str(base);
+            revs.push('\n');
+        }
         let mut stdin = child.stdin()?;
         stdin.write_all(revs.as_bytes()).await?;
         drop(stdin);
@@ -211,21 +214,19 @@ impl Delivery<'_> {
         Ok(Some(Pack { child, stdout }))
     }
 
-    /// Records that the host now has the snapshot, making it the base of the next run. Nothing to record when it
-    /// already is.
+    /// Records that the host now has the snapshot, making it the most recent base of the next run. The other bases
+    /// stay, unless the host lacked one of them: then only `recovered`, what this run's pack was built against
+    /// instead, is known to be on the host.
     ///
     /// # Errors
     ///
-    /// Returns an error when the ref cannot be updated.
-    pub async fn synced(&self) -> Result<(), Error> {
-        if self.base.as_ref() == Some(&self.snapshot.commit) {
-            return Ok(());
-        }
-        git::run(
-            &self.snapshot.root,
-            ["update-ref", &self.host_ref, &self.snapshot.commit],
-        )
-        .await?;
+    /// Returns an error when the refs cannot be updated.
+    pub async fn synced(&self, recovered: Option<&[String]>) -> Result<(), Error> {
+        let root = &self.snapshot.root;
+        let _lock = lock_bases(&self.lock_file).await?;
+        let current = retained::read(root, &self.refs).await?;
+        let rest = recovered.unwrap_or(&current);
+        retained::keep(root, &self.refs, &current, &self.snapshot.commit, rest).await?;
         Ok(())
     }
 
@@ -233,6 +234,14 @@ impl Delivery<'_> {
     pub async fn has(&self, commit: &str) -> bool {
         git::has_commit(&self.snapshot.root, commit).await
     }
+}
+
+/// Locks the bases of one host and checkout for reading or rewriting.
+async fn lock_bases(path: &Path) -> Result<std::fs::File, Error> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(lock(path.to_owned()).await?)
 }
 
 /// The next snapshot number: one more than the last, and at least the time in milliseconds, so numbering keeps
@@ -269,19 +278,14 @@ impl Pack {
     }
 }
 
-/// Maps a host or repository name onto characters that are always valid in a ref name component.
-/// Forgets what every checkout on `host` was last sent from the repository around `cwd`, if there is one, after the
-/// host's checkouts were removed.
+/// Forgets the bases of every checkout on `host` in the repository around `cwd`, if there is one, after the host's
+/// checkouts were removed.
 pub async fn forget_host(cwd: &Path, host: &str) {
-    let prefix = format!("refs/ovr/hosts/{}/", ref_component(host));
-    let Ok(refs) = git::run(cwd, ["for-each-ref", "--format=%(refname)", &prefix]).await else {
-        return;
-    };
-    for name in refs.lines() {
-        let _ = git::run(cwd, ["update-ref", "-d", name]).await;
-    }
+    let prefix = format!("refs/ovr/bases/{}/", ref_component(host));
+    let _ = retained::forget(cwd, &prefix).await;
 }
 
+/// Maps a host or repository name onto characters that are always valid in a ref name component.
 fn ref_component(name: &str) -> String {
     name.chars()
         .map(|c| {
@@ -351,26 +355,74 @@ mod tests {
 
         let first = Snapshot::take(root).await?;
         let to_box = first.deliver_to("user@box", "me").await?;
-        assert_eq!(to_box.base, None);
+        assert_eq!(to_box.bases, [] as [String; 0]);
         let again = Snapshot::take(root).await?;
         assert_eq!(again.commit, first.commit);
         assert!(again.seq > first.seq);
 
-        to_box.synced().await?;
+        to_box.synced(None).await?;
         std::fs::write(root.join("a"), "2")?;
         let second = Snapshot::take(root).await?;
         assert_ne!(second.commit, first.commit);
         let to_box = second.deliver_to("user@box", "me").await?;
-        assert_eq!(to_box.base.as_deref(), Some(first.commit.as_str()));
-        assert_eq!(second.deliver_to("other", "me").await?.base, None);
-        assert_eq!(second.deliver_to("user@box", "you").await?.base, None);
+        assert_eq!(to_box.bases, [first.commit]);
+        let none: [String; 0] = [];
+        assert_eq!(second.deliver_to("other", "me").await?.bases, none);
+        assert_eq!(second.deliver_to("user@box", "you").await?.bases, none);
         Ok(())
     }
 
-    async fn pack_len(snapshot: &Snapshot, base: Option<&str>) -> Result<usize, Error> {
+    #[tokio::test]
+    async fn bases_are_distinct_most_recent_first_and_bounded() -> Result<(), Error> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        run(root, &["init", "-q"]).await;
+        // Syncs a tree whose one file holds `content`, returning its snapshot.
+        let sync = async |content: &str, recovered: Option<&[String]>| {
+            std::fs::write(root.join("file"), content)?;
+            let snapshot = Snapshot::take(root).await?;
+            let delivery = snapshot.deliver_to("box", "me").await?;
+            delivery.synced(recovered).await?;
+            Ok::<_, Error>(snapshot.commit)
+        };
+        // The bases of the next run, by content.
+        let bases = async || {
+            let snapshot = Snapshot::take(root).await?;
+            let mut contents = Vec::new();
+            for base in snapshot.deliver_to("box", "me").await?.bases {
+                contents.push(run(root, &["show", &format!("{base}:file")]).await);
+            }
+            Ok::<_, Error>(contents)
+        };
+
+        sync("a", None).await?;
+        for _ in 0..=retained::KEPT {
+            sync("b", None).await?;
+        }
+        assert_eq!(bases().await?, ["b", "a"], "repeats take no slot");
+        for content in ["c", "a", "d", "e"] {
+            sync(content, None).await?;
+        }
+        assert_eq!(
+            bases().await?,
+            ["e", "d", "a", "c"],
+            "b was used least recently"
+        );
+
+        let c = sync("c", None).await?;
+        sync("f", Some(&[c])).await?;
+        assert_eq!(
+            bases().await?,
+            ["f", "c"],
+            "after recovery, only what the host had"
+        );
+        Ok(())
+    }
+
+    async fn pack_len(snapshot: &Snapshot, bases: &[String]) -> Result<usize, Error> {
         let delivery = snapshot.deliver_to("box", "me").await?;
         let mut pack = delivery
-            .pack(base)
+            .pack(bases)
             .await?
             .ok_or_else(|| io::Error::other("nothing to send"))?;
         let mut bytes = Vec::new();
@@ -402,8 +454,8 @@ mod tests {
         std::fs::write(root.join("src/new.rs"), "fn new() {}\n")?;
         let second = Snapshot::take(root).await?;
 
-        let full = pack_len(&second, None).await?;
-        let thin = pack_len(&second, Some(&first.commit)).await?;
+        let full = pack_len(&second, &[]).await?;
+        let thin = pack_len(&second, std::slice::from_ref(&first.commit)).await?;
         assert!(
             thin * 10 < full,
             "{thin} bytes against the base, {full} without"

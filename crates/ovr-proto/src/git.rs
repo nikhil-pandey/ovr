@@ -3,9 +3,9 @@
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 
 #[derive(Debug, thiserror::Error)]
@@ -48,12 +48,38 @@ where
         .stdin(Stdio::null())
         .output()
         .await?;
+    stdout(&args, output)
+}
+
+/// Runs `git` in `dir` with `input` on its stdin and returns its stdout.
+///
+/// # Errors
+///
+/// Returns an error when Git cannot be started, fails, or prints something other than UTF-8.
+pub async fn run_input(dir: &Path, args: &[&str], input: &[u8]) -> Result<String, Error> {
+    let mut child = command(dir, args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("git stdin is taken"))?;
+    let write = async move {
+        // Git may exit without reading everything; its status then explains why.
+        let _ = stdin.write_all(input).await;
+    };
+    let ((), output) = tokio::join!(write, child.wait_with_output());
+    stdout(args, output?)
+}
+
+fn stdout<S: AsRef<OsStr>>(args: &[S], output: Output) -> Result<String, Error> {
     if output.status.success() {
         String::from_utf8(output.stdout)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err).into())
     } else {
         Err(Error::Failed {
-            command: subcommand(&args),
+            command: subcommand(args),
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         })
     }
@@ -61,11 +87,37 @@ where
 
 /// Whether the repository in `dir` has commit `id`. Anything but a full object ID is never looked up.
 pub async fn has_commit(dir: &Path, id: &str) -> bool {
-    let object_id = matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit());
-    object_id
-        && run(dir, ["cat-file", "-e", &format!("{id}^{{commit}}")])
-            .await
-            .is_ok()
+    commits(dir, &[id.to_owned()]).await.len() == 1
+}
+
+/// Those of `ids` that are commits in the repository in `dir`, in order. Anything but a full object ID is never
+/// looked up, and nothing is found when Git fails.
+pub async fn commits(dir: &Path, ids: &[String]) -> Vec<String> {
+    let ids: Vec<&String> = ids
+        .iter()
+        .filter(|id| matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect();
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let input = ids
+        .iter()
+        .flat_map(|id| [id.as_str(), "\n"])
+        .collect::<String>();
+    let Ok(types) = run_input(
+        dir,
+        &["cat-file", "--batch-check=%(objecttype)"],
+        input.as_bytes(),
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+    ids.into_iter()
+        .zip(types.lines())
+        .filter(|(_, kind)| *kind == "commit")
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// A running `git` whose stdin and stdout the caller streams.

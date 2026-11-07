@@ -109,11 +109,12 @@ async fn start<S: AsyncRead + AsyncWrite>(
 ) -> Result<(Run, Option<std::fs::File>), Error> {
     let checkout = Checkout::open(&config.root, &hello.initiator, &hello.checkout).await?;
     let objects = checkout.hold_objects().await?;
-    let welcome = match &hello.base {
-        Some(base) if !checkout.has_commit(base).await => Welcome::Rebase {
+    let welcome = if checkout.has_commits(&hello.bases).await {
+        Welcome::Ok
+    } else {
+        Welcome::Rebase {
             have: checkout.newest().await?,
-        },
-        _ => Welcome::Ok,
+        }
     };
     writer
         .send(Frame::json(FrameKind::Welcome, &welcome)?)
@@ -312,7 +313,7 @@ mod tests {
         let hello = Hello {
             checkout: "repo-key".to_owned(),
             seq: 1,
-            base: None,
+            bases: Vec::new(),
             snapshot: "0".repeat(40),
             initiator: "me".to_owned(),
         };
