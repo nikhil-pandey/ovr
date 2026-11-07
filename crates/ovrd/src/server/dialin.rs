@@ -1,5 +1,6 @@
 //! The TLS listener dial-in hosts connect to, for pairing and then for serving runs.
 
+use std::net::Ipv4Addr;
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
@@ -42,6 +43,15 @@ pub async fn listen(server: Arc<Server>) {
         }
     };
     tracing::info!("listening for dial-in hosts on port {PORT}");
+    // Where the platform allows a more specific address beside the wildcard one (macOS), claim loopback too, so a
+    // `devtunnel connect` on this machine cannot take it and loop dial-ins to this server back into the tunnel.
+    if let Ok(loopback) = TcpListener::bind((Ipv4Addr::LOCALHOST, PORT)).await {
+        tokio::spawn(accept(loopback, Arc::clone(&server), acceptor.clone()));
+    }
+    accept(listener, server, acceptor).await;
+}
+
+async fn accept(listener: TcpListener, server: Arc<Server>, acceptor: TlsAcceptor) {
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(accepted) => accepted,

@@ -102,24 +102,40 @@ pub(crate) struct Server {
 }
 
 async fn handle(server: Arc<Server>, stream: ipc::ServerStream, restart: Arc<Notify>) {
+    /// Read on its own first, so a client of another version is told to restart even when its request is unknown here.
+    #[derive(serde::Deserialize)]
+    struct Versioned {
+        version: String,
+    }
+
     let mut stream = frame::framed(stream);
-    let request = match stream.next().await {
-        Some(Ok(frame)) => frame.expect::<Request>(FrameKind::Request),
+    let frame = match stream.next().await {
+        Some(Ok(frame)) => frame,
         None => return,
-        Some(Err(err)) => Err(err),
+        Some(Err(err)) => {
+            tracing::warn!(%err, "bad request");
+            return;
+        }
     };
-    let request = match request {
+    match frame.expect::<Versioned>(FrameKind::Request) {
+        Ok(versioned) if versioned.version == VERSION => {}
+        Ok(_) => {
+            let _ = respond(&mut stream, &Response::Restart).await;
+            restart.notify_one();
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(%err, "bad request");
+            return;
+        }
+    }
+    let request = match frame.expect::<Request>(FrameKind::Request) {
         Ok(request) => request,
         Err(err) => {
             tracing::warn!(%err, "bad request");
             return;
         }
     };
-    if request.version != VERSION {
-        let _ = respond(&mut stream, &Response::Restart).await;
-        restart.notify_one();
-        return;
-    }
     let response = match request.op {
         Op::Open { host } => match server.open(&host).await {
             Ok((mut channel, lease)) => {

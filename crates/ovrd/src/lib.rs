@@ -3,6 +3,8 @@
 pub mod agent;
 mod autostart;
 mod host;
+#[cfg(windows)]
+mod job;
 mod mux;
 mod pairing;
 mod server;
@@ -12,6 +14,8 @@ mod tls;
 mod tunnel;
 
 use std::io;
+use std::path::Path;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use futures::{SinkExt, StreamExt};
@@ -201,22 +205,55 @@ async fn close_tunnel(provider: Provider) -> Result<(), Error> {
     }
 }
 
-/// Sends `op` to the running server, started if needed, and returns its response.
+/// Sends `op` to the running server, started if needed, and returns its response. A server of another version is
+/// asked to make way first, as `ovr` does.
 async fn request(op: Op) -> Result<Response, Error> {
-    let stream = ipc::connect_or_spawn(&std::env::current_exe()?).await?;
-    let mut stream = frame::framed(stream);
-    let request = Request {
-        version: VERSION.to_owned(),
-        op,
-    };
-    stream
-        .send(Frame::json(FrameKind::Request, &request)?)
-        .await?;
-    Ok(stream
-        .next()
-        .await
-        .ok_or(Error::Disconnected)??
-        .expect(FrameKind::Response)?)
+    let program = std::env::current_exe()?;
+    let request = Frame::json(
+        FrameKind::Request,
+        &Request {
+            version: VERSION.to_owned(),
+            op,
+        },
+    )?;
+    // Servers before protocol 3 read the whole request before its version, and close on an operation they do not
+    // know without answering; one they all know gets them to restart.
+    let known = Frame::json(
+        FrameKind::Request,
+        &Request {
+            version: VERSION.to_owned(),
+            op: Op::Hosts,
+        },
+    )?;
+    let mut last = Error::Disconnected;
+    let mut probed = false;
+    for _ in 0..3 {
+        match exchange(&program, request.clone()).await {
+            Ok(Some(Response::Restart)) => {}
+            Ok(Some(response)) => return Ok(response),
+            Ok(None) if !probed => {
+                probed = true;
+                let probe = exchange(&program, known.clone()).await;
+                if !matches!(probe, Ok(Some(Response::Restart))) {
+                    return Err(Error::Disconnected);
+                }
+            }
+            Ok(None) => last = Error::Disconnected,
+            Err(err) => last = err,
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(last)
+}
+
+/// Sends one request on a new connection, returning the response, if any came.
+async fn exchange(program: &Path, request: Frame) -> Result<Option<Response>, Error> {
+    let mut stream = frame::framed(ipc::connect_or_spawn(program).await?);
+    stream.send(request).await?;
+    match stream.next().await {
+        Some(frame) => Ok(Some(frame?.expect(FrameKind::Response)?)),
+        None => Ok(None),
+    }
 }
 
 fn unexpected(response: Response) -> Error {

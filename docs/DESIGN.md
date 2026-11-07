@@ -179,7 +179,8 @@ For hosts that cannot accept SSH, including every Windows workstation:
   networks, and only ever accepts jobs from the initiator it paired with. Pairing installs it to start at login as
   the logged-in user (Scheduled Task on Windows, a `launchd` agent on macOS, a `systemd --user` unit on Linux),
   never as SYSTEM or root, and it works only inside `~/ovr` / `C:\ovr`. Restarting the service leaves run keepers
-  alone (`KillMode=process` on Linux). With `--foreground`, or where no service manager is available, it serves in
+  alone (`KillMode=process` on Linux). The service keeps the `PATH` it was installed from, so it finds tunnel CLIs
+  wherever the user installed them. With `--foreground`, or where no service manager is available, it serves in
   the foreground instead and installs nothing. A Linux host that should serve without a login session needs
   `loginctl enable-linger`.
 - `ovrd connect ADDR` without a code moves a paired host to a new address of the same initiator. It needs no code
@@ -215,12 +216,13 @@ Microsoft Dev Tunnels.
   provider is already open, then prints the host's command with the tunnel's address. From then on `ovrd` restarts
   the provider's CLI when it exits and reopens the tunnel whenever `ovrd` starts, so the tunnel outlives the
   terminal that asked for it. Only `ovrd tunnel close PROVIDER` closes it, which also deletes what `ovrd` created at
-  the provider. Open tunnels are recorded in the data directory.
+  the provider; if that deletion fails, the tunnel stays open. Open tunnels are recorded in the data directory as
+  soon as they are created at the provider, so none is forgotten.
 - **The host's `ovrd connect` owns the forwarder.** Given a tunnel address, it starts the provider's local forwarder
   on a free port, dials through it, and restarts it on every reconnect. The forwarder lives and dies with
   `ovrd connect`, so the one printed command is all a host needs, whether it serves at login or in a CI job.
 - **Addresses.** A Dev Tunnel keeps its ID across restarts, so paired hosts reconnect on their own; it suits hosts
-  that stay. A Cloudflare quick tunnel gets a new hostname whenever it restarts, for example when the initiator
+  that stay. Should the provider lose it, as when it expires unused, `ovrd` creates a new one in its place. A Cloudflare quick tunnel gets a new hostname whenever it restarts, for example when the initiator
   reboots; it suits short-lived hosts such as CI runners. `ovrd tunnel` shows each tunnel's current address with the
   `ovrd connect ADDR` command that moves a paired host to it.
 - **CI runners.** `--foreground` serves for as long as the job runs and installs nothing. When the job ends, its

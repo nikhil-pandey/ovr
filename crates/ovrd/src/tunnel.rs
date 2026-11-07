@@ -79,6 +79,9 @@ pub struct Running {
     program: &'static str,
     child: Child,
     tail: Arc<Mutex<VecDeque<String>>>,
+    /// Kills the CLI even when `ovrd` is terminated without unwinding, as `schtasks /End` does.
+    #[cfg(windows)]
+    _job: crate::job::Job,
 }
 
 impl Running {
@@ -109,7 +112,8 @@ pub async fn create(provider: Provider) -> Result<Option<String>, Error> {
                     "--json",
                 ],
             )
-            .await?;
+            .await
+            .map_err(Error::from)?;
             let id = devtunnel_id(&created).ok_or_else(|| {
                 Error::Host(format!(
                     "devtunnel create printed no tunnel ID: {}",
@@ -119,24 +123,43 @@ pub async fn create(provider: Provider) -> Result<Option<String>, Error> {
             let port = PORT.to_string();
             if let Err(err) = output("devtunnel", &["port", "create", &id, "-p", &port]).await {
                 let _ = delete(provider, Some(&id)).await;
-                return Err(err);
+                return Err(err.into());
             }
             Ok(Some(id))
         }
     }
 }
 
-/// Deletes what [`create`] made.
+/// Deletes what [`create`] made, unless it is already gone.
 ///
 /// # Errors
 ///
 /// Returns an error when the CLI fails.
 pub async fn delete(provider: Provider, id: Option<&str>) -> Result<(), Error> {
     match (provider, id) {
-        (Provider::Devtunnel, Some(id)) => output("devtunnel", &["delete", id, "--force"])
-            .await
-            .map(drop),
+        (Provider::Devtunnel, Some(id)) => {
+            match output("devtunnel", &["delete", id, "--force"]).await {
+                Ok(_) | Err(Failure::NotFound) => Ok(()),
+                Err(Failure::Other(err)) => Err(err),
+            }
+        }
         _ => Ok(()),
+    }
+}
+
+/// Whether what [`create`] made still exists at the provider; Dev Tunnels expire after a while unused.
+///
+/// # Errors
+///
+/// Returns an error when the CLI fails to tell.
+pub async fn exists(provider: Provider, id: Option<&str>) -> Result<bool, Error> {
+    match (provider, id) {
+        (Provider::Devtunnel, Some(id)) => match output("devtunnel", &["show", id]).await {
+            Ok(_) => Ok(true),
+            Err(Failure::NotFound) => Ok(false),
+            Err(Failure::Other(err)) => Err(err),
+        },
+        _ => Ok(true),
     }
 }
 
@@ -204,29 +227,16 @@ pub async fn forward(provider: Provider, name: &str) -> Result<(Running, SocketA
             Ok((running, local))
         }
         // `devtunnel connect` picks the local port itself: the remote one when it is free, otherwise the next. It
-        // reuses addresses, so on macOS it would take `127.0.0.1:7420` from under an `ovrd` on this machine that
-        // listens on every address, and dial-ins to it would loop back into the tunnel. Holding the port keeps it off.
+        // reports the port before it can forward, and a connection that early ends its accept loop for good.
         Provider::Devtunnel => {
-            let held = hold_loopback(PORT);
-            // It reports the port before it can forward; a connection that early ends its accept loop for good.
             let mut forwarding = None;
-            let started = start("devtunnel", &["connect", name], |line| {
+            start("devtunnel", &["connect", name], |line| {
                 forwarding = forwarding.or_else(|| devtunnel_forwarding(line));
                 forwarding.filter(|local| devtunnel_listening(line, *local))
             })
-            .await;
-            drop(held);
-            started
+            .await
         }
     }
-}
-
-/// Listens on `127.0.0.1:port` alongside whatever else may, when the platform allows it.
-fn hold_loopback(port: u16) -> Option<tokio::net::TcpListener> {
-    let socket = tokio::net::TcpSocket::new_v4().ok()?;
-    socket.set_reuseaddr(true).ok()?;
-    socket.bind((Ipv4Addr::LOCALHOST, port).into()).ok()?;
-    socket.listen(1).ok()
 }
 
 /// Starts `program`, collecting its output until `ready` finds what it is waiting for.
@@ -243,6 +253,14 @@ async fn start<T>(
         .kill_on_drop(true)
         .spawn()
         .map_err(|err| missing(program, &err))?;
+    #[cfg(windows)]
+    let job = {
+        let job = crate::job::Job::new()?;
+        if let Some(handle) = child.raw_handle() {
+            job.assign(handle)?;
+        }
+        job
+    };
     let tail = Arc::new(Mutex::new(VecDeque::new()));
     let (lines, mut received) = mpsc::unbounded_channel();
     if let Some(stdout) = child.stdout.take() {
@@ -266,6 +284,8 @@ async fn start<T>(
                 program,
                 child,
                 tail,
+                #[cfg(windows)]
+                _job: job,
             },
             found,
         )),
@@ -302,8 +322,23 @@ async fn collect(
     }
 }
 
+/// Why a provider's CLI failed: what it was asked about does not exist, or anything else.
+enum Failure {
+    NotFound,
+    Other(Error),
+}
+
+impl From<Failure> for Error {
+    fn from(failure: Failure) -> Self {
+        match failure {
+            Failure::NotFound => Self::Host("the tunnel does not exist at the provider".to_owned()),
+            Failure::Other(err) => err,
+        }
+    }
+}
+
 /// Runs `program` to completion, returning its standard output.
-async fn output(program: &'static str, args: &[&str]) -> Result<String, Error> {
+async fn output(program: &'static str, args: &[&str]) -> Result<String, Failure> {
     let output = tokio::time::timeout(
         READY_TIMEOUT,
         command(program)
@@ -313,19 +348,27 @@ async fn output(program: &'static str, args: &[&str]) -> Result<String, Error> {
             .output(),
     )
     .await
-    .map_err(|_| Error::Host(format!("{program} {} timed out", args.join(" "))))?
-    .map_err(|err| missing(program, &err))?;
+    .map_err(|_| {
+        Failure::Other(Error::Host(format!(
+            "{program} {} timed out",
+            args.join(" ")
+        )))
+    })?
+    .map_err(|err| Failure::Other(missing(program, &err)))?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
     if output.status.success() {
         Ok(stdout)
+    } else if stderr.contains("Tunnel not found") {
+        Err(Failure::NotFound)
     } else {
-        Err(Error::Host(format!(
+        Err(Failure::Other(Error::Host(format!(
             "{program} {} failed ({}): {} {}",
             args.first().copied().unwrap_or_default(),
             output.status,
             stdout.trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )))
+            stderr.trim()
+        ))))
     }
 }
 
