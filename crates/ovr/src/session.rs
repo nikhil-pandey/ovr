@@ -949,6 +949,15 @@ mod tests {
         let kept = ovr_proto::retained::read(&checkout, "refs/ovr/kept/").await?;
         assert_eq!(kept, snapshot.deliver_to("box", "me").await?.bases);
         assert_eq!(kept.len(), 2);
+
+        // A new tree using both retained states should send neither state's large blob.
+        std::fs::write(repo.path().join("other"), b)?;
+        let run = ovr(repo.path(), "", host.path(), "cat big other | wc -c", b"").await?;
+        assert_eq!(run.stdout.trim(), (2 << 20).to_string());
+        assert!(
+            packed(&checkout)? - second < first / 10,
+            "the pack excludes objects from both bases"
+        );
         Ok(())
     }
 

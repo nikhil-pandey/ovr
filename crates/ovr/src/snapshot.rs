@@ -30,8 +30,8 @@ const IDENTITY: [(&str, &str); 6] = [
 #[derive(Debug)]
 pub struct Snapshot {
     root: PathBuf,
-    /// `ovr`'s state in the Git directory: `<git-dir>/ovr`.
-    state: PathBuf,
+    /// Locks for the shared refs, including when cleaning another worktree's bases.
+    bases_dir: PathBuf,
     /// The basename of the repository root.
     repo: String,
     /// Current directory relative to the repository root, `/`-separated with a trailing slash, or empty.
@@ -55,13 +55,17 @@ impl Snapshot {
                 "rev-parse",
                 "--show-toplevel",
                 "--absolute-git-dir",
+                "--path-format=absolute",
+                "--git-common-dir",
                 "--show-prefix",
             ],
         )
         .await
         .map_err(|_| Error::NotARepository)?;
         let mut lines = located.lines();
-        let (Some(root), Some(git_dir)) = (lines.next(), lines.next()) else {
+        let (Some(root), Some(git_dir), Some(common_dir)) =
+            (lines.next(), lines.next(), lines.next())
+        else {
             return Err(Error::NotARepository);
         };
         let root = PathBuf::from(root);
@@ -106,7 +110,7 @@ impl Snapshot {
 
         Ok(Self {
             root,
-            state,
+            bases_dir: PathBuf::from(common_dir).join("ovr").join("bases"),
             repo,
             prefix,
             commit: commit.trim().to_owned(),
@@ -126,11 +130,7 @@ impl Snapshot {
         let checkout = format!("{}-{:08x}", self.repo, ovr_proto::fnv1a(&key) >> 32);
         let (host, name) = (ref_component(host), ref_component(&checkout));
         let refs = format!("refs/ovr/bases/{host}/{name}/");
-        let lock_file = self
-            .state
-            .join("bases")
-            .join(host)
-            .join(format!("{name}.lock"));
+        let lock_file = self.bases_dir.join(host).join(format!("{name}.lock"));
         let looked = Instant::now();
         let bases = {
             let _lock = lock_bases(&lock_file).await?;
@@ -281,8 +281,37 @@ impl Pack {
 /// Forgets the bases of every checkout on `host` in the repository around `cwd`, if there is one, after the host's
 /// checkouts were removed.
 pub async fn forget_host(cwd: &Path, host: &str) {
-    let prefix = format!("refs/ovr/bases/{}/", ref_component(host));
-    let _ = retained::forget(cwd, &prefix).await;
+    let host = ref_component(host);
+    let prefix = format!("refs/ovr/bases/{host}/");
+    let Ok(common_dir) = git::run(
+        cwd,
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .await
+    else {
+        return;
+    };
+    let Ok(refs) = git::run(cwd, ["for-each-ref", "--format=%(refname)", &prefix]).await else {
+        return;
+    };
+    let checkouts: std::collections::BTreeSet<_> = refs
+        .lines()
+        .filter_map(|name| {
+            name.strip_prefix(&prefix)?
+                .split_once('/')
+                .map(|(name, _)| name)
+        })
+        .collect();
+    let locks = Path::new(common_dir.trim())
+        .join("ovr")
+        .join("bases")
+        .join(host);
+    for checkout in checkouts {
+        let Ok(_lock) = lock_bases(&locks.join(format!("{checkout}.lock"))).await else {
+            continue;
+        };
+        let _ = retained::forget(cwd, &format!("{prefix}{checkout}/")).await;
+    }
 }
 
 /// Maps a host or repository name onto characters that are always valid in a ref name component.
@@ -416,6 +445,55 @@ mod tests {
             ["f", "c"],
             "after recovery, only what the host had"
         );
+
+        std::fs::write(root.join("file"), "g")?;
+        let g = Snapshot::take(root).await?;
+        let g_delivery = g.deliver_to("box", "me").await?;
+        std::fs::write(root.join("file"), "h")?;
+        let h = Snapshot::take(root).await?;
+        let h_delivery = h.deliver_to("box", "me").await?;
+        let (g_synced, h_synced) = tokio::join!(g_delivery.synced(None), h_delivery.synced(None));
+        g_synced?;
+        h_synced?;
+        let mut contents = bases().await?;
+        contents.sort();
+        assert_eq!(
+            contents,
+            ["c", "f", "g", "h"],
+            "both acknowledgements survive"
+        );
+
+        h.deliver_to("other", "me").await?.synced(None).await?;
+        let linked = tempfile::tempdir()?;
+        git::run(
+            root,
+            [
+                OsStr::new("worktree"),
+                OsStr::new("add"),
+                OsStr::new("--detach"),
+                linked.path().as_os_str(),
+                OsStr::new(&h.commit),
+            ],
+        )
+        .await?;
+        let linked_snapshot = Snapshot::take(linked.path()).await?;
+        let linked_delivery = linked_snapshot.deliver_to("box", "me").await?;
+        linked_delivery.synced(None).await?;
+        let held = lock_bases(&linked_delivery.lock_file).await?;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), forget_host(root, "box"))
+                .await
+                .is_err(),
+            "clean must take the same metadata lock, even for another worktree"
+        );
+        drop(held);
+        forget_host(root, "box").await;
+        assert_eq!(bases().await?, [] as [String; 0]);
+        assert_eq!(
+            linked_snapshot.deliver_to("box", "me").await?.bases,
+            [] as [String; 0]
+        );
+        assert_eq!(h.deliver_to("other", "me").await?.bases, [h.commit]);
         Ok(())
     }
 

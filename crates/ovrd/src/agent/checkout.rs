@@ -39,7 +39,7 @@ impl Checkout {
         if !dir.join(".git").is_dir() {
             tokio::fs::create_dir_all(&dir).await?;
             git::run(&dir, &["init", "-q"]).await?;
-            // Without reflogs, superseded snapshots become garbage as soon as the next one is checked out.
+            // Superseded snapshots become garbage once they also leave the retained set.
             git::run(&dir, &["config", "core.logAllRefUpdates", "false"]).await?;
             if cfg!(windows) {
                 git::run(&dir, &["config", "core.longpaths", "true"]).await?;

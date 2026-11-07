@@ -324,10 +324,11 @@ orders them.
   automatic collection takes it exclusively. Concurrent syncs still receive and apply without waiting for each
   other's transfers, and cannot lose an accepted or offered base to automatic collection, even when a concurrent
   sync evicts it from the kept snapshots.
-- **A failed sync keeps the bases.** An error before `SYNCED` leaves the host's refs alone: the host may have applied
-  the snapshot before the reply was lost, and a concurrent run may just have recorded a newer base. The next
-  run's `HELLO` lets the host tell. Concurrent runs read and rewrite the bases under a lock per host and checkout in
-  `.git/ovr/bases/`, held only for that, and rewrite them in one ref transaction, so neither loses the other's.
+- **A failed sync keeps the bases.** An error before `SYNCED` leaves the initiator's recorded bases alone: the host
+  may have applied the snapshot before the reply was lost, and a concurrent run may just have recorded a newer base.
+  The next run's `HELLO` lets the host tell. Concurrent runs read and rewrite the bases under a lock per host and checkout in
+  the common Git directory's `ovr/bases/`, held only for that, and rewrite them in one ref transaction, so neither
+  loses the other's. Cleaning uses the same locks, including when removing another worktree's bases.
 - **Pipelined.** `EXEC` follows the pack on the same stream, so the agent starts the command the moment checkout
   finishes without another exchange.
 - **Connections outlive runs.** SSH agents stay up for ten minutes; dial-in connections stay up indefinitely. A
