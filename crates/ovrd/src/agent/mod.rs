@@ -14,7 +14,6 @@ use std::sync::Arc;
 use futures::SinkExt;
 use ovr_proto::msg::{Banner, Platform};
 use ovr_proto::{Frame, FrameKind, PROTOCOL_VERSION, VERSION, frame};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinSet;
 use tokio_util::codec::FramedWrite;
 
@@ -76,12 +75,8 @@ pub fn hostname() -> String {
         .to_ascii_lowercase()
 }
 
-/// Serves streams over `stream` until the initiator closes it. Runs carry on with their keepers.
-pub async fn serve<S>(stream: S, config: Arc<Config>)
-where
-    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-{
-    let mut incoming = Incoming::accept_on(stream);
+/// Serves the initiator's streams until it closes the connection. Runs carry on with their keepers.
+pub(crate) async fn serve(mut incoming: Incoming, config: Arc<Config>) {
     let mut sessions = JoinSet::new();
     loop {
         tokio::select! {
@@ -107,10 +102,7 @@ pub async fn serve_stdio() -> Result<(), ovr_proto::Error> {
     stdout
         .send(Frame::json(FrameKind::Banner, &banner())?)
         .await?;
-    serve(
-        tokio::io::join(tokio::io::stdin(), stdout.into_inner()),
-        config,
-    )
-    .await;
+    let stdio = tokio::io::join(tokio::io::stdin(), stdout.into_inner());
+    serve(Incoming::accept_on(stdio), config).await;
     Ok(())
 }

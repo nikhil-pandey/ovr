@@ -32,7 +32,11 @@ struct World {
     /// Under `/tmp`, so socket paths stay within the platform limit.
     dir: tempfile::TempDir,
     ovr: PathBuf,
+    ovrd: PathBuf,
+    /// The initiator's `PATH`: the stand-ins first.
     path: OsString,
+    /// A dial-in host's `PATH`, which has only the tunnel CLIs.
+    host_path: OsString,
 }
 
 impl World {
@@ -72,15 +76,51 @@ impl World {
         git(&repo, &["init", "-q"])?;
         std::fs::write(repo.join("msg.txt"), "hello\n")?;
 
-        let ovrd_dir = ovrd.parent().ok_or("ovrd has no directory")?;
         let inherited = std::env::var_os("PATH").unwrap_or_default();
+        // Both sides use the real tunnel CLIs, and the initiator's `devtunnel` stays logged in as whoever runs the
+        // tests; the host's is anonymous.
+        let host_bin = dir.path().join("host-bin");
+        std::fs::create_dir_all(&host_bin)?;
+        for tool in ["cloudflared", "devtunnel"] {
+            let Some(real) = resolve(tool, &inherited) else {
+                continue;
+            };
+            std::os::unix::fs::symlink(&real, host_bin.join(tool))?;
+            match std::env::var_os("HOME") {
+                Some(home) if tool == "devtunnel" => {
+                    let stand_in = bin.join(tool);
+                    std::fs::write(
+                        &stand_in,
+                        format!(
+                            "#!/bin/sh\nexport HOME='{}'\nexec '{}' \"$@\"\n",
+                            Path::new(&home).display(),
+                            real.display()
+                        ),
+                    )?;
+                    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755))?;
+                }
+                _ => std::os::unix::fs::symlink(&real, bin.join(tool))?,
+            }
+        }
+
+        let ovrd_dir = ovrd.parent().ok_or("ovrd has no directory")?.to_owned();
         let path = std::env::join_paths(
-            [bin.as_path(), ovrd_dir]
+            [bin, ovrd_dir.clone()]
                 .into_iter()
-                .map(Path::to_owned)
                 .chain(std::env::split_paths(&inherited)),
         )?;
-        Ok(Self { dir, ovr, path })
+        let host_path = std::env::join_paths(
+            [host_bin, ovrd_dir]
+                .into_iter()
+                .chain(std::env::split_paths(&inherited)),
+        )?;
+        Ok(Self {
+            dir,
+            ovr,
+            ovrd,
+            path,
+            host_path,
+        })
     }
 
     fn host(&self) -> PathBuf {
@@ -107,6 +147,76 @@ impl World {
 
     fn run(&self, args: &[&str]) -> Result<Output> {
         Ok(self.ovr(args).output()?)
+    }
+
+    /// Runs the initiator's `ovrd`, failing unless it succeeds, and returns its output.
+    fn ovrd(&self, args: &[&str]) -> Result<String> {
+        let mut command = Command::new(&self.ovrd);
+        command
+            .args(args)
+            .env("HOME", self.file("initiator"))
+            .env("PATH", &self.path)
+            .stdin(Stdio::null());
+        for var in XDG {
+            command.env_remove(var);
+        }
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(format!("ovrd {args:?} failed: {}", text(&output.stderr)).into());
+        }
+        Ok(text(&output.stdout))
+    }
+
+    /// Starts `ovrd connect ARGS --foreground` on a dial-in host with a home of its own, and waits until it serves.
+    fn connect(&self, args: &[&str]) -> Result<Connected> {
+        let home = self.file("dialin");
+        std::fs::create_dir_all(&home)?;
+        let mut command = Command::new(&self.ovrd);
+        command
+            .arg("connect")
+            .args(args)
+            .arg("--foreground")
+            .current_dir(&home)
+            .env("HOME", &home)
+            .env("PATH", &self.host_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        for var in XDG {
+            command.env_remove(var);
+        }
+        let mut child = command.spawn()?;
+        let stdout = child.stdout.take().ok_or("no stdout")?;
+        let mut connected = Connected {
+            child,
+            name: String::new(),
+        };
+        // Pairing through a tunnel can take a while: the first line comes once the host has reached the initiator.
+        let line = BufReader::new(stdout)
+            .lines()
+            .next()
+            .ok_or("ovrd connect exited before serving")??;
+        line.split_once("; serving as ")
+            .ok_or_else(|| format!("unexpected output from ovrd connect: {line}"))?
+            .1
+            .clone_into(&mut connected.name);
+        Ok(connected)
+    }
+
+    /// Runs `cat msg.txt` on `host`, retrying while it comes online, as a just-paired host does.
+    fn cat(&self, host: &str) -> Result {
+        let deadline = Instant::now() + Duration::from_mins(1);
+        loop {
+            let output = self.run(&[host, "--", "cat", "msg.txt"])?;
+            if output.status.code() == Some(0) {
+                assert_eq!(text(&output.stdout), "hello\n");
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                return Err(format!("ovr {host} failed: {}", text(&output.stderr)).into());
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
     }
 
     /// The host's record of run `run`.
@@ -149,6 +259,71 @@ impl Drop for World {
             }
         });
     }
+}
+
+/// A dial-in host's `ovrd connect`, stopped on drop the way Ctrl-C stops it, so its forwarder goes with it.
+struct Connected {
+    child: std::process::Child,
+    name: String,
+}
+
+impl Drop for Connected {
+    fn drop(&mut self) {
+        let pid = self.child.id().to_string();
+        if !matches!(signal(&pid, "-INT"), Ok(true)) {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while matches!(self.child.try_wait(), Ok(None)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Closes a tunnel on drop, so that a failing test leaves nothing behind at the provider.
+struct Tunnel<'a>(&'a World, &'static str);
+
+impl Drop for Tunnel<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.ovrd(&["tunnel", "close", self.1]);
+    }
+}
+
+/// Dial-in tests share the fixed dial-in port, so they take turns.
+fn dial_in() -> std::sync::MutexGuard<'static, ()> {
+    static PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    PORT.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The address and code in the command `ovrd pair` prints.
+fn pairing(printed: &str) -> Result<(String, String)> {
+    let line = printed
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("ovrd connect "))
+        .ok_or_else(|| format!("no command in {printed:?}"))?;
+    let (addr, code) = line
+        .split_once(' ')
+        .ok_or_else(|| format!("no code in {line:?}"))?;
+    Ok((addr.to_owned(), code.to_owned()))
+}
+
+/// Where `tool` really is: version managers' shims on `PATH` resolve it by the caller's home, which tests replace.
+fn resolve(tool: &str, path: &OsString) -> Option<PathBuf> {
+    let shimmed = Command::new("mise")
+        .args(["which", tool])
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| PathBuf::from(text(&output.stdout).trim()));
+    shimmed.or_else(|| {
+        std::env::split_paths(path)
+            .map(|dir| dir.join(tool))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 /// `ovr` and `ovrd`: from Bazel's runfiles, or built by Cargo next to each other.
@@ -330,5 +505,66 @@ fn runs_whose_keeper_dies_are_lost_and_cleaned_up() -> Result {
     let logs = world.run(&["logs", "box", &run])?;
     assert_eq!(logs.status.code(), Some(125));
     assert!(text(&logs.stderr).contains("was lost"));
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs the dial-in port, the network, and cloudflared"]
+fn dial_in_hosts_pair_directly_then_move_to_a_cloudflare_tunnel() -> Result {
+    let _port = dial_in();
+    let world = World::new()?;
+
+    let (_, code) = pairing(&world.ovrd(&["pair"])?)?;
+    let host = world.connect(&["127.0.0.1:7420", &code])?;
+    world.cat(&host.name)?;
+    let name = host.name.clone();
+    drop(host);
+
+    let _tunnel = Tunnel(&world, "cloudflare");
+    let (addr, _) = pairing(&world.ovrd(&["pair", "cloudflare"])?)?;
+    assert!(addr.starts_with("cloudflare:"), "{addr}");
+    let listed = world.ovrd(&["tunnel"])?;
+    assert!(listed.contains(&format!("ovrd connect {addr}")), "{listed}");
+
+    let host = world.connect(&[&addr])?;
+    assert_eq!(host.name, name);
+    world.cat(&name)?;
+    let wrong = world.connect(&[&addr, "AAAA-AAAA"]);
+    assert!(wrong.is_err(), "a wrong code is rejected");
+
+    assert!(
+        world
+            .ovrd(&["tunnel", "close", "cloudflare"])?
+            .contains("closed")
+    );
+    assert!(world.ovrd(&["tunnel"])?.contains("no tunnels are open"));
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs the dial-in port, the network, and devtunnel logged in"]
+fn dial_in_hosts_pair_through_a_dev_tunnel() -> Result {
+    let _port = dial_in();
+    let world = World::new()?;
+
+    let _tunnel = Tunnel(&world, "devtunnel");
+    let (addr, code) = pairing(&world.ovrd(&["pair", "devtunnel"])?)?;
+    let id = addr
+        .strip_prefix("devtunnel:")
+        .ok_or_else(|| format!("not a dev tunnel: {addr}"))?
+        .to_owned();
+    let (again, _) = pairing(&world.ovrd(&["pair", "devtunnel"])?)?;
+    assert_eq!(again, addr, "an open tunnel is reused");
+
+    let host = world.connect(&[&addr, &code])?;
+    world.cat(&host.name)?;
+
+    world.ovrd(&["tunnel", "close", "devtunnel"])?;
+    let show = Command::new("devtunnel")
+        .args(["show", &id])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    assert!(!show.success(), "the dev tunnel was deleted");
     Ok(())
 }

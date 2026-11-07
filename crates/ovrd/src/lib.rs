@@ -3,18 +3,23 @@
 pub mod agent;
 mod autostart;
 mod host;
+#[cfg(windows)]
+mod job;
 mod mux;
 mod pairing;
 mod server;
 mod state;
 mod target;
 mod tls;
+mod tunnel;
 
 use std::io;
+use std::path::Path;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use futures::{SinkExt, StreamExt};
-use ovr_proto::msg::{Op, Request, Response};
+use ovr_proto::msg::{Op, Provider, Request, Response};
 use ovr_proto::{Frame, FrameKind, VERSION, frame, ipc};
 
 /// Server and host agent for `ovr`.
@@ -27,16 +32,27 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Print a one-shot command for a host that must dial in.
-    Pair,
-    /// On a host: pair with the initiator at ADDR, then keep serving it. Without arguments, serve a paired initiator.
+    /// Print a one-shot command for a host that must dial in, through a tunnel from PROVIDER if given.
+    Pair {
+        /// `cloudflare` or `devtunnel`: open a tunnel with that provider's CLI unless one is open.
+        provider: Option<Provider>,
+    },
+    /// List open tunnels and the command that points a paired host at each.
+    Tunnel {
+        #[command(subcommand)]
+        command: Option<TunnelCommand>,
+    },
+    /// On a host: pair with the initiator at ADDR, then keep serving it. Without a code, move a paired host to ADDR.
+    /// Without arguments, serve the paired initiator.
     Connect {
-        /// Address printed by `ovrd pair`.
-        #[arg(requires = "code")]
-        addr: Option<String>,
+        /// `host:port`, `cloudflare:HOSTNAME`, or `devtunnel:ID`, as printed by `ovrd pair` or `ovrd tunnel`.
+        addr: Option<tunnel::Addr>,
         /// Pairing code printed by `ovrd pair`.
         #[arg(requires = "addr")]
         code: Option<String>,
+        /// Serve in the foreground and install nothing to start at login, as on a CI runner.
+        #[arg(long, conflicts_with = "service")]
+        foreground: bool,
         /// Started at login: log to a file and detach from the console.
         #[arg(long, hide = true, conflicts_with = "addr")]
         service: bool,
@@ -47,6 +63,12 @@ pub enum Command {
     /// Keep the run in DIR: own its command and log, and serve attached clients; started by the agent.
     #[command(hide = true)]
     Keep { dir: std::path::PathBuf },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TunnelCommand {
+    /// Close the tunnel `ovrd pair PROVIDER` opened, and delete what was created for it at the provider.
+    Close { provider: Provider },
 }
 
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
@@ -87,42 +109,157 @@ pub enum Error {
 /// Returns an error when the server or agent fails.
 pub async fn run(cli: Cli) -> Result<(), Error> {
     match cli.command {
-        None => server::run().await,
-        Some(Command::Pair) => pair().await,
+        None => until_stopped(server::run()).await,
+        Some(Command::Pair { provider }) => pair(provider).await,
+        Some(Command::Tunnel { command: None }) => tunnels().await,
+        Some(Command::Tunnel {
+            command: Some(TunnelCommand::Close { provider }),
+        }) => close_tunnel(provider).await,
         Some(Command::Connect {
-            addr: Some(addr),
-            code: Some(code),
+            addr,
+            code,
+            foreground,
             ..
-        }) => host::pair(&addr, &code).await,
-        Some(Command::Connect { .. }) => host::serve().await,
+        }) => until_stopped(host::connect(addr, code.as_deref(), foreground)).await,
         Some(Command::Agent) => Ok(agent::serve_stdio().await?),
         Some(Command::Keep { dir }) => agent::keeper::main(dir).await,
     }
 }
 
-/// Asks the running server, started if needed, for a pairing code.
-async fn pair() -> Result<(), Error> {
-    let stream = ipc::connect_or_spawn(&std::env::current_exe()?).await?;
-    let mut stream = frame::framed(stream);
-    let request = Request {
-        version: VERSION.to_owned(),
-        op: Op::Pair,
-    };
-    stream
-        .send(Frame::json(FrameKind::Request, &request)?)
-        .await?;
-    let response: Response = stream
-        .next()
-        .await
-        .ok_or(Error::Disconnected)??
-        .expect(FrameKind::Response)?;
-    match response {
-        Response::Pair { addr, code } => {
-            println!("On the host, within 10 minutes, run:\n\n    ovrd connect {addr} {code}\n");
+/// Runs `work` until it ends or `ovrd` is told to stop, by Ctrl-C or, on Unix, `SIGTERM` or `SIGHUP`. Stopping
+/// returns rather than letting the signal kill the process, so the tunnel CLIs `ovrd` started are killed with it.
+async fn until_stopped(work: impl Future<Output = Result<(), Error>>) -> Result<(), Error> {
+    tokio::select! {
+        result = work => result,
+        () = stopped() => {
+            tracing::info!("stopping");
             Ok(())
         }
-        Response::Failed { message } => Err(Error::Host(message)),
-        Response::Restart => Err(Error::Host("ovrd was restarting; try again".to_owned())),
-        other => Err(Error::Host(format!("unexpected response: {other:?}"))),
+    }
+}
+
+async fn stopped() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut interrupt), Ok(mut terminate), Ok(mut hangup)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+            signal(SignalKind::hangup()),
+        ) else {
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+            _ = hangup.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Asks the running server, started if needed, for a pairing code.
+async fn pair(tunnel: Option<Provider>) -> Result<(), Error> {
+    if let Some(provider) = tunnel {
+        eprintln!("opening a {provider} tunnel unless one is open...");
+    }
+    match request(Op::Pair { tunnel }).await? {
+        Response::Pair { addr, code } => {
+            println!("run this on the host within 10 minutes:\n  ovrd connect {addr} {code}");
+            Ok(())
+        }
+        other => Err(unexpected(other)),
+    }
+}
+
+/// `ovrd tunnel`: lists open tunnels.
+async fn tunnels() -> Result<(), Error> {
+    match request(Op::Tunnels).await? {
+        Response::Tunnels { tunnels } if tunnels.is_empty() => {
+            println!("no tunnels are open; `ovrd pair PROVIDER` opens one");
+            Ok(())
+        }
+        Response::Tunnels { tunnels } => {
+            for tunnel in tunnels {
+                match tunnel.addr {
+                    Some(addr) => println!("{:<10}  ovrd connect {addr}", tunnel.provider),
+                    None => println!("{:<10}  (restarting)", tunnel.provider),
+                }
+            }
+            Ok(())
+        }
+        other => Err(unexpected(other)),
+    }
+}
+
+async fn close_tunnel(provider: Provider) -> Result<(), Error> {
+    match request(Op::CloseTunnel { provider }).await? {
+        Response::TunnelClosed => {
+            println!("closed the {provider} tunnel");
+            Ok(())
+        }
+        other => Err(unexpected(other)),
+    }
+}
+
+/// Sends `op` to the running server, started if needed, and returns its response. A server of another version is
+/// asked to make way first, as `ovr` does.
+async fn request(op: Op) -> Result<Response, Error> {
+    let program = std::env::current_exe()?;
+    let request = Frame::json(
+        FrameKind::Request,
+        &Request {
+            version: VERSION.to_owned(),
+            op,
+        },
+    )?;
+    // Servers before protocol 3 read the whole request before its version, and close on an operation they do not
+    // know without answering; one they all know gets them to restart.
+    let known = Frame::json(
+        FrameKind::Request,
+        &Request {
+            version: VERSION.to_owned(),
+            op: Op::Hosts,
+        },
+    )?;
+    let mut last = Error::Disconnected;
+    let mut probed = false;
+    for _ in 0..3 {
+        match exchange(&program, request.clone()).await {
+            Ok(Some(Response::Restart)) => {}
+            Ok(Some(response)) => return Ok(response),
+            Ok(None) if !probed => {
+                probed = true;
+                let probe = exchange(&program, known.clone()).await;
+                if !matches!(probe, Ok(Some(Response::Restart))) {
+                    return Err(Error::Disconnected);
+                }
+            }
+            Ok(None) => last = Error::Disconnected,
+            Err(err) => last = err,
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(last)
+}
+
+/// Sends one request on a new connection, returning the response, if any came.
+async fn exchange(program: &Path, request: Frame) -> Result<Option<Response>, Error> {
+    let mut stream = frame::framed(ipc::connect_or_spawn(program).await?);
+    stream.send(request).await?;
+    match stream.next().await {
+        Some(frame) => Ok(Some(frame?.expect(FrameKind::Response)?)),
+        None => Ok(None),
+    }
+}
+
+fn unexpected(response: Response) -> Error {
+    match response {
+        Response::Failed { message } => Error::Host(message),
+        Response::Restart => Error::Host("ovrd was restarting; try again".to_owned()),
+        other => Error::Host(format!("unexpected response: {other:?}")),
     }
 }

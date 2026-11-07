@@ -2,6 +2,7 @@
 
 mod dialin;
 mod ssh;
+mod tunnels;
 
 use std::collections::HashMap;
 use std::io;
@@ -11,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
-use ovr_proto::msg::{HostStatus, Op, Platform, Request, Response};
+use ovr_proto::msg::{HostStatus, Op, Platform, Provider, Request, Response};
 use ovr_proto::{Frame, FrameKind, VERSION, frame, ipc};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
@@ -41,12 +42,14 @@ pub async fn run() -> Result<(), Error> {
     let mut listener = ipc::Listener::bind()?;
     let server = Arc::new(Server {
         identity: Identity::load_or_create(&dir)?,
-        dir,
         dialed: Registry::default(),
         ssh: ssh::Pool::default(),
         codes: Mutex::default(),
+        tunnels: tunnels::Tunnels::new(dir.clone()),
+        dir,
     });
     tracing::info!(version = VERSION, "serving");
+    server.tunnels.restore()?;
     tokio::spawn(dialin::listen(Arc::clone(&server)));
 
     let restart = Arc::new(Notify::new());
@@ -95,27 +98,44 @@ pub(crate) struct Server {
     dialed: Registry,
     ssh: ssh::Pool,
     codes: Mutex<Codes>,
+    tunnels: tunnels::Tunnels,
 }
 
 async fn handle(server: Arc<Server>, stream: ipc::ServerStream, restart: Arc<Notify>) {
+    /// Read on its own first, so a client of another version is told to restart even when its request is unknown here.
+    #[derive(serde::Deserialize)]
+    struct Versioned {
+        version: String,
+    }
+
     let mut stream = frame::framed(stream);
-    let request = match stream.next().await {
-        Some(Ok(frame)) => frame.expect::<Request>(FrameKind::Request),
+    let frame = match stream.next().await {
+        Some(Ok(frame)) => frame,
         None => return,
-        Some(Err(err)) => Err(err),
+        Some(Err(err)) => {
+            tracing::warn!(%err, "bad request");
+            return;
+        }
     };
-    let request = match request {
+    match frame.expect::<Versioned>(FrameKind::Request) {
+        Ok(versioned) if versioned.version == VERSION => {}
+        Ok(_) => {
+            let _ = respond(&mut stream, &Response::Restart).await;
+            restart.notify_one();
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(%err, "bad request");
+            return;
+        }
+    }
+    let request = match frame.expect::<Request>(FrameKind::Request) {
         Ok(request) => request,
         Err(err) => {
             tracing::warn!(%err, "bad request");
             return;
         }
     };
-    if request.version != VERSION {
-        let _ = respond(&mut stream, &Response::Restart).await;
-        restart.notify_one();
-        return;
-    }
     let response = match request.op {
         Op::Open { host } => match server.open(&host).await {
             Ok((mut channel, lease)) => {
@@ -143,9 +163,21 @@ async fn handle(server: Arc<Server>, stream: ipc::ServerStream, restart: Arc<Not
         Op::Connected => Response::Connected {
             hosts: server.connected(),
         },
-        Op::Pair => server.pair().unwrap_or_else(|err| Response::Failed {
-            message: err.to_string(),
-        }),
+        Op::Pair { tunnel } => server
+            .pair(tunnel)
+            .await
+            .unwrap_or_else(|err| Response::Failed {
+                message: err.to_string(),
+            }),
+        Op::Tunnels => Response::Tunnels {
+            tunnels: server.tunnels.list(),
+        },
+        Op::CloseTunnel { provider } => match server.tunnels.close(provider).await {
+            Ok(()) => Response::TunnelClosed,
+            Err(err) => Response::Failed {
+                message: err.to_string(),
+            },
+        },
     };
     if respond(&mut stream, &response).await.is_ok() {
         let _ = stream.close().await;
@@ -201,17 +233,19 @@ impl Server {
         hosts
     }
 
-    fn pair(&self) -> Result<Response, Error> {
+    /// Issues a pairing code for hosts to dial in directly, or through the tunnel from `tunnel`, opened if needed.
+    async fn pair(&self, tunnel: Option<Provider>) -> Result<Response, Error> {
+        let addr = match tunnel {
+            Some(provider) => self.tunnels.open(provider).await?.to_string(),
+            None => format!("{}:{PORT}", local_ip()),
+        };
         let code = self
             .codes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .issue()
             .map_err(|_| Error::Invalid("the system random number generator failed".to_owned()))?;
-        Ok(Response::Pair {
-            addr: format!("{}:{PORT}", local_ip()),
-            code,
-        })
+        Ok(Response::Pair { addr, code })
     }
 }
 
