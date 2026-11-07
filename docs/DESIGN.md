@@ -180,8 +180,12 @@ For hosts that cannot accept SSH, including every Windows workstation:
 - Both ends send a heartbeat on the connection every 15 seconds and close it after 45 seconds without one, so a
   vanished peer is noticed within a minute even through a tunnel or proxy, where TCP keepalive only probes the
   nearest hop, which stays up.
-- After pairing, `ovrd connect` keeps serving: it reconnects with backoff when the initiator sleeps or moves
-  networks, and only ever accepts jobs from the initiator it paired with. Pairing installs it to start at login as
+- After pairing, `ovrd connect` keeps serving: it reconnects when the initiator sleeps or moves networks, and only
+  ever accepts jobs from the initiator it paired with. Retries back off from one second to at most two seconds
+  between a failed attempt and the next for a `host:port` address, so a host notices within seconds that the
+  initiator is back, and to at most ten for a tunnel, where each attempt restarts the provider's local forwarder.
+  Each attempt still has its own 10-second connection timeout. Only a new reason for failing is logged, so a host
+  waiting all night for a sleeping laptop leaves one line, not thousands. Pairing installs it to start at login as
   the logged-in user (Scheduled Task on Windows, a `launchd` agent on macOS, a `systemd --user` unit on Linux),
   never as SYSTEM or root, and it works only inside its checkouts directory. Restarting the service leaves run
   keepers alone (`KillMode=process` on Linux). The service keeps the `PATH` and `OVR_*` directory variables it was
@@ -311,6 +315,16 @@ orders them.
   answers `ERROR` and then reads and discards the rest of the stream, and the client listens to the agent while
   it sends. Either side alone keeps a pack larger than the stream's window from stalling forever on a host that
   stopped reading.
+- **Nothing to record when nothing changed.** After `SYNCED`, `ovr` moves the host's ref to the snapshot only when
+  it differs from the base, so an unchanged tree runs no `git update-ref`.
+- **Timed.** The client emits `debug` events for the wall-clock time from starting the run to `ATTACHED` and for
+  each phase: opening the host stream, waiting for the snapshot lock, building the snapshot, looking up the base,
+  producing and sending each pack (with its bytes, and whether it was full or cut short by `need_full`), receiving
+  `SYNCED`, recording the base, and receiving `ATTACHED`, tagged with the checkout and run to match the host's log.
+  Phases overlap, so they do not add up to the total, and time until `SYNCED` includes the host's work. The CLI
+  installs no subscriber, so its output is unchanged; to see them, run the developer example
+  `cargo run --release -p ovr --example timing -- HOST -- CMD... 2> timings.log`, whose stderr mixes the events
+  with the command's.
 
 ### How the remote applies it
 

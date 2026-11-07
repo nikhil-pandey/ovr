@@ -5,6 +5,7 @@ use std::convert::Infallible;
 use std::future::poll_fn;
 use std::pin::Pin;
 use std::task::ready;
+use std::time::Instant;
 
 use bytes::{Bytes, BytesMut};
 use futures::{Sink, SinkExt, StreamExt};
@@ -145,19 +146,28 @@ where
     let mut stream = Stream::new(stream);
     let mut synced = false;
     let started = async {
+        let mut phase = Instant::now();
         sync(&mut stream, delivery, exec).await?;
         loop {
             let frame = next(&mut stream.frames).await?;
             match frame.kind {
                 FrameKind::Synced => {
+                    tracing::debug!(elapsed = ?phase.elapsed(), "received SYNCED");
+                    phase = Instant::now();
                     synced = true;
                     delivery.synced().await?;
+                    tracing::debug!(elapsed = ?phase.elapsed(), "recorded the acknowledged base");
+                    phase = Instant::now();
                 }
                 FrameKind::Err => {
                     stderr.write_all(&frame.payload).await?;
                     stderr.flush().await?;
                 }
-                FrameKind::Attached => return Ok(Position::new(frame.parse()?)),
+                FrameKind::Attached => {
+                    let attached: Attached = frame.parse()?;
+                    tracing::debug!(elapsed = ?phase.elapsed(), run = attached.run, "received ATTACHED");
+                    return Ok(Position::new(attached));
+                }
                 kind => return Err(ovr_proto::Error::Unexpected(kind).into()),
             }
         }
@@ -284,6 +294,7 @@ async fn sync<S: AsyncRead + AsyncWrite>(
         None => next(&mut stream.frames).await?.expect(FrameKind::Welcome)?,
     };
     if welcome == Welcome::NeedFull {
+        tracing::debug!("the host needs the full snapshot");
         let mut welcome = Some(welcome);
         send_pack(stream, delivery, None, &mut welcome).await?;
         send_heeding(stream, Frame::json(FrameKind::Exec, exec)?, &mut welcome).await?;
@@ -300,6 +311,9 @@ async fn send_pack<S: AsyncRead + AsyncWrite>(
     welcome: &mut Option<Welcome>,
 ) -> Result<(), Error> {
     let speculative = welcome.is_none();
+    let sending = Instant::now();
+    let mut bytes = 0;
+    let mut cut = false;
     if let Some(mut pack) = delivery.pack(base).await? {
         let mut buf = BytesMut::with_capacity(CHUNK);
         let complete = loop {
@@ -309,9 +323,11 @@ async fn send_pack<S: AsyncRead + AsyncWrite>(
             buf.reserve(CHUNK);
             tokio::select! {
                 read = pack.stdout.read_buf(&mut buf) => {
-                    if read? == 0 {
+                    let read = read?;
+                    if read == 0 {
                         break true;
                     }
+                    bytes += read;
                     let frame = Frame::new(FrameKind::Pack, buf.split().freeze());
                     send_heeding(stream, frame, welcome).await?;
                 }
@@ -321,8 +337,11 @@ async fn send_pack<S: AsyncRead + AsyncWrite>(
         if complete {
             pack.finish().await?;
         }
+        cut = !complete;
     }
-    send_heeding(stream, Frame::empty(FrameKind::Pack), welcome).await
+    send_heeding(stream, Frame::empty(FrameKind::Pack), welcome).await?;
+    tracing::debug!(elapsed = ?sending.elapsed(), bytes, full = base.is_none(), cut, "sent the pack");
+    Ok(())
 }
 
 /// Sends `frame` while heeding the host, without ever dropping a frame half sent.

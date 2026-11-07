@@ -20,7 +20,10 @@ use crate::tunnel::{self, Addr, Running};
 use crate::{Error, agent, autostart, mux, pairing};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_BACKOFF: Duration = Duration::from_secs(10);
+/// Longest wait between attempts to reach the initiator directly, so a host notices it is back within seconds.
+const MAX_BACKOFF: Duration = Duration::from_secs(2);
+/// Longest wait between attempts through a tunnel, each of which restarts the provider's local forwarder.
+const MAX_TUNNEL_BACKOFF: Duration = Duration::from_secs(10);
 
 /// How long a tunnel may take to carry connections once its forwarder is up: a new quick tunnel's hostname, for
 /// one, can take a minute or more to resolve at the provider's edge.
@@ -145,20 +148,33 @@ pub async fn serve() -> Result<(), Error> {
     let config = Arc::new(agent::Config::detect()?);
     tracing::info!(%addr, "serving");
 
+    let max_backoff = match addr {
+        Addr::Direct(_) => MAX_BACKOFF,
+        Addr::Tunnel { .. } => MAX_TUNNEL_BACKOFF,
+    };
     let mut backoff = Duration::from_secs(1);
+    // Retries come every few seconds while the initiator is away, so only a new reason is logged.
+    let mut reported = None;
     loop {
         match attach(&identity, &addr, &initiator.fingerprint).await {
             Ok((forwarder, stream)) => {
                 tracing::info!("connected");
                 backoff = Duration::from_secs(1);
+                reported = None;
                 agent::serve(Incoming::accept_with_heartbeat(stream), Arc::clone(&config)).await;
                 drop(forwarder);
                 tracing::info!("disconnected");
             }
             Err(err) => {
-                tracing::info!(%err, "cannot reach the initiator; retrying in {}s", backoff.as_secs());
+                let reason = err.to_string();
+                if reported.as_ref() == Some(&reason) {
+                    tracing::debug!(%reason, "still cannot reach the initiator");
+                } else {
+                    tracing::info!(%reason, "cannot reach the initiator; retrying until it answers");
+                    reported = Some(reason);
+                }
                 tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                backoff = (backoff * 2).min(max_backoff);
             }
         }
     }

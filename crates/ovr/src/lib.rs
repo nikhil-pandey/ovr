@@ -6,7 +6,7 @@ mod snapshot;
 mod terminal;
 
 use std::io;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 use ovr_proto::frame::Resumed;
@@ -153,8 +153,16 @@ pub async fn run(cli: Cli) -> Result<i32, Error> {
 }
 
 async fn run_on(host: String, argv: Vec<String>, detach: bool) -> Result<i32, Error> {
+    let started = Instant::now();
     let cwd = std::env::current_dir()?;
-    let (opened, snapshot) = tokio::join!(daemon::open(&host), Snapshot::take(&cwd));
+    let open = async {
+        let opened = daemon::open(&host).await;
+        if opened.is_ok() {
+            tracing::debug!(elapsed = ?started.elapsed(), "opened the host stream");
+        }
+        opened
+    };
+    let (opened, snapshot) = tokio::join!(open, Snapshot::take(&cwd));
     let snapshot = snapshot?;
     let (stream, initiator) = opened?;
     let delivery = snapshot.deliver_to(&host, &initiator).await?;
@@ -170,6 +178,13 @@ async fn run_on(host: String, argv: Vec<String>, detach: bool) -> Result<i32, Er
     };
     let (mut stream, position) =
         session::start(stream, &delivery, &exec, &mut tokio::io::stderr()).await?;
+    tracing::debug!(
+        elapsed = ?started.elapsed(),
+        %host,
+        checkout = %delivery.checkout,
+        run = position.run,
+        "attached"
+    );
     if detach {
         // Nothing will ever feed a background command's pipe; a terminal waits for whoever attaches.
         if !tty {

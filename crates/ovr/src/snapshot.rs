@@ -7,7 +7,7 @@
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use ovr_proto::git::{self, lock};
 use ovr_proto::msg::Hello;
@@ -72,7 +72,10 @@ impl Snapshot {
 
         let state = git_dir.join("ovr");
         std::fs::create_dir_all(&state)?;
+        let waited = Instant::now();
         let _lock = lock(state.join("lock")).await?;
+        tracing::debug!(elapsed = ?waited.elapsed(), "took the snapshot lock");
+        let built = Instant::now();
         let index = state.join("index");
         if !index.exists() {
             match std::fs::copy(git_dir.join("index"), &index) {
@@ -96,6 +99,7 @@ impl Snapshot {
         )
         .await?;
         let seq = next_seq(&state.join("seq"))?;
+        tracing::debug!(elapsed = ?built.elapsed(), commit = commit.trim(), seq, "built the snapshot");
 
         Ok(Self {
             root,
@@ -121,6 +125,7 @@ impl Snapshot {
             ref_component(host),
             ref_component(&checkout)
         );
+        let looked = Instant::now();
         let base = git::run(
             &self.root,
             [
@@ -133,6 +138,7 @@ impl Snapshot {
         .await
         .ok()
         .map(|base| base.trim().to_owned());
+        tracing::debug!(elapsed = ?looked.elapsed(), %checkout, ?base, "looked up the base");
         Ok(Delivery {
             snapshot: self,
             checkout,
@@ -205,12 +211,16 @@ impl Delivery<'_> {
         Ok(Some(Pack { child, stdout }))
     }
 
-    /// Records that the host now has the snapshot, making it the base of the next run.
+    /// Records that the host now has the snapshot, making it the base of the next run. Nothing to record when it
+    /// already is.
     ///
     /// # Errors
     ///
     /// Returns an error when the ref cannot be updated.
     pub async fn synced(&self) -> Result<(), Error> {
+        if self.base.as_ref() == Some(&self.snapshot.commit) {
+            return Ok(());
+        }
         git::run(
             &self.snapshot.root,
             ["update-ref", &self.host_ref, &self.snapshot.commit],
