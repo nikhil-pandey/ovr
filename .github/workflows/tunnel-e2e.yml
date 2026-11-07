@@ -9,10 +9,6 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "17 4 * * *"
-  pull_request:
-    paths:
-      - .github/workflows/tunnel-e2e.yml
-      - .github/e2e/**
 
 permissions:
   contents: read
@@ -61,7 +57,7 @@ jobs:
           for os in linux macos windows; do
             read -r addr code < <(ovrd pair cloudflare | sed -n 's/^ *ovrd connect //p')
             [[ -n $code ]] || { echo "ovrd pair printed no connect command" >&2; exit 1; }
-            printf '%s %s' "$addr" "$code" |
+            printf '%s %s\n' "$addr" "$code" |
               openssl pkeyutl -encrypt -pubin -inkey "keys/$os/key.pub" -pkeyopt rsa_padding_mode:oaep -out "pairs/$os"
           done
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -153,10 +149,11 @@ jobs:
           .github/e2e/await.sh pairs pairs 1800
           read -r addr code < <(openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/key/key.pem" \
             -pkeyopt rsa_padding_mode:oaep -in "pairs/${{ matrix.name }}")
+          [[ -n $code ]] || { echo "no pairing for ${{ matrix.name }}" >&2; exit 1; }
           ovrd connect "$addr" "$code" --foreground >host.log 2>&1 &
           pid=$!
-          code=0
-          .github/e2e/await.sh finished finished 6000 "$pid" || code=$?
+          status=0
+          .github/e2e/await.sh finished finished 6000 "$pid" || status=$?
           kill "$pid" 2>/dev/null || true
           cat host.log
-          exit $code
+          exit $status
