@@ -815,7 +815,29 @@ mod tests {
         assert!(matches!(err, Some(Error::Remote(_))), "{err:?}");
         let snapshot = Snapshot::take(repo.path()).await?;
         let base = snapshot.deliver_to("box", "me").await?.base;
-        assert_eq!(base, Some(confirmed));
+        assert_eq!(base.as_deref(), Some(confirmed.as_str()));
+
+        // A delivery already in flight must not erase a later delivery's acknowledgement when it fails.
+        let failed = snapshot.deliver_to("box", "me").await?;
+        std::fs::write(repo.path().join("src/main.rs"), "v3\n")?;
+        ovr(repo.path(), "", host.path(), "true", b"").await?;
+        let newer = Snapshot::take(repo.path()).await?;
+        let (client, agent) = agent(&blocked);
+        assert!(
+            start(
+                client,
+                &failed,
+                &exec(&snapshot, "true"),
+                &mut tokio::io::sink()
+            )
+            .await
+            .is_err()
+        );
+        agent.await.map_err(|_| Error::Disconnected)?;
+        assert_eq!(
+            newer.deliver_to("box", "me").await?.base.as_deref(),
+            Some(newer.commit.as_str())
+        );
         Ok(())
     }
 
@@ -865,6 +887,31 @@ mod tests {
         let run = ovr(repo.path(), "", host.path(), "cat src/main.rs", b"").await?;
         assert_eq!(run.stdout, "v3\n");
         assert!(packed(&checkout)? - before >= full, "a full pack is sent");
+
+        // Missing, malformed, and collected applied state all require a full replacement pack.
+        for (index, state) in [
+            None,
+            Some("not a record".to_owned()),
+            Some("0 HEAD".to_owned()),
+            Some(format!("0 {}", "0".repeat(40))),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let applied = checkout.join(".git/ovr-applied");
+            if let Some(state) = state {
+                std::fs::write(applied, state)?;
+            } else {
+                std::fs::remove_file(applied)?;
+            }
+            let content = format!("fallback {index}\n");
+            std::fs::write(&main, &content)?;
+            git(repo.path(), &lose_base).await?;
+            let before = packed(&checkout)?;
+            let run = ovr(repo.path(), "", host.path(), "cat src/main.rs", b"").await?;
+            assert_eq!(run.stdout, content);
+            assert!(packed(&checkout)? - before >= full, "a full pack is sent");
+        }
         Ok(())
     }
 
@@ -1029,6 +1076,56 @@ mod tests {
             let run = run_snapshot(late, host.path(), "cat src/main.rs", b"", none).await?;
             assert_eq!(run.stdout, "v1\n");
         }
+
+        // A recovery waiting for its replacement pack must not block a newer sync, or lose its offered base
+        // when that newer run finishes and triggers collection.
+        let delivery = first.deliver_to("box", "me").await?;
+        let checkout = host.path().join("me").join(&delivery.checkout);
+        git(&checkout, &["config", "gc.autoPackLimit", "1"]).await?;
+        git(&checkout, &["config", "gc.pruneExpire", "now"]).await?;
+        let (client, agent) = agent(host.path());
+        let mut stream = Stream::new(client);
+        let mut hello = delivery.hello();
+        hello.base = Some("0".repeat(40));
+        stream.send(Frame::json(FrameKind::Hello, &hello)?).await?;
+        let welcome: Welcome = next(&mut stream.frames).await?.expect(FrameKind::Welcome)?;
+        assert_eq!(
+            welcome,
+            Welcome::Rebase {
+                have: Some(first.commit.clone())
+            }
+        );
+        std::fs::write(&main, "v4\n")?;
+        let newer = tokio::time::timeout(
+            Duration::from_secs(20),
+            ovr(repo.path(), "", host.path(), "cat src/main.rs", b""),
+        )
+        .await
+        .map_err(|_| Error::Host("recovery blocked a concurrent sync".to_owned()))??;
+        assert_eq!(newer.stdout, "v4\n");
+        let checkout = ovrd::agent::checkout::Checkout::at(checkout);
+        checkout.collect_garbage().await;
+        {
+            let _objects = checkout.hold_objects().await?;
+            assert!(checkout.has_commit(&first.commit).await);
+        }
+
+        let request = exec(&first, "cat src/main.rs");
+        for _ in 0..2 {
+            stream.send(Frame::empty(FrameKind::Pack)).await?;
+            stream.send(Frame::json(FrameKind::Exec, &request)?).await?;
+        }
+        assert_eq!(next(&mut stream.frames).await?.kind, FrameKind::Synced);
+        let attached = next(&mut stream.frames)
+            .await?
+            .expect(FrameKind::Attached)?;
+        let (end, out) = follow(&mut stream, &mut Position::new(attached), Mode::Drive).await;
+        assert_eq!((end?, out.as_str()), (End::Exit(0), "v4\n"));
+        drop(stream);
+        agent.await.map_err(|_| Error::Disconnected)?;
+        checkout.collect_garbage().await;
+        let _objects = checkout.hold_objects().await?;
+        assert!(!checkout.has_commit(&first.commit).await);
         Ok(())
     }
 
@@ -1100,6 +1197,8 @@ mod tests {
     #[tokio::test]
     async fn a_host_that_fails_mid_pack_is_heard_instead_of_waited_on() -> Result<(), Error> {
         let repo = repo()?;
+        let confirmed = Snapshot::take(repo.path()).await?;
+        confirmed.deliver_to("box", "me").await?.synced().await?;
         std::fs::write(repo.path().join("noise"), noise(2 << 20))?;
         let snapshot = Snapshot::take(repo.path()).await?;
         let delivery = snapshot.deliver_to("box", "me").await?;
@@ -1134,6 +1233,10 @@ mod tests {
             matches!(started, Ok(Err(Error::Remote(ref message))) if message == "disk full"),
             "{:?}",
             started.map(|started| started.map(|_| ()))
+        );
+        assert_eq!(
+            snapshot.deliver_to("box", "me").await?.base,
+            Some(confirmed.commit)
         );
         Ok(())
     }

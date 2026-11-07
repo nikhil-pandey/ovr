@@ -311,6 +311,10 @@ orders them.
   it has checked that `have` is an object ID of a commit it still has; nothing at all when `have` is this run's
   snapshot; and otherwise, as when the checkout is gone or `git gc` pruned `have` locally, a full pack. Then it
   sends `EXEC` again. The common case pays zero extra round trips; a stale base pays one, and usually a small pack.
+  Reading applied state takes the apply lock, so a concurrent reset cannot leave recovery reading a partial record.
+  From base validation through applying the received snapshot, each sync holds a shared `.git/ovr-gc.lock`;
+  automatic collection takes it exclusively. Concurrent syncs still receive and apply without waiting for each
+  other's transfers, and cannot lose an accepted or offered base to automatic collection.
 - **A failed sync keeps the base.** An error before `SYNCED` leaves the host's ref alone: the host may have applied
   the snapshot before the reply was lost, and a concurrent run may just have recorded a newer base. The next
   run's `HELLO` lets the host tell.
@@ -339,9 +343,9 @@ orders them.
 
 ### How the remote applies it
 
-Applying holds a per-checkout lock for as long as the two steps below take, typically milliseconds, and never
-while a command runs. Commands already running in the checkout keep running while it changes under them, exactly
-as they would when you save files locally mid-build.
+Receiving packs does not take the apply lock. Applying holds a per-checkout lock for the reset and submodule
+update, never while a command runs. Commands already running in the checkout keep running while it changes under
+them, exactly as they would when you save files locally mid-build.
 
 1. `git index-pack --stdin --fix-thin` streams the pack straight into `.git/objects/pack/`.
 2. `git reset --hard` to the newest snapshot the checkout has seen: this run's, or a higher `seq` already applied
@@ -352,7 +356,9 @@ as they would when you save files locally mid-build.
    build rewriting a lockfile, are restored even when the snapshot itself is unchanged: the initiator is the source
    of truth.
 3. Reflogs are off in the checkout, so the previous snapshot becomes unreachable at once. After a command exits,
-   its keeper runs `git gc --auto` so pack accumulation never lands on a run's critical path.
+   its keeper runs `git gc --auto` unless a sync or another collection holds the object lock. Collection stays
+   under that lock until Git finishes, alongside draining clients; a new sync waits for an already-running
+   collection before validating its base.
 
 The remote never runs `git clean`. The reset already removes files that left the snapshot, and anything the build
 creates that is not tracked stays, exactly as it would locally.

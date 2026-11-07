@@ -218,8 +218,10 @@ async fn keep(run: Run, shell: Shell) -> Result<(), Error> {
     run.end(&ended)?;
     progress_tx.send_modify(|progress| progress.ended = true);
     drop(listener);
-    Checkout::at(meta.dir).collect_garbage();
-    while clients.join_next().await.is_some() {}
+    let checkout = Checkout::at(meta.dir);
+    tokio::join!(checkout.collect_garbage(), async {
+        while clients.join_next().await.is_some() {}
+    });
     Ok(())
 }
 

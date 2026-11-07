@@ -15,6 +15,7 @@ pub const LOCKS: &str = ".locks";
 
 /// In a checkout's Git directory: `<seq> <commit>` of the newest snapshot applied.
 const APPLIED: &str = "ovr-applied";
+const GC_LOCK: &str = "ovr-gc.lock";
 
 pub struct Checkout {
     dir: PathBuf,
@@ -65,16 +66,34 @@ impl Checkout {
         &self.dir
     }
 
-    /// Whether the object database has `commit` and therefore every object of that snapshot.
+    /// Keeps automatic collection from removing a base or received snapshot during a sync. Other syncs can
+    /// still receive and apply concurrently.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lock cannot be opened or taken.
+    pub async fn hold_objects(&self) -> io::Result<std::fs::File> {
+        git::lock_shared(self.dir.join(".git").join(GC_LOCK)).await
+    }
+
+    /// Whether the object database has `commit`.
     pub async fn has_commit(&self, commit: &str) -> bool {
         git::has_commit(&self.dir, commit).await
     }
 
     /// The newest snapshot applied here, if the checkout still has it: what a client lacking its base can send a
     /// pack against instead.
-    pub async fn newest(&self) -> Option<String> {
-        let (_, commit) = applied(&self.dir.join(".git"))?;
-        self.has_commit(&commit).await.then_some(commit)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the apply lock cannot be taken.
+    pub async fn newest(&self) -> Result<Option<String>, Error> {
+        let git_dir = self.dir.join(".git");
+        let _lock = git::lock(git_dir.join("ovr.lock")).await?;
+        let Some((_, commit)) = applied(&git_dir) else {
+            return Ok(None);
+        };
+        Ok(self.has_commit(&commit).await.then_some(commit))
     }
 
     /// Starts `git index-pack` reading a pack from its stdin.
@@ -161,15 +180,28 @@ impl Checkout {
         }
     }
 
-    /// Repacks in the background when Git thinks it is time, off every run's critical path.
-    pub fn collect_garbage(&self) {
+    /// Repacks when Git thinks it is time, unless a sync or another collection is using the objects.
+    pub async fn collect_garbage(&self) {
+        let Ok(lock) = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.dir.join(".git").join(GC_LOCK))
+        else {
+            return;
+        };
+        if lock.try_lock().is_err() {
+            return;
+        }
         let _ = Command::new("git")
-            .args(["gc", "--auto", "--quiet"])
+            .args(["-c", "gc.autoDetach=false", "gc", "--auto", "--quiet"])
             .current_dir(&self.dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
+            .kill_on_drop(true)
+            .status()
+            .await;
     }
 }
 

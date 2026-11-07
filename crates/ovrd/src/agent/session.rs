@@ -108,9 +108,10 @@ async fn start<S: AsyncRead + AsyncWrite>(
     hello: Hello,
 ) -> Result<(Run, Option<std::fs::File>), Error> {
     let checkout = Checkout::open(&config.root, &hello.initiator, &hello.checkout).await?;
+    let objects = checkout.hold_objects().await?;
     let welcome = match &hello.base {
         Some(base) if !checkout.has_commit(base).await => Welcome::Rebase {
-            have: checkout.newest().await,
+            have: checkout.newest().await?,
         },
         _ => Welcome::Ok,
     };
@@ -127,6 +128,7 @@ async fn start<S: AsyncRead + AsyncWrite>(
 
     let applying = Instant::now();
     let warning = checkout.apply(&hello.snapshot, hello.seq).await?;
+    drop(objects);
     writer.send(Frame::empty(FrameKind::Synced)).await?;
     tracing::info!(
         checkout = hello.checkout,
