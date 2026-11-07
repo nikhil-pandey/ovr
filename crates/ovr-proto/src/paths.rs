@@ -26,6 +26,9 @@ pub const OVERRIDES: [&str; 4] = [
     "OVR_CHECKOUTS",
 ];
 
+/// Where SSH hosts keep the uploaded agent, relative to the home directory: `ovrd-<version>` there.
+pub const SSH_AGENTS: &str = ".cache/ovr/bin";
+
 /// Identity and pairing records, whose loss means pairing again, and the locks that keep one `ovrd` per user.
 ///
 /// # Errors

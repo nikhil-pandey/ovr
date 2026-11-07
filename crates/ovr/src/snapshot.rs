@@ -260,6 +260,18 @@ impl Pack {
 }
 
 /// Maps a host or repository name onto characters that are always valid in a ref name component.
+/// Forgets what every checkout on `host` was last sent from the repository around `cwd`, if there is one, after the
+/// host's checkouts were removed.
+pub async fn forget_host(cwd: &Path, host: &str) {
+    let prefix = format!("refs/ovr/hosts/{}/", ref_component(host));
+    let Ok(refs) = git::run(cwd, ["for-each-ref", "--format=%(refname)", &prefix]).await else {
+        return;
+    };
+    for name in refs.lines() {
+        let _ = git::run(cwd, ["update-ref", "-d", name]).await;
+    }
+}
+
 fn ref_component(name: &str) -> String {
     name.chars()
         .map(|c| {

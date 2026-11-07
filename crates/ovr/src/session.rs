@@ -10,7 +10,8 @@ use bytes::{Bytes, BytesMut};
 use futures::{Sink, SinkExt, StreamExt};
 use ovr_proto::frame::{self, CHUNK, INPUT_WINDOW, Reader, Writer};
 use ovr_proto::msg::{
-    Attach, Attached, Consumed, Exec, Exit, Failure, Resize, RunInfo, RunList, Runs, Welcome,
+    Attach, Attached, Clean, Cleaned, Consumed, Exec, Exit, Failure, Resize, RunInfo, RunList,
+    Runs, Welcome,
 };
 use ovr_proto::{Frame, FrameKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -223,6 +224,23 @@ pub async fn list<S: AsyncRead + AsyncWrite>(
     stream.send(Frame::json(FrameKind::Runs, &runs)?).await?;
     let list: RunList = next(&mut stream.frames).await?.expect(FrameKind::RunList)?;
     Ok(list.runs)
+}
+
+/// Removes `initiator`'s checkouts and finished runs from the host, and agents of other versions.
+///
+/// # Errors
+///
+/// Returns an error when the host cannot clean up or the connection drops.
+pub async fn clean<S: AsyncRead + AsyncWrite>(
+    stream: S,
+    initiator: &str,
+) -> Result<Cleaned, Error> {
+    let mut stream = Stream::new(stream);
+    let clean = Clean {
+        initiator: initiator.to_owned(),
+    };
+    stream.send(Frame::json(FrameKind::Clean, &clean)?).await?;
+    Ok(next(&mut stream.frames).await?.expect(FrameKind::Cleaned)?)
 }
 
 /// Kills `run`'s whole process tree and waits for it to end.
@@ -644,6 +662,7 @@ mod tests {
         Config {
             root: host_root.to_owned(),
             runs: host_root.join(".runs"),
+            agents: host_root.join(".agents"),
             shell: Shell::new("/bin/sh"),
             keeper: None,
         }

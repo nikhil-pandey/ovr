@@ -1,13 +1,13 @@
 //! The agent half of a stream; see the client half in `ovr`'s `session` module for the sequence.
 //!
-//! A stream starts a run (`HELLO`), resumes one (`ATTACH`), or lists runs (`RUNS`). Once a run has started, the
+//! A stream starts a run (`HELLO`), resumes one (`ATTACH`), lists runs (`RUNS`), or cleans up (`CLEAN`). Once a run has started, the
 //! agent only relays frames between the client and the run's keeper, so the stream's end never ends the run.
 
 use std::time::Instant;
 
 use futures::{SinkExt, StreamExt};
 use ovr_proto::frame::{self, Reader, Writer};
-use ovr_proto::msg::{Attach, Attached, Exec, Failure, Hello, RunList, Runs, Welcome};
+use ovr_proto::msg::{Attach, Attached, Clean, Exec, Failure, Hello, RunList, Runs, Welcome};
 use ovr_proto::{Frame, FrameKind};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
@@ -80,6 +80,18 @@ async fn dispatch<S: AsyncRead + AsyncWrite>(
                 .await?;
             Ok(())
         }
+        FrameKind::Clean => {
+            let Clean { initiator } = first.parse()?;
+            let config = config.clone();
+            let cleaned =
+                tokio::task::spawn_blocking(move || super::clean::clean(&config, Some(&initiator)))
+                    .await
+                    .map_err(std::io::Error::from)??;
+            writer
+                .send(Frame::json(FrameKind::Cleaned, &cleaned)?)
+                .await?;
+            Ok(())
+        }
         kind => Err(ovr_proto::Error::Unexpected(kind).into()),
     }
 }
@@ -92,7 +104,7 @@ async fn start<S: AsyncRead + AsyncWrite>(
     store: &Store,
     hello: Hello,
 ) -> Result<Run, Error> {
-    let checkout = Checkout::open(&config.root, &hello.checkout).await?;
+    let checkout = Checkout::open(&config.root, &hello.initiator, &hello.checkout).await?;
     let welcome = match &hello.base {
         Some(base) if !checkout.has_commit(base).await => Welcome::NeedFull,
         _ => Welcome::Ok,
@@ -273,6 +285,7 @@ mod tests {
         let config = Config {
             root: dir.path().join("checkouts"),
             runs: dir.path().join("runs"),
+            agents: dir.path().join("agents"),
             shell: Shell::new("/bin/sh"),
             keeper: None,
         };

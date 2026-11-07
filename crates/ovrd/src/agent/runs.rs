@@ -257,7 +257,12 @@ impl Store {
         Ok(runs)
     }
 
-    fn all(&self) -> io::Result<Vec<Run>> {
+    /// Every run, in no particular order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the runs directory cannot be read.
+    pub fn all(&self) -> io::Result<Vec<Run>> {
         match std::fs::read_dir(&self.dir) {
             Ok(entries) => Ok(entries
                 .filter_map(|entry| Run::at(entry.ok()?.path()).ok())

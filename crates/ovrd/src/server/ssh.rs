@@ -132,7 +132,7 @@ async fn connect(host: &str) -> Result<Connection, Error> {
 }
 
 fn remote_path() -> String {
-    format!(".cache/ovr/bin/ovrd-{VERSION}")
+    format!("{}/ovrd-{VERSION}", ovr_proto::paths::SSH_AGENTS)
 }
 
 /// Starts the agent; `None` when it is not installed.
@@ -281,6 +281,29 @@ async fn ssh_output(host: &str, command: &str) -> Result<String, Error> {
             String::from_utf8_lossy(&output.stderr).trim()
         )))
     }
+}
+
+/// Removes agents downloaded for versions other than this one, returning how many and the bytes they held.
+///
+/// # Errors
+///
+/// Returns an error when the cache cannot be read.
+pub fn clean_downloads() -> Result<(u64, u64), Error> {
+    let dir = ovr_proto::paths::cache_dir()?.join("bin");
+    let versions = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries.filter_map(Result::ok).collect(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err.into()),
+    };
+    let (mut agents, mut bytes) = (0, 0);
+    for version in versions {
+        if version.file_name() == VERSION {
+            continue;
+        }
+        agents += std::fs::read_dir(version.path()).map_or(0, |targets| targets.count() as u64);
+        bytes += crate::agent::clean::remove(&version.path());
+    }
+    Ok((agents, bytes))
 }
 
 /// This binary when the host matches, otherwise the release build for `target`, downloaded once and cached.

@@ -69,6 +69,25 @@ pub struct RunList {
     pub runs: Vec<RunInfo>,
 }
 
+/// `CLEAN`: first frame of a stream that removes `initiator`'s checkouts and finished runs, and agents of other
+/// versions; answered by [`Cleaned`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Clean {
+    pub initiator: String,
+}
+
+/// `CLEANED`: what a clean removed, and what it left because it is in use.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Cleaned {
+    pub checkouts: u64,
+    pub runs: u64,
+    pub agents: u64,
+    /// Bytes freed.
+    pub bytes: u64,
+    /// Checkouts left in place: syncing, or with a run still running.
+    pub kept: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunInfo {
     pub run: u64,
@@ -142,6 +161,8 @@ pub enum Op {
     Tunnels,
     /// Close the tunnel from `provider` and delete what `ovrd` created there.
     CloseTunnel { provider: Provider },
+    /// Remove every checkout and finished run on this machine, and downloaded and uploaded agents of other versions.
+    Clean,
 }
 
 /// `RESPONSE`: the local `ovrd`'s answer to a [`Request`].
@@ -166,6 +187,7 @@ pub enum Response {
         tunnels: Vec<TunnelStatus>,
     },
     TunnelClosed,
+    Cleaned(Cleaned),
     /// `ovrd` is a different version and is exiting; reconnect to start the matching one.
     Restart,
     Failed {

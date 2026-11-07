@@ -1,6 +1,7 @@
 //! The agent: `ovrd` on a host, serving runs from the initiator over a multiplexed connection.
 
 pub mod checkout;
+pub mod clean;
 pub mod keeper;
 mod log;
 pub mod process;
@@ -25,6 +26,8 @@ pub use process::Shell;
 pub struct Config {
     pub root: PathBuf,
     pub runs: PathBuf,
+    /// Where agents uploaded over SSH live, so that cleaning removes other versions.
+    pub agents: PathBuf,
     pub shell: Shell,
     /// The `ovrd` that keeps runs, as `ovrd keep`; `None` keeps them in this process, which only tests want, since
     /// runs then end with it.
@@ -32,7 +35,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// The checkouts and runs directories, the user's shell, and this `ovrd` as keeper.
+    /// The checkouts, runs, and uploaded agents directories, the user's shell, and this `ovrd` as keeper.
     ///
     /// # Errors
     ///
@@ -41,6 +44,7 @@ impl Config {
         Ok(Self {
             root: ovr_proto::paths::checkouts_dir()?,
             runs: ovr_proto::paths::runs_dir()?,
+            agents: ovr_proto::paths::home_dir()?.join(ovr_proto::paths::SSH_AGENTS),
             shell: Shell::detect(),
             keeper: Some(std::env::current_exe()?),
         })
