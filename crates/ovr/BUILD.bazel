@@ -27,7 +27,10 @@ rust_binary(
     aliases = aliases(),
     rustc_env_files = [":cargo_env"],
     visibility = ["//visibility:public"],
-    deps = all_crate_deps(normal = True) + [":lib"],
+    deps = all_crate_deps(normal = True) + [
+        ":lib",
+        "//crates/ovr-proto",
+    ],
 )
 
 rust_test(
@@ -35,5 +38,5 @@ rust_test(
     size = "small",
     crate = ":lib",
     rustc_env_files = [":cargo_env"],
-    deps = all_crate_deps(normal_dev = True),
+    deps = all_crate_deps(normal_dev = True) + ["//crates/ovrd:lib"],
 )

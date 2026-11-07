@@ -18,6 +18,7 @@ rust_library(
     crate_name = "ovrd",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     rustc_env_files = [":cargo_env"],
+    visibility = ["//crates/ovr:__pkg__"],
     deps = all_crate_deps(normal = True) + ["//crates/ovr-proto"],
 )
 
@@ -27,7 +28,10 @@ rust_binary(
     aliases = aliases(),
     rustc_env_files = [":cargo_env"],
     visibility = ["//visibility:public"],
-    deps = all_crate_deps(normal = True) + [":lib"],
+    deps = all_crate_deps(normal = True) + [
+        ":lib",
+        "//crates/ovr-proto",
+    ],
 )
 
 rust_test(

@@ -36,6 +36,10 @@ cargo test --workspace --locked
 bazel test //...
 ```
 
+The client tests in `crates/ovr/src/session.rs` run a real `ovrd` agent in-process against temporary repositories
+and need `git` on `PATH`. Platform-specific code (Windows Job Objects, ConPTY, named pipes) is only compiled on its
+platform; CI checks every released OS.
+
 ## Release
 
 Use [Conventional Commits](https://www.conventionalcommits.org); release-plz turns them into a release PR that bumps

@@ -11,20 +11,29 @@ repository.workspace = true
 ovr-proto.workspace = true
 
 clap = { workspace = true, features = ["derive"] }
-ed25519-dalek.workspace = true
-fd-lock.workspace = true
+gethostname.workspace = true
 miette = { workspace = true, features = ["fancy"] }
 portable-pty.workspace = true
+rcgen = { workspace = true, features = ["crypto", "ring"] }
+ring.workspace = true
 rustls = { workspace = true, features = ["ring", "std"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { workspace = true, features = ["ring"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["ansi", "fmt", "std"] }
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+nix = { workspace = true, features = ["signal", "user"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_Console",
     "Win32_System_JobObjects",
     "Win32_System_Threading",

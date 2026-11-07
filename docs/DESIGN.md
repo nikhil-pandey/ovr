@@ -55,7 +55,7 @@ Constraints that shape the design:
 | Binary | Where it runs | Job |
 |---|---|---|
 | `ovr` | laptop | The CLI. Snapshots the tree and hands the run to the local `ovrd` over a Unix socket (named pipe on Windows). Starts `ovrd` on demand if it is not running. |
-| `ovrd` | laptop **and** every host | The server. On the laptop it owns connections to hosts and runs jobs through them. On a host it is the agent: spawned per run over SSH, or kept running and dialing out to the laptop. |
+| `ovrd` | laptop **and** every host | The server. On the laptop it owns connections to hosts and runs jobs through them. On a host it is the agent: kept running over an SSH session, or dialing out to the laptop. |
 
 The CLI knows nothing about transports. The server knows nothing about Git working trees. Hosts of both kinds look
 identical above the transport layer.
@@ -69,6 +69,7 @@ ovr hosts                   list dialed-in hosts and their OS/arch
 ovrd                        the laptop server; started automatically by ovr, or by launchd/systemd --user
 ovrd pair                   print a one-shot command to run on a host that must dial in
 ovrd connect ADDR CODE      on a host: pair with the laptop at ADDR and keep serving it (printed by `pair`)
+ovrd connect                on a host: keep serving the laptop it already paired with
 ```
 
 - `HOST` is a dialed-in host's name (its hostname, as shown by `ovr hosts`) or an SSH destination: an alias from
@@ -77,8 +78,8 @@ ovrd connect ADDR CODE      on a host: pair with the laptop at ADDR and keep ser
   parsed by `ovr`.
 - The remote command runs in the same directory relative to the repository root as your current directory, so
   `cd crates/engine && ovr box cargo test` does what you expect.
-- The remote command's exit code is returned unchanged. Failures in `ovr` itself exit with `125`, following the
-  `docker run` convention.
+- The remote command's exit code is returned unchanged; a command killed by a signal reports `128 + signal`.
+  Failures in `ovr` itself exit with `125`, following the `docker run` convention.
 
 ## Architecture
 
@@ -98,21 +99,24 @@ ovrd connect ADDR CODE      on a host: pair with the laptop at ADDR and keep ser
  └──────────────────────────────────────────────┘         └─────────────────────────────────┘
 ```
 
-Every run is **one stream** to the host's agent: handshake, sync, execution, and terminal I/O are multiplexed over
-it. For SSH hosts the stream is a session that `ovrd` keeps alive between runs; for dialed-in hosts it is a
-channel over the host's long-lived TLS connection. Above that the two are indistinguishable.
+Every run is **one stream** to the host's agent: handshake, sync, execution, and terminal I/O travel over it.
+Each host has one long-lived connection to its agent, multiplexed into a channel per run: an SSH session that
+`ovrd` keeps alive between runs, or the host's own TLS connection for dialed-in hosts. Above that the two are
+indistinguishable.
 
 ## Transports
 
 ### SSH
 
-`ovrd` runs `ssh HOST ~/.cache/ovr/bin/ovrd-<version> agent`, inheriting everything in `~/.ssh/config`:
-jump hosts, `ProxyCommand`, keys, certificates, Tailscale SSH. If the remote command exits without a `HELLO`
-(binary missing or wrong version), `ovrd` uploads the matching `ovrd` for the remote OS and architecture over
-SFTP and retries. Nothing is installed by hand, and version skew is impossible: both ends are always the same build.
+`ovrd` runs `ssh -T HOST .cache/ovr/bin/ovrd-<version> agent`, inheriting everything in `~/.ssh/config`: jump
+hosts, `ProxyCommand`, keys, certificates, Tailscale SSH. The agent answers with a `BANNER` naming its version and
+platform. If the binary is missing, `ovrd` runs `uname -sm`, uploads the matching `ovrd` over SFTP (its own
+executable when the platforms match, otherwise the release archive for that target, downloaded once and cached in
+`~/.local/state/ovr/bin/`), and retries. Nothing is installed by hand, and version skew is impossible: both ends are
+always the same build. Output before the banner is reported as a noisy shell startup file.
 
-`ovrd` keeps one SSH master connection per host open for ten minutes after the last run (`ControlMaster` on Unix;
-on a Windows laptop, where OpenSSH has no multiplexing, each run pays one connection).
+The agent process is the connection: `ovrd` multiplexes every run to that host over its stdio, and closes it ten
+minutes after the last run. This needs no `ControlMaster`, so a Windows laptop gets the same warm path.
 
 ### Dial-in
 
@@ -127,14 +131,19 @@ For hosts that cannot accept SSH, including every Windows workstation:
  paired with laptop; serving as winbox
 ```
 
-- `ovrd` on the laptop listens on `:7420`. The host runs `ovrd connect ADDR CODE` once; the two exchange
-  Ed25519 identities, after which every connection is TLS 1.3 with **both keys pinned**. Codes are single-use,
-  expire, and wrong guesses are rate-limited. Pairing state lives in `~/.local/state/ovr/` and
-  `%LOCALAPPDATA%\ovr\`; it is a record, like `known_hosts`, not configuration.
+- `ovrd` on the laptop listens on `:7420`. Each side has a self-signed Ed25519 certificate; every connection is
+  TLS 1.3 and each side checks the other's certificate fingerprint, so **both keys are pinned**. The host runs
+  `ovrd connect ADDR CODE` once: it sends its name with an HMAC of both fingerprints keyed by the code, and the
+  laptop answers with its own HMAC, so neither side can be impersonated by someone without the code. Codes are
+  single-use and expire after ten minutes, and five wrong guesses revoke every outstanding code. Pairing state
+  lives in `~/.local/state/ovr/` and `%LOCALAPPDATA%\ovr\`; it is a record, like `known_hosts`, not
+  configuration.
 - After pairing, `ovrd connect` keeps serving: it reconnects with backoff when the laptop sleeps or moves
-  networks, and only ever accepts jobs from the laptop it paired with. It runs as the logged-in user (Scheduled
-  Task at logon on Windows, `launchd`/`systemd --user` elsewhere), never as SYSTEM or root, and only inside
-  `~/ovr` / `C:\ovr`.
+  networks, and only ever accepts jobs from the laptop it paired with. Pairing installs it to start at login as
+  the logged-in user (Scheduled Task on Windows, a `launchd` agent on macOS, a `systemd --user` unit on Linux),
+  never as SYSTEM or root, and it works only inside `~/ovr` / `C:\ovr`. Where no service manager is available it
+  keeps serving in the foreground. A Linux host that should serve without a login session needs
+  `loginctl enable-linger`.
 - The host is addressable by its hostname: `ovr winbox dotnet test`. `ovr hosts` lists what is connected.
 - Reachability is the network's job. On Tailscale, `100.x.y.z` is the laptop's stable address and the WireGuard
   layer already authenticates peers; the pinned keys are defense in depth and also make the design work over any
@@ -189,31 +198,33 @@ allowed on the critical path. Every decision below exists to hit that.
 ```
  t0  ovr: connect to ovrd socket; ovrd: open/reuse host stream ────────┐  (overlaps the snapshot)
  t0  ovr: snapshot: add -A, write-tree, commit-tree                    │
- t1  HELLO{repo, version, base, snapshot} ────────────────────────────►┼─► agent: HELLO{ok | need_full}
+ t1  HELLO{repo, base, snapshot} ──────────────────────────────────────►┼─► agent: WELCOME{ok | need_full}
  t1  PACK frames (speculative, vs base) ──────────────────────────────►┼─► agent: index-pack as frames arrive
- t2  EXEC{argv, cwd, cols, rows} ─────────────────────────────────────►┼─► agent: read-tree, lock, spawn
-     ◄── OUT frames ... ◄── EXIT{code} ────────────────────────────────┘
+ t2  EXEC{argv, cwd, tty, cols, rows} ────────────────────────────────►┼─► agent: lock, read-tree, SYNCED, spawn
+     ◄── OUT/ERR frames ... ◄── EXIT{code} ────────────────────────────┘
 ```
 
-- **Speculative send.** `ovr` records, per host, the last snapshot it delivered as a ref, `refs/ovr/hosts/<host>`,
+- **Speculative send.** `ovr` records, per host, the last snapshot it delivered as a ref,
+  `refs/ovr/hosts/<host>/<repo>`,
   so your local `git gc` cannot prune the delta base out from under the next run (losing it would silently degrade
   to a full-tree send). It assumes the host still has it and streams the thin pack immediately after `HELLO`
-  without waiting for the reply. The agent answers `HELLO` as soon as it reads it; on `need_full` (checkout
-  deleted, first contact) the client aborts the stream and sends a pack with no base. The common case pays zero
+  without waiting for the reply. The agent answers `WELCOME` as soon as it reads `HELLO`; on `need_full`
+  (checkout deleted, first contact) it discards the speculative pack and the client sends one with no base. The common case pays zero
   extra round trips; the rare case pays one.
 - **Pipelined.** `EXEC` follows the pack on the same stream, so the agent starts the command the moment checkout
   finishes without another exchange.
-- **Connections outlive runs.** SSH masters stay up for ten minutes; dial-in connections stay up indefinitely. A
+- **Connections outlive runs.** SSH agents stay up for ten minutes; dial-in connections stay up indefinitely. A
   warm run never pays a TCP or TLS handshake, let alone a jump host.
 - **Overlapped.** Opening the host stream and building the snapshot run concurrently.
 
 ### How the remote applies it
 
 1. `git index-pack --stdin --fix-thin` streams the pack straight into `.git/objects/pack/`.
-2. `git read-tree -m -u <previous> <snapshot>` is a two-tree merge: it touches only paths that differ between the
-   two snapshots, so a one-file edit rewrites one file and its mtime, and everything else keeps its timestamps.
-   Cargo, Bazel, and MSBuild see exactly the changed inputs. Deleted files are removed; `.gitignore`d outputs are
-   never touched because they are not in either tree.
+2. `git read-tree --reset -u <previous> <snapshot>` is a two-tree update: it touches only paths that differ
+   between the two snapshots, so a one-file edit rewrites one file and its mtime, and everything else keeps its
+   timestamps. Cargo, Bazel, and MSBuild see exactly the changed inputs. Deleted files are removed; `.gitignore`d
+   outputs are never touched because they are not in either tree. Edits made on the host to tracked files are
+   overwritten: the laptop is the source of truth.
 3. `refs/ovr/head` is updated to the snapshot; the previous one becomes unreachable. After `EXIT` is sent, the
    agent runs `git gc --auto` in the background so pack accumulation never lands on a run's critical path.
 
@@ -222,9 +233,11 @@ the build creates that is not ignored stays, exactly as it would locally.
 
 ### The wire
 
-- Frames are `type:u8, len:u32le, payload`. Control messages (`HELLO`, `EXEC`, `RESIZE`, `EXIT`) are small JSON and
-  occur a handful of times per run. Data frames (`PACK`, `OUT`, `IN`) carry raw bytes, up to 64 KiB each, and are
-  what the stream is made of.
+- Frames are `type:u8, len:u32le, payload`. Control messages (`HELLO`, `WELCOME`, `EXEC`, `SYNCED`, `RESIZE`,
+  `EXIT`, and `BANNER`/`ACCEPT`/`PAIR` on connection setup) are small JSON and occur a handful of times per run.
+  Data frames (`PACK`, `OUT`, `ERR`, `IN`) carry raw bytes, up to 64 KiB each, and are what the stream is made of.
+- One connection to a host carries many runs as independent channels with per-channel flow control, so a slow
+  terminal on one run never stalls another.
 - The same frames flow `ovr → ovrd` over the local socket and `ovrd → agent` over SSH or TLS; `ovrd`
   forwards them without parsing the data frames.
 - PTY output is read in large chunks and forwarded as-is; no line buffering, no re-encoding. Build output
@@ -243,12 +256,16 @@ the remote from `origin` with the remote user's credentials.
 The agent is `ovrd` on the host, whether spawned per run over SSH or resident via `ovrd connect`.
 
 - **Exec:** argument vector, working directory relative to the checkout, terminal size. No shell string, so no
-  quoting problems on any OS. Environment is the host user's login environment plus `TERM`.
-- **Terminal:** the agent creates the pseudo-terminal (`openpty` on Unix, ConPTY on Windows) and streams output.
-  Input, resize, and interrupt frames flow the other way. Colors, progress bars, and interactive prompts work.
-- **Lifetime:** the command runs in its own process group on Unix and in a Job Object with kill-on-close on Windows.
-  Ctrl-C sends `SIGINT` or `CTRL_BREAK`, then kills the group after a grace period. If the stream drops, the run
-  is killed and the whole process tree goes with it.
+  quoting problems on any OS. On Unix the argument vector is run through the user's login shell
+  (`$SHELL -l -c 'exec "$@"'`) so the host's `PATH` and toolchains are the ones the user sees. Nothing from the
+  laptop's environment is forwarded; terminal runs get `TERM=xterm-256color`.
+- **Terminal:** when `ovr` runs in a terminal, the agent creates a pseudo-terminal (`openpty` on Unix, ConPTY on
+  Windows); otherwise stdout and stderr stay separate pipes, so `ovr box cargo metadata | jq` works. Input, resize,
+  and interrupt frames flow the other way. Colors, progress bars, and interactive prompts work.
+- **Lifetime:** the command runs in its own process group on Unix and in a Job Object on Windows. Ctrl-C is
+  forwarded as an interrupt: `^C` on the terminal, or `SIGINT` to the process group. A second Ctrl-C abandons the
+  run and exits `130`. If the stream drops or the run is abandoned, the whole process tree is killed; processes a
+  command leaves behind after exiting normally, such as build servers, are left alone.
 - **Concurrency:** a per-checkout file lock serialises runs against the same checkout on the same host.
 
 ## Windows
@@ -284,8 +301,8 @@ caches such as sccache or bazel-remote are a per-host concern and work unchanged
 ## Implementation
 
 - Rust. Two binaries from one workspace: `ovr` (CLI) and `ovrd` (server, agent, dial-in client).
-- Crates: `clap`, `miette`, `tokio`, `serde_json`, `rustls` + `ed25519-dalek`, `portable-pty`, `crossterm`,
-  `windows-sys` (Job Objects, console control, named pipes), `fd-lock`.
+- Crates: `clap`, `miette`, `tokio`, `serde_json`, `rustls` + `rcgen` + `ring`, `portable-pty`, `crossterm`,
+  `nix` (signals), `windows-sys` (Job Objects, console control, named pipes). File locks are `std::fs::File::lock`.
 - Uses the system `ssh` and `git`; reimplements neither.
 - Prebuilt binaries for macOS, Linux, and Windows on arm64 and x86-64.
 
