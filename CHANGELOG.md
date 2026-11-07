@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/nikhil-pandey/ovr/compare/v0.2.1...v0.2.2) - 2026-11-07
+
+### Added
+
+- ovr clean, XDG paths, and a cross-runner tunnel e2e ([#9](https://github.com/nikhil-pandey/ovr/pull/9))
+
 ## [0.2.1](https://github.com/nikhil-pandey/ovr/compare/v0.2.0...v0.2.1) - 2026-11-07
 
 ### Added
