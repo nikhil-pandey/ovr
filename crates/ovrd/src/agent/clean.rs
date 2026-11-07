@@ -175,6 +175,7 @@ mod tests {
                 rows: 24,
             },
             started: 0,
+            synced_snapshot: None,
         }
     }
 

@@ -14,7 +14,7 @@ mod tls;
 mod tunnel;
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -84,6 +84,17 @@ pub enum Error {
     #[error(transparent)]
     #[diagnostic(code(ovrd::git))]
     Git(#[from] ovr_proto::git::Error),
+
+    #[error(
+        "{error}\nthe checkout's index stayed locked: wait for the Git command using it to finish, or, once no Git \
+         process is running in the checkout, remove {}",
+        lock.display()
+    )]
+    #[diagnostic(code(ovrd::index_locked))]
+    IndexLocked {
+        error: ovr_proto::git::Error,
+        lock: PathBuf,
+    },
 
     #[error("{0}")]
     #[diagnostic(code(ovrd::invalid))]

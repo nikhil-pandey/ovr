@@ -2,7 +2,7 @@
 //!
 //! | File | Written by | Holds |
 //! |---|---|---|
-//! | `run.json` | agent | the request: initiator, checkout, command, start time |
+//! | `run.json` | agent | the request: initiator, checkout, command, start time, snapshot synced |
 //! | `lock` | keeper | locked for the keeper's whole life, so a free lock means no keeper |
 //! | `pid` | keeper | the command's process group, once it has started |
 //! | `out.*`, `err.*` | keeper | the output log; see [`super::log`] |
@@ -38,6 +38,9 @@ pub struct Meta {
     pub exec: Exec,
     /// Seconds since the Unix epoch.
     pub started: u64,
+    /// The snapshot checked out by the run's sync: the one it sent, or a newer one already applied. The checkout may
+    /// have moved on by the time the command started. `None` in records written before it was kept.
+    pub synced_snapshot: Option<String>,
 }
 
 /// How a run ended.
@@ -339,6 +342,7 @@ mod tests {
                 rows: 24,
             },
             started: now(),
+            synced_snapshot: None,
         }
     }
 

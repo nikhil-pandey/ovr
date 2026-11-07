@@ -366,6 +366,10 @@ them, exactly as they would when you save files locally mid-build.
    outputs are never touched because they are not in either tree. Tracked files the host changed, for example a
    build rewriting a lockfile, are restored even when the snapshot itself is unchanged: the initiator is the source
    of truth.
+   When another Git process holds `.git/index.lock`, the reset retries every 100 ms for up to 2 seconds, then fails
+   the sync with Git's error and advice to wait for that process or, once none remains, remove the lock. The apply
+   lock only coordinates `ovr`'s own syncs, so the agent cannot tell a live writer from an abandoned lock and never
+   removes it.
 3. Reflogs are off in the checkout, so a snapshot becomes unreachable once it is neither checked out nor among the
    four kept. After a command exits, its keeper runs `git gc --auto` unless a sync or another collection holds the
    object lock. Collection stays under that lock until Git finishes, alongside draining clients; a new sync waits
@@ -465,10 +469,12 @@ disconnect, not a stop.
   on Windows). A new agent finds running keepers through their directories. Keepers are a few megabytes, so under
   memory pressure the kernel's OOM killer picks the build over its keeper.
 - **Run directory.** `runs/<n>/` in the host's state directory (see [Files](#files)) holds the exec request, the
-  checkout and snapshot, the initiator identity that started it, the start time, the output log (`out`, plus `err`
-  for runs without a terminal), and, once the command ends, its exit code. Logs keep the last 32 to 64 MiB of
-  each stream; offsets count from the start of the run, so a client always knows what it missed. Finished runs are
-  removed after seven days, or by `ovr clean`.
+  checkout, the snapshot its sync checked out, the initiator identity that started it, the start time, the output
+  log (`out`, plus `err` for runs without a terminal), and, once the command ends, its exit code. The snapshot is the
+  one the run sent or a newer one a concurrent run had already applied; the agent logs it with the run's number. It
+  is diagnostic context only: another sync may change the checkout before the command starts, and the snapshot's
+  objects are not retained for replay. Logs keep the last 32 to 64 MiB of each stream; offsets count from the start
+  of the run, so a client always knows what it missed. Finished runs are removed after seven days, or by `ovr clean`.
 - **Reconnect.** When a run's stream breaks, `ovr` says so on stderr, reconnects with backoff, and sends
   `ATTACH{run, out, err}` with the byte offsets it already has; the keeper replays the rest and continues live. A
   terminal run gets the current window size. Input typed while disconnected is dropped rather than replayed late.

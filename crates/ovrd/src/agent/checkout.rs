@@ -3,10 +3,12 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use ovr_proto::{git, retained};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, Command};
+use tokio::time::Instant;
 
 use crate::Error;
 
@@ -18,6 +20,9 @@ const APPLIED: &str = "ovr-applied";
 const GC_LOCK: &str = "ovr-gc.lock";
 /// Snapshots synced most recently, kept so that the initiator can pack against any of them.
 const KEPT: &str = "refs/ovr/kept/";
+/// How long a reset waits for another Git process to release the index, and how often it tries meanwhile.
+const INDEX_WAIT: Duration = Duration::from_secs(2);
+const INDEX_RETRY: Duration = Duration::from_millis(100);
 
 pub struct Checkout {
     dir: PathBuf,
@@ -121,12 +126,13 @@ impl Checkout {
     /// files whose content differs are rewritten, so unchanged files keep their timestamps; tracked files changed on
     /// the host are restored: the initiator is the source of truth. Commands already running carry on.
     ///
-    /// Returns a warning for the client when submodules could not be updated.
+    /// Another Git process holding the index briefly delays the reset; one that keeps it fails it, and its lock is
+    /// never removed.
     ///
     /// # Errors
     ///
-    /// Returns an error when `snapshot` is missing or Git fails.
-    pub async fn apply(&self, snapshot: &str, seq: u64) -> Result<Option<String>, Error> {
+    /// Returns an error when `snapshot` is missing, the index stays locked, or Git fails.
+    pub async fn apply(&self, snapshot: &str, seq: u64) -> Result<Applied, Error> {
         if !self.has_commit(snapshot).await {
             return Err(Error::Invalid(format!(
                 "snapshot {snapshot} did not arrive"
@@ -140,24 +146,46 @@ impl Checkout {
             }
             _ => (snapshot.to_owned(), true),
         };
-        git::run(&self.dir, &["reset", "--hard", "-q", &target]).await?;
+        self.reset(&target).await?;
         if newest {
             std::fs::write(git_dir.join(APPLIED), format!("{seq} {snapshot}\n"))?;
         }
         let kept = retained::read(&self.dir, KEPT).await?;
         retained::keep(&self.dir, KEPT, &kept, snapshot, &kept).await?;
-        if !self.dir.join(".gitmodules").is_file() {
-            return Ok(None);
-        }
-        // Submodules come from their remotes with the host's credentials.
-        let updated = git::run(
-            &self.dir,
-            &["submodule", "update", "--init", "--recursive", "-q"],
-        )
-        .await;
-        Ok(updated
+        let warning = if self.dir.join(".gitmodules").is_file() {
+            // Submodules come from their remotes with the host's credentials.
+            git::run(
+                &self.dir,
+                &["submodule", "update", "--init", "--recursive", "-q"],
+            )
+            .await
             .err()
-            .map(|err| format!("submodules were not updated: {err}")))
+            .map(|err| format!("submodules were not updated: {err}"))
+        } else {
+            None
+        };
+        Ok(Applied {
+            commit: target,
+            warning,
+        })
+    }
+
+    /// Checks out `commit`, retrying for a while when another Git process holds the index.
+    async fn reset(&self, commit: &str) -> Result<(), Error> {
+        let deadline = Instant::now() + INDEX_WAIT;
+        loop {
+            match git::run(&self.dir, &["reset", "--hard", "-q", commit]).await {
+                Ok(_) => return Ok(()),
+                Err(error) if !index_locked(&error) => return Err(error.into()),
+                Err(error) if Instant::now() >= deadline => {
+                    return Err(Error::IndexLocked {
+                        error,
+                        lock: self.dir.join(".git").join("index.lock"),
+                    });
+                }
+                Err(_) => tokio::time::sleep(INDEX_RETRY).await,
+            }
+        }
     }
 
     /// Resolves the client's working directory, given relative to the repository root.
@@ -214,6 +242,15 @@ impl Checkout {
             .status()
             .await;
     }
+}
+
+/// The outcome of [`Checkout::apply`].
+#[derive(Debug)]
+pub struct Applied {
+    /// The snapshot checked out: the one asked for, or a newer one a concurrent run already applied.
+    pub commit: String,
+    /// For the client, when submodules could not be updated.
+    pub warning: Option<String>,
 }
 
 /// A running `git index-pack`, fed one frame at a time.
@@ -274,9 +311,96 @@ pub fn owner(initiator: &str) -> Result<&str, Error> {
     Ok(&initiator[..initiator.len().min(16)])
 }
 
+/// Whether Git failed because another process holds the index's lock file.
+fn index_locked(error: &git::Error) -> bool {
+    matches!(error, git::Error::Failed { stderr, .. } if stderr.contains("index.lock"))
+}
+
 /// The newest snapshot applied to the checkout whose Git directory is `git_dir`, and its number.
 fn applied(git_dir: &Path) -> Option<(u64, String)> {
     let text = std::fs::read_to_string(git_dir.join(APPLIED)).ok()?;
     let (seq, commit) = text.trim().split_once(' ')?;
     Some((seq.parse().ok()?, commit.to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A checkout with one empty commit per message, returned in order.
+    async fn checkout(root: &Path, messages: &[&str]) -> Result<(Checkout, Vec<String>), Error> {
+        let checkout = Checkout::open(root, "me", "repo").await?;
+        let mut commits = Vec::new();
+        for message in messages {
+            git::run(
+                checkout.dir(),
+                &[
+                    "-c",
+                    "user.name=ovr",
+                    "-c",
+                    "user.email=ovr@localhost",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    message,
+                ],
+            )
+            .await?;
+            commits.push(
+                git::run(checkout.dir(), &["rev-parse", "HEAD"])
+                    .await?
+                    .trim()
+                    .to_owned(),
+            );
+        }
+        Ok((checkout, commits))
+    }
+
+    #[tokio::test]
+    async fn a_late_snapshot_records_the_newer_one_applied() -> Result<(), Error> {
+        let root = tempfile::tempdir()?;
+        let (checkout, commits) = checkout(root.path(), &["old", "new"]).await?;
+        assert_eq!(checkout.apply(&commits[1], 2).await?.commit, commits[1]);
+        assert_eq!(checkout.apply(&commits[0], 1).await?.commit, commits[1]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_briefly_held_index_lock_is_waited_for() -> Result<(), Error> {
+        let root = tempfile::tempdir()?;
+        let (checkout, commits) = checkout(root.path(), &["one"]).await?;
+        let lock = checkout.dir().join(".git").join("index.lock");
+        std::fs::write(&lock, "")?;
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            std::fs::remove_file(lock)
+        });
+        assert_eq!(checkout.apply(&commits[0], 1).await?.commit, commits[0]);
+        release.await.map_err(io::Error::from)??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_held_index_lock_fails_the_apply_and_is_left_alone() -> Result<(), Error> {
+        let root = tempfile::tempdir()?;
+        let (checkout, commits) = checkout(root.path(), &["one"]).await?;
+        let lock = checkout.dir().join(".git").join("index.lock");
+        std::fs::write(&lock, "another writer")?;
+        let started = Instant::now();
+        let result = checkout.apply(&commits[0], 1).await;
+        assert!(started.elapsed() >= INDEX_WAIT, "it waits before failing");
+        assert!(
+            matches!(&result, Err(Error::IndexLocked { .. })),
+            "{result:?}"
+        );
+        let message = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(message.contains(&lock.display().to_string()), "{message}");
+        assert_eq!(std::fs::read_to_string(&lock)?, "another writer");
+        Ok(())
+    }
 }

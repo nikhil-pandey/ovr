@@ -128,7 +128,7 @@ async fn start<S: AsyncRead + AsyncWrite>(
     let exec: Exec = next(frames).await?.expect(FrameKind::Exec)?;
 
     let applying = Instant::now();
-    let warning = checkout.apply(&hello.snapshot, hello.seq).await?;
+    let applied = checkout.apply(&hello.snapshot, hello.seq).await?;
     drop(objects);
     writer.send(Frame::empty(FrameKind::Synced)).await?;
     tracing::info!(
@@ -138,7 +138,7 @@ async fn start<S: AsyncRead + AsyncWrite>(
         apply_ms = applying.elapsed().as_millis(),
         "synced"
     );
-    if let Some(warning) = warning {
+    if let Some(warning) = applied.warning {
         writer
             .send(Frame::new(FrameKind::Err, format!("ovr: {warning}\n")))
             .await?;
@@ -150,8 +150,15 @@ async fn start<S: AsyncRead + AsyncWrite>(
         cwd: checkout.cwd(&exec.cwd)?,
         exec,
         started: runs::now(),
+        synced_snapshot: Some(applied.commit),
     };
     let run = store.create(&meta).await?;
+    tracing::info!(
+        run = run.id,
+        checkout = meta.checkout,
+        snapshot = meta.synced_snapshot,
+        "recorded run"
+    );
     keeper::start(config, &run).await?;
     Ok((run, checkout.into_claim()))
 }
