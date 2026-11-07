@@ -41,6 +41,12 @@ pub struct Resize {
     pub rows: u16,
 }
 
+/// `CONSUMED`: how much input, in total, the command has consumed or the agent has discarded, so the client may send more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Consumed {
+    pub bytes: u64,
+}
+
 /// `EXIT`: the command finished; always the last frame of a successful run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Exit {

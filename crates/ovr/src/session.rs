@@ -1,12 +1,14 @@
 //! The client half of a run: sync the snapshot, start the command, and relay terminal I/O until it exits.
 
-use bytes::BytesMut;
+use std::convert::Infallible;
+
+use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
-use ovr_proto::frame::{self, CHUNK, Reader, Writer};
-use ovr_proto::msg::{Exec, Exit, Failure, Resize, Welcome};
+use ovr_proto::frame::{self, CHUNK, INPUT_WINDOW, Reader, Writer};
+use ovr_proto::msg::{Consumed, Exec, Exit, Failure, Resize, Welcome};
 use ovr_proto::{Frame, FrameKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::Error;
 use crate::snapshot::Snapshot;
@@ -14,23 +16,18 @@ use crate::snapshot::Snapshot;
 /// Exit code reported when a second interrupt abandons the run, as a shell does for `SIGINT`.
 pub const INTERRUPTED: i32 = 130;
 
-/// Local terminal events forwarded to the remote command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Input {
-    Data(bytes::Bytes),
-    /// Local stdin ended.
-    Eof,
-    Resize {
-        cols: u16,
-        rows: u16,
-    },
-    /// Ctrl-C outside a terminal; inside one it arrives as input.
+/// Local terminal events forwarded to the remote command, ahead of any pending input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    Resize { cols: u16, rows: u16 },
     Interrupt,
 }
 
 /// Where a run's input comes from and its output goes.
 pub struct Io<O, E> {
-    pub input: mpsc::Receiver<Input>,
+    /// Local stdin; it ends when the sender is dropped.
+    pub stdin: mpsc::Receiver<Bytes>,
+    pub signals: mpsc::Receiver<Signal>,
     pub stdout: O,
     pub stderr: E,
 }
@@ -125,60 +122,102 @@ async fn send_pack<S: AsyncRead + AsyncWrite>(
     Ok(welcome)
 }
 
+/// Receives output, forwards signals, and sends input concurrently, so neither a slow local terminal nor a command
+/// that ignores its input keeps a second Ctrl-C from abandoning the run.
 async fn relay<S, O, E>(
     writer: &mut Writer<S>,
     frames: &mut Reader<S>,
     snapshot: &Snapshot,
     synced: &mut bool,
-    mut io: Io<O, E>,
+    io: Io<O, E>,
 ) -> Result<i32, Error>
 where
     S: AsyncRead + AsyncWrite,
     O: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    let mut input_open = true;
-    let mut interrupted = false;
-    loop {
-        tokio::select! {
-            frame = next(frames) => {
-                let frame = frame?;
-                match frame.kind {
-                    FrameKind::Synced => {
-                        *synced = true;
-                        snapshot.synced().await?;
-                    }
-                    FrameKind::Out => {
-                        io.stdout.write_all(&frame.payload).await?;
-                        io.stdout.flush().await?;
-                    }
-                    FrameKind::Err => {
-                        io.stderr.write_all(&frame.payload).await?;
-                        io.stderr.flush().await?;
-                    }
-                    FrameKind::Exit => return Ok(frame.parse::<Exit>()?.code),
-                    kind => return Err(ovr_proto::Error::Unexpected(kind).into()),
+    let Io {
+        mut stdin,
+        mut signals,
+        mut stdout,
+        mut stderr,
+    } = io;
+    let (consumed_tx, mut consumed) = watch::channel(0);
+    let (control_tx, mut control) = mpsc::unbounded_channel();
+
+    let receive = async {
+        loop {
+            let frame = next(frames).await?;
+            match frame.kind {
+                FrameKind::Synced => {
+                    *synced = true;
+                    snapshot.synced().await?;
                 }
+                FrameKind::Out => {
+                    stdout.write_all(&frame.payload).await?;
+                    stdout.flush().await?;
+                }
+                FrameKind::Err => {
+                    stderr.write_all(&frame.payload).await?;
+                    stderr.flush().await?;
+                }
+                FrameKind::Consumed => {
+                    consumed_tx.send_replace(frame.parse::<Consumed>()?.bytes);
+                }
+                FrameKind::Exit => return Ok(frame.parse::<Exit>()?.code),
+                kind => return Err(ovr_proto::Error::Unexpected(kind).into()),
             }
-            input = io.input.recv(), if input_open => {
-                let frame = match input {
-                    Some(Input::Data(data)) => Frame::new(FrameKind::In, data),
-                    Some(Input::Resize { cols, rows }) => Frame::json(FrameKind::Resize, &Resize { cols, rows })?,
-                    Some(Input::Interrupt) if interrupted => return Ok(INTERRUPTED),
-                    Some(Input::Interrupt) => {
-                        interrupted = true;
-                        Frame::empty(FrameKind::Interrupt)
-                    }
-                    // Interrupts may still follow the end of stdin.
-                    Some(Input::Eof) => Frame::empty(FrameKind::In),
-                    None => {
-                        input_open = false;
+        }
+    };
+    let forward_signals = async {
+        let mut interrupted = false;
+        while let Some(signal) = signals.recv().await {
+            let frame = match signal {
+                Signal::Resize { cols, rows } => {
+                    Frame::json(FrameKind::Resize, &Resize { cols, rows })?
+                }
+                Signal::Interrupt if interrupted => return Ok(INTERRUPTED),
+                Signal::Interrupt => {
+                    interrupted = true;
+                    Frame::empty(FrameKind::Interrupt)
+                }
+            };
+            let _ = control_tx.send(frame);
+        }
+        std::future::pending().await
+    };
+    let send = async {
+        let mut sent = 0;
+        let mut stdin_open = true;
+        loop {
+            // The agent holds what the command has not consumed yet; this bounds how much.
+            let room = sent < *consumed.borrow_and_update() + INPUT_WINDOW;
+            let frame = tokio::select! {
+                biased;
+                Some(frame) = control.recv() => frame,
+                data = stdin.recv(), if stdin_open && room => {
+                    if let Some(data) = data {
+                        sent += data.len() as u64;
+                        Frame::new(FrameKind::In, data)
+                    } else {
+                        stdin_open = false;
                         Frame::empty(FrameKind::In)
                     }
-                };
-                writer.send(frame).await?;
-            },
+                }
+                Ok(()) = consumed.changed(), if stdin_open && !room => continue,
+                else => break,
+            };
+            if writer.send(frame).await.is_err() {
+                break;
+            }
         }
+        // Nothing more can be sent; the agent's last frames, or the lost connection, end the run.
+        std::future::pending::<Infallible>().await
+    };
+    tokio::select! {
+        result = receive => result,
+        result = forward_signals => result,
+        never = send => match never {},
     }
 }
 
@@ -212,6 +251,17 @@ mod tests {
         script: &str,
         stdin: &[u8],
     ) -> Result<Run, Error> {
+        ovr_with(repo, cwd, host_root, script, stdin, mpsc::channel(1).1).await
+    }
+
+    async fn ovr_with(
+        repo: &Path,
+        cwd: &str,
+        host_root: &Path,
+        script: &str,
+        stdin: &[u8],
+        signals: mpsc::Receiver<Signal>,
+    ) -> Result<Run, Error> {
         let snapshot = Snapshot::take(&repo.join(cwd), "box").await?;
         let exec = Exec {
             argv: vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
@@ -227,17 +277,20 @@ mod tests {
         let (client, agent) = tokio::io::duplex(1 << 16);
         let agent = tokio::spawn(async move { ovrd::agent::session::serve(agent, &config).await });
 
-        let (input_tx, input) = mpsc::channel(4);
-        if !stdin.is_empty() {
-            input_tx
-                .send(Input::Data(stdin.to_vec().into()))
-                .await
-                .map_err(|_| Error::Disconnected)?;
-        }
-        drop(input_tx);
+        let (stdin_tx, stdin_rx) = mpsc::channel(4);
+        let stdin = Bytes::copy_from_slice(stdin);
+        tokio::spawn(async move {
+            for at in (0..stdin.len()).step_by(CHUNK) {
+                let chunk = stdin.slice(at..stdin.len().min(at + CHUNK));
+                if stdin_tx.send(chunk).await.is_err() {
+                    return;
+                }
+            }
+        });
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         let io = Io {
-            input,
+            stdin: stdin_rx,
+            signals,
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
@@ -371,6 +424,47 @@ mod tests {
         assert!(matches!(err, Some(Error::Remote(_))), "{err:?}");
         let snapshot = Snapshot::take(repo.path(), "box").await?;
         assert_eq!(snapshot.base, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn input_beyond_the_window_flows_as_the_command_reads_it() -> Result<(), Error> {
+        let repo = repo()?;
+        let host = tempfile::tempdir()?;
+        let input = vec![b'x'; 3 * usize::try_from(INPUT_WINDOW).unwrap_or_default()];
+
+        let slow = ovr(repo.path(), "", host.path(), "sleep 1; wc -c", &input).await?;
+        assert_eq!(slow.stdout.trim(), input.len().to_string());
+        let ignored = ovr(repo.path(), "", host.path(), "echo done", &input).await?;
+        assert_eq!((ignored.code, ignored.stdout.as_str()), (0, "done\n"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn interrupts_reach_the_command_and_a_second_abandons_the_run() -> Result<(), Error> {
+        let repo = repo()?;
+        let host = tempfile::tempdir()?;
+        let interrupt = |count| {
+            let (tx, rx) = mpsc::channel(2);
+            tokio::spawn(async move {
+                for _ in 0..count {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let _ = tx.send(Signal::Interrupt).await;
+                }
+                tx.closed().await;
+            });
+            rx
+        };
+
+        let run = ovr_with(repo.path(), "", host.path(), "sleep 30", b"", interrupt(1)).await?;
+        assert_eq!(run.code, 128 + 2, "SIGINT");
+
+        let marker = host.path().join("survived");
+        let script = format!("trap '' INT; sleep 2; touch {}", marker.display());
+        let run = ovr_with(repo.path(), "", host.path(), &script, b"", interrupt(2)).await?;
+        assert_eq!(run.code, INTERRUPTED);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(!marker.exists(), "an abandoned run kills its command");
         Ok(())
     }
 }

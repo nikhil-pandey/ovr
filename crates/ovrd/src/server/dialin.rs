@@ -89,16 +89,12 @@ where
 {
     let request: Pair = frame.parse()?;
     let laptop = &server.identity.fingerprint;
+    let proof = pairing::Proof::host(laptop, host, &request.hostname);
     let code = server
         .codes
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .redeem(|code| {
-            pairing::matches(
-                &pairing::host_mac(code, laptop, host, &request.hostname),
-                &request.mac,
-            )
-        });
+        .redeem(|code| proof.verify(code, &request.mac));
     let Some(code) = code else {
         let message = "the pairing code is wrong or has expired; run `ovrd pair` again".to_owned();
         stream
@@ -117,7 +113,7 @@ where
             fingerprint: host.to_owned(),
         },
     )?;
-    let mac = pairing::laptop_mac(&code, laptop, host);
+    let mac = pairing::Proof::laptop(laptop, host).sign(&code);
     stream
         .send(Frame::json(FrameKind::PairOk, &PairOk { mac })?)
         .await?;

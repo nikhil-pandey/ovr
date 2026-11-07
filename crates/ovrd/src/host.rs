@@ -41,7 +41,7 @@ pub async fn pair(addr: &str, code: &str) -> Result<(), Error> {
     let (mut stream, laptop) = dial(&identity, &addr).await?;
 
     let hostname = agent::hostname();
-    let mac = pairing::host_mac(&code, &laptop, &identity.fingerprint, &hostname);
+    let mac = pairing::Proof::host(&laptop, &identity.fingerprint, &hostname).sign(&code);
     let pair = Pair {
         hostname: hostname.clone(),
         mac,
@@ -52,10 +52,7 @@ pub async fn pair(addr: &str, code: &str) -> Result<(), Error> {
         return Err(Error::Pairing(reply.parse::<Failure>()?.message));
     }
     let PairOk { mac } = reply.expect(FrameKind::PairOk)?;
-    if !pairing::matches(
-        &pairing::laptop_mac(&code, &laptop, &identity.fingerprint),
-        &mac,
-    ) {
+    if !pairing::Proof::laptop(&laptop, &identity.fingerprint).verify(&code, &mac) {
         return Err(Error::Pairing(format!(
             "{addr} did not prove it issued the code; something may be intercepting the connection"
         )));

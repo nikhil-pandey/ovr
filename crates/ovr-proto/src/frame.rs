@@ -14,6 +14,10 @@ pub const CHUNK: usize = 64 * 1024;
 /// Largest payload any frame may carry; bounds memory for control frames such as a long `EXEC` argv.
 pub const MAX_LEN: usize = 1024 * 1024;
 
+/// A client sends input only while less than this is unconsumed, as reported by `CONSUMED`, so the agent holds at
+/// most this plus one frame on behalf of a command that is not reading, and can always keep reading frames.
+pub const INPUT_WINDOW: u64 = 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FrameKind {
@@ -32,6 +36,7 @@ pub enum FrameKind {
     Err = 19,
     Exit = 20,
     Error = 21,
+    Consumed = 22,
 
     // `ovr` to the local `ovrd`.
     Request = 32,
@@ -49,8 +54,8 @@ impl TryFrom<u8> for FrameKind {
 
     fn try_from(byte: u8) -> Result<Self, Error> {
         use FrameKind::{
-            Accept, Banner, Err, Error as Fail, Exec, Exit, Hello, In, Interrupt, Out, Pack, Pair,
-            PairOk, Request, Resize, Response, Synced, Welcome,
+            Accept, Banner, Consumed, Err, Error as Fail, Exec, Exit, Hello, In, Interrupt, Out,
+            Pack, Pair, PairOk, Request, Resize, Response, Synced, Welcome,
         };
         Ok(match byte {
             1 => Hello,
@@ -65,6 +70,7 @@ impl TryFrom<u8> for FrameKind {
             19 => Err,
             20 => Exit,
             21 => Fail,
+            22 => Consumed,
             32 => Request,
             33 => Response,
             48 => Banner,

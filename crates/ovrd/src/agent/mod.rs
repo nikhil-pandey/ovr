@@ -12,6 +12,7 @@ use futures::SinkExt;
 use ovr_proto::msg::{Banner, Platform};
 use ovr_proto::{Frame, FrameKind, PROTOCOL_VERSION, VERSION, frame};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::task::JoinSet;
 use tokio_util::codec::FramedWrite;
 
 use crate::mux::Incoming;
@@ -66,16 +67,25 @@ pub fn hostname() -> String {
         .to_ascii_lowercase()
 }
 
-/// Serves runs over `stream` until the laptop closes it.
+/// Serves runs over `stream` until the laptop closes it, then ends the runs still in progress, killing their
+/// commands, before returning.
 pub async fn serve<S>(stream: S, config: Arc<Config>)
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let mut incoming = Incoming::accept_on(stream);
-    while let Some(channel) = incoming.accept().await {
-        let config = Arc::clone(&config);
-        tokio::spawn(async move { session::serve(channel, &config).await });
+    let mut sessions = JoinSet::new();
+    loop {
+        tokio::select! {
+            channel = incoming.accept() => {
+                let Some(channel) = channel else { break };
+                let config = Arc::clone(&config);
+                sessions.spawn(async move { session::serve(channel, &config).await });
+            }
+            Some(_) = sessions.join_next() => {}
+        }
     }
+    sessions.shutdown().await;
 }
 
 /// `ovrd agent`: announce this host on stdout, then serve over stdin and stdout until SSH closes them.

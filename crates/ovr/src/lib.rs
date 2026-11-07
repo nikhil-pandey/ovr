@@ -130,9 +130,10 @@ async fn run_on(host: String, argv: Vec<String>) -> Result<i32, Error> {
         cols,
         rows,
     };
-    let (_terminal, input) = terminal::start(tty)?;
+    let (_terminal, stdin, signals) = terminal::start(tty)?;
     let io = session::Io {
-        input,
+        stdin,
+        signals,
         stdout: tokio::io::stdout(),
         stderr: tokio::io::stderr(),
     };

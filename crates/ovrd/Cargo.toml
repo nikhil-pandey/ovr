@@ -17,7 +17,7 @@ futures.workspace = true
 gethostname.workspace = true
 miette = { workspace = true, features = ["fancy"] }
 portable-pty.workspace = true
-process-wrap = { workspace = true, features = ["job-object", "process-group", "tokio1"] }
+process-wrap = { workspace = true, features = ["job-object", "kill-on-drop", "process-group", "tokio1"] }
 rcgen = { workspace = true, features = ["crypto", "ring"] }
 ring.workspace = true
 rustls = { workspace = true, features = ["ring", "std"] }
@@ -35,7 +35,7 @@ yamux.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
-nix = { workspace = true, features = ["signal", "user"] }
+nix = { workspace = true, features = ["fs", "process", "signal", "user"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

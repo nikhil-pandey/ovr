@@ -236,7 +236,7 @@ creates that is not tracked stays, exactly as it would locally.
 
 - Frames are `len:u32le, kind:u8, payload`, where `len` covers the kind and payload, read and written with
   `tokio-util`'s length-delimited codec. Control messages (`HELLO`, `WELCOME`, `EXEC`, `SYNCED`, `RESIZE`,
-  `EXIT`, and `BANNER`/`ACCEPT`/`PAIR` on connection setup) are small JSON and occur a handful of times per run.
+  `CONSUMED`, `EXIT`, and `BANNER`/`ACCEPT`/`PAIR` on connection setup) are small JSON.
   Data frames (`PACK`, `OUT`, `ERR`, `IN`) carry raw bytes, up to 64 KiB each, and are what the stream is made of.
 - One connection to a host carries many runs as independent [yamux](https://github.com/libp2p/rust-yamux) streams
   with per-stream flow control, so a slow terminal on one run never stalls another.
@@ -247,8 +247,10 @@ creates that is not tracked stays, exactly as it would locally.
 - Backpressure is the stream's: the agent stops reading the PTY when the client is slow, so `yes | head` behaves.
   After the command exits, output drains until the terminal or pipes have been idle for a second, so a slow client
   gets everything while a leftover build server holding them open does not hang the run.
-- Input the command has not read yet is held by the agent up to 1 MiB while it keeps reading frames, so Ctrl-C and
-  a vanished client are noticed even when the command ignores its input.
+- Input has its own window: the client sends stdin only while less than 1 MiB is unconsumed, and the agent reports
+  with `CONSUMED` as the command takes it. The agent therefore always keeps reading frames, and both sides relay
+  input and output concurrently, so a command that ignores its input and a terminal that stops reading output never
+  hold up Ctrl-C or each other.
 
 ### Checkout location
 
@@ -269,12 +271,16 @@ The agent is `ovrd` on the host, whether spawned per run over SSH or resident vi
 - **Terminal:** when `ovr` runs in a terminal, the agent creates a pseudo-terminal (`openpty` on Unix, ConPTY on
   Windows); otherwise stdout and stderr stay separate pipes, so `ovr box cargo metadata | jq` works. Input, resize,
   and interrupt frames flow the other way. Colors, progress bars, and interactive prompts work.
-- **Lifetime:** the command runs in its own process group on Unix and in a Job Object on Windows. Ctrl-C is
-  forwarded as an interrupt: `^C` on the terminal, `SIGINT` to the process group, or, for a Windows command without
-  a terminal, which has no equivalent signal, terminating its Job Object. A second Ctrl-C abandons the
-  run and exits `130`. If the stream drops or the run is abandoned, the whole process tree is killed; processes a
-  command leaves behind after exiting normally, such as build servers, are left alone.
-- **Concurrency:** a per-checkout file lock serialises runs against the same checkout on the same host.
+- **Lifetime:** the command runs in its own process group on Unix and in a Job Object on Windows. Ctrl-C, read as
+  a key in raw mode or as a signal otherwise, is forwarded as an interrupt: `^C` on the terminal, ahead of pending
+  input, `SIGINT` to the process group, or, for a Windows command without a terminal, which has no equivalent
+  signal, terminating its Job Object. A second Ctrl-C abandons the run and exits `130`. If the stream drops, the
+  connection ends, or the run is abandoned, the whole process tree is killed at once, also when the agent itself
+  is exiting; a Job Object kills its processes when its last handle closes, even if `ovrd` crashes. Processes a
+  command leaves behind after exiting normally, such as build servers, are left alone. ConPTY cannot start a
+  command suspended, so on Windows a terminal command is assigned to its job just after starting.
+- **Concurrency:** a per-checkout file lock serialises runs against the same checkout on the same host. A queued
+  run keeps reading frames, so Ctrl-C (exit `130`) or a vanished client ends the wait.
 
 ## Windows
 

@@ -74,37 +74,57 @@ pub fn normalize(input: &str) -> Option<String> {
     (code.len() == LEN && code.bytes().all(|b| ALPHABET.contains(&b))).then_some(code)
 }
 
-/// The host's proof: it knows the code and saw these fingerprints.
-#[must_use]
-pub fn host_mac(code: &str, laptop: &str, host: &str, hostname: &str) -> String {
-    mac(code, &["ovr pair v1", laptop, host, hostname])
-}
+/// What one side signs with the code to prove it took part in this exchange.
+pub struct Proof(Vec<u8>);
 
-/// The laptop's proof in reply.
-#[must_use]
-pub fn laptop_mac(code: &str, laptop: &str, host: &str) -> String {
-    mac(code, &["ovr pair ok v1", laptop, host])
-}
-
-/// Constant-time comparison of a received MAC against the expected one.
-#[must_use]
-pub fn matches(expected: &str, received: &str) -> bool {
-    let difference = expected
-        .bytes()
-        .zip(received.bytes())
-        .fold(0, |acc, (a, b)| acc | (a ^ b));
-    expected.len() == received.len() && std::hint::black_box(difference) == 0
-}
-
-fn mac(code: &str, parts: &[&str]) -> String {
-    let key = hmac::Key::new(hmac::HMAC_SHA256, code.as_bytes());
-    let mut context = hmac::Context::with_key(&key);
-    for part in parts {
-        // Length-prefixed so that no two different part lists produce the same input.
-        context.update(&(part.len() as u64).to_le_bytes());
-        context.update(part.as_bytes());
+impl Proof {
+    /// The host's proof: it knows the code and saw these fingerprints.
+    #[must_use]
+    pub fn host(laptop: &str, host: &str, hostname: &str) -> Self {
+        Self::of(&["ovr pair v1", laptop, host, hostname])
     }
-    hex(context.sign().as_ref())
+
+    /// The laptop's proof in reply.
+    #[must_use]
+    pub fn laptop(laptop: &str, host: &str) -> Self {
+        Self::of(&["ovr pair ok v1", laptop, host])
+    }
+
+    /// Length-prefixed parts, so that no two different part lists produce the same message.
+    fn of(parts: &[&str]) -> Self {
+        let mut message = Vec::new();
+        for part in parts {
+            message.extend_from_slice(&(part.len() as u64).to_le_bytes());
+            message.extend_from_slice(part.as_bytes());
+        }
+        Self(message)
+    }
+
+    /// The hex MAC to send.
+    #[must_use]
+    pub fn sign(&self, code: &str) -> String {
+        hex(hmac::sign(&key(code), &self.0).as_ref())
+    }
+
+    /// Whether `mac` is this proof signed with `code`, compared in constant time.
+    #[must_use]
+    pub fn verify(&self, code: &str, mac: &str) -> bool {
+        unhex(mac).is_some_and(|tag| hmac::verify(&key(code), &self.0, &tag).is_ok())
+    }
+}
+
+fn key(code: &str) -> hmac::Key {
+    hmac::Key::new(hmac::HMAC_SHA256, code.as_bytes())
+}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 #[cfg(test)]
@@ -148,19 +168,11 @@ mod tests {
 
     #[test]
     fn proofs_bind_the_code_and_both_identities() {
-        let mac = host_mac("7KQXM4RT", "laptop", "host", "winbox");
-        assert!(matches(
-            &mac,
-            &host_mac("7KQXM4RT", "laptop", "host", "winbox")
-        ));
-        assert!(!matches(
-            &mac,
-            &host_mac("7KQXM4RU", "laptop", "host", "winbox")
-        ));
-        assert!(!matches(
-            &mac,
-            &host_mac("7KQXM4RT", "mitm", "host", "winbox")
-        ));
-        assert!(!matches(&mac, &laptop_mac("7KQXM4RT", "laptop", "host")));
+        let mac = Proof::host("laptop", "host", "winbox").sign("7KQXM4RT");
+        assert!(Proof::host("laptop", "host", "winbox").verify("7KQXM4RT", &mac));
+        assert!(!Proof::host("laptop", "host", "winbox").verify("7KQXM4RU", &mac));
+        assert!(!Proof::host("mitm", "host", "winbox").verify("7KQXM4RT", &mac));
+        assert!(!Proof::laptop("laptop", "host").verify("7KQXM4RT", &mac));
+        assert!(!Proof::host("laptop", "host", "winbox").verify("7KQXM4RT", "zz"));
     }
 }
