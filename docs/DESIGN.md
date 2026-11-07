@@ -241,11 +241,13 @@ allowed on the critical path. Every decision below exists to hit that.
 - **Trees, not history.** The remote never needs your Git history; it needs the files. A snapshot is a
   **parentless commit** over the working tree, so the first sync sends exactly the working tree (compressed, ~size of
   a source tarball), never the repository's history. A ten-year monorepo costs the same as a fresh one.
-- **Thin packs, not bundles.** New objects go out as `git pack-objects --thin --stdout --revs` with input
-  `<snapshot>\n^<previous snapshot>`. Thin packs may delta against objects the receiver already has, so editing one
-  line of a 1 MB file sends a few bytes of delta, not a recompressed blob. The remote runs
-  `git index-pack --stdin --fix-thin`, which writes a pack directly; no loose objects, no `git fetch`, no refs
-  negotiation.
+- **Thin packs, not bundles.** New objects go out as `git pack-objects --thin --shallow --stdout --revs` with input
+  `<snapshot>\n^<previous snapshot>`. Snapshots have no parents, so `--shallow` is what makes the previous
+  snapshot's trees and blobs count as already sent; without it every changed sync would resend the whole tree. Thin
+  packs may delta against objects the receiver already has, so editing one line of a 1 MB file sends a few bytes of
+  delta, not a recompressed blob. The remote runs `git index-pack --stdin --fix-thin`, which writes a pack directly;
+  no loose objects, no `git fetch`, no refs negotiation. The host logs each sync with its checkout, the bytes
+  received, and how long receiving and applying took.
 - **Nothing when nothing changed.** If the snapshot tree equals the tree last sent to this host, no pack is built
   and zero bytes of sync cross the wire; the exec request goes immediately.
 - **Already compressed.** Pack data is zlib-compressed by Git, so SSH compression is disabled and the TLS transport
@@ -299,6 +301,10 @@ orders them.
   warm run never pays a TCP or TLS handshake, let alone a jump host. Runs, in turn, outlive connections; see
   [Runs](#runs).
 - **Overlapped.** Opening the host stream and building the snapshot run concurrently.
+- **Failures mid-sync are heard.** An agent that fails while the pack is still arriving, say on a full disk,
+  answers `ERROR` and then reads and discards the rest of the stream, and the client listens to the agent while
+  it sends. Either side alone keeps a pack larger than the stream's window from stalling forever on a host that
+  stopped reading.
 
 ### How the remote applies it
 

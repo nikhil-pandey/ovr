@@ -3,6 +3,8 @@
 //! A stream starts a run (`HELLO`), resumes one (`ATTACH`), or lists runs (`RUNS`). Once a run has started, the
 //! agent only relays frames between the client and the run's keeper, so the stream's end never ends the run.
 
+use std::time::Instant;
+
 use futures::{SinkExt, StreamExt};
 use ovr_proto::frame::{self, Reader, Writer};
 use ovr_proto::msg::{Attach, Attached, Exec, Failure, Hello, RunList, Runs, Welcome};
@@ -32,17 +34,21 @@ where
             Some(err.to_string())
         }
     };
-    if let Some(message) = failure {
-        match Frame::json(FrameKind::Error, &Failure { message }) {
-            Ok(frame) => {
-                if let Err(err) = writer.send(frame).await {
-                    tracing::info!(%err, "cannot report a failure");
-                }
+    let Some(message) = failure else {
+        let _ = writer.close().await;
+        return;
+    };
+    match Frame::json(FrameKind::Error, &Failure { message }) {
+        Ok(frame) => {
+            if let Err(err) = writer.send(frame).await {
+                tracing::info!(%err, "cannot report a failure");
             }
-            Err(err) => tracing::warn!(%err, "cannot encode a failure"),
         }
+        Err(err) => tracing::warn!(%err, "cannot encode a failure"),
     }
     let _ = writer.close().await;
+    // A client still sending a pack would otherwise wait forever for room to write, and never read why.
+    while let Some(Ok(_)) = frames.next().await {}
 }
 
 async fn dispatch<S: AsyncRead + AsyncWrite>(
@@ -98,11 +104,20 @@ async fn start<S: AsyncRead + AsyncWrite>(
         // The speculative pack is useless without its base; skip it and its EXEC.
         while next(frames).await?.kind != FrameKind::Exec {}
     }
-    receive_pack(frames, &checkout).await?;
+    let received = Instant::now();
+    let bytes = receive_pack(frames, &checkout).await?;
     let exec: Exec = next(frames).await?.expect(FrameKind::Exec)?;
 
+    let applying = Instant::now();
     let warning = checkout.apply(&hello.snapshot, hello.seq).await?;
     writer.send(Frame::empty(FrameKind::Synced)).await?;
+    tracing::info!(
+        checkout = hello.checkout,
+        bytes,
+        receive_ms = (applying - received).as_millis(),
+        apply_ms = applying.elapsed().as_millis(),
+        "synced"
+    );
     if let Some(warning) = warning {
         writer
             .send(Frame::new(FrameKind::Err, format!("ovr: {warning}\n")))
@@ -121,12 +136,13 @@ async fn start<S: AsyncRead + AsyncWrite>(
     Ok(run)
 }
 
-/// Indexes pack frames as they arrive, until the empty end-of-pack frame.
+/// Indexes pack frames as they arrive, until the empty end-of-pack frame, and returns the pack's size.
 async fn receive_pack<S: AsyncRead>(
     frames: &mut Reader<S>,
     checkout: &Checkout,
-) -> Result<(), Error> {
+) -> Result<u64, Error> {
     let mut indexer = None;
+    let mut bytes = 0;
     loop {
         let frame = next(frames).await?;
         if frame.kind != FrameKind::Pack {
@@ -135,6 +151,7 @@ async fn receive_pack<S: AsyncRead>(
         if frame.payload.is_empty() {
             break;
         }
+        bytes += frame.payload.len() as u64;
         let indexer = match &mut indexer {
             Some(indexer) => indexer,
             None => indexer.insert(checkout.index_pack()?),
@@ -144,10 +161,10 @@ async fn receive_pack<S: AsyncRead>(
             break;
         }
     }
-    match indexer {
-        Some(indexer) => indexer.finish().await,
-        None => Ok(()),
+    if let Some(indexer) = indexer {
+        indexer.finish().await?;
     }
+    Ok(bytes)
 }
 
 /// Relays between the client and the run's keeper or, once the run has ended, replays its log from disk.
@@ -239,4 +256,64 @@ async fn replay<S: AsyncRead + AsyncWrite>(
 
 async fn next<S: AsyncRead>(frames: &mut Reader<S>) -> Result<Frame, Error> {
     Ok(frames.next().await.ok_or(Error::Disconnected)??)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::time::Duration;
+
+    use super::super::Shell;
+    use super::*;
+    use crate::mux::{Incoming, Mux};
+
+    #[tokio::test]
+    async fn a_failed_sync_lets_the_client_finish_sending_and_hear_why()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let config = Config {
+            root: dir.path().join("checkouts"),
+            runs: dir.path().join("runs"),
+            shell: Shell::new("/bin/sh"),
+            keeper: None,
+        };
+        // Through the mux, whose flow control stalls a writer the other end stopped reading.
+        let (initiator, host) = tokio::io::duplex(1 << 16);
+        let mux = Mux::open_on(initiator);
+        let mut incoming = Incoming::accept_on(host);
+        let host = tokio::spawn(async move {
+            if let Some(channel) = incoming.accept().await {
+                serve(channel, &config).await;
+            }
+            // The connection outlives the stream, as with a real host.
+            std::future::pending::<Incoming>().await
+        });
+
+        let (mut frames, mut writer) = frame::split(mux.open().await?);
+        let hello = Hello {
+            checkout: "repo-key".to_owned(),
+            seq: 1,
+            base: None,
+            snapshot: "0".repeat(40),
+            initiator: "me".to_owned(),
+        };
+        writer.send(Frame::json(FrameKind::Hello, &hello)?).await?;
+        // Not a pack: git gives up on the first frame, well before the rest is sent.
+        let sent = tokio::time::timeout(Duration::from_secs(10), async {
+            for _ in 0..64 {
+                writer
+                    .send(Frame::new(FrameKind::Pack, vec![0xff; 64 * 1024]))
+                    .await?;
+            }
+            writer.send(Frame::empty(FrameKind::Pack)).await
+        })
+        .await;
+        assert!(matches!(sent, Ok(Ok(()))), "{sent:?}");
+
+        let welcome: Welcome = next(&mut frames).await?.expect(FrameKind::Welcome)?;
+        assert_eq!(welcome, Welcome::Ok);
+        let failure: Failure = next(&mut frames).await?.expect(FrameKind::Error)?;
+        assert!(failure.message.contains("pack"), "{}", failure.message);
+        host.abort();
+        Ok(())
+    }
 }
