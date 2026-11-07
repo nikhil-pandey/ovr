@@ -38,10 +38,10 @@ mod platform {
     const LABEL: &str = "dev.ovr.connect";
 
     pub fn install(exe: &Path) -> io::Result<()> {
-        let dir = ovr_proto::home_dir()?.join("Library/LaunchAgents");
+        let dir = ovr_proto::paths::home_dir()?.join("Library/LaunchAgents");
         std::fs::create_dir_all(&dir)?;
         let plist = dir.join(format!("{LABEL}.plist"));
-        let log = ovr_proto::state_dir()?.join("connect.log");
+        let log = ovr_proto::paths::log_dir()?.join("connect.log");
         std::fs::write(
             &plist,
             format!(
@@ -84,14 +84,10 @@ mod platform {
     use super::{NAME, Path, io, run};
 
     pub fn install(exe: &Path) -> io::Result<()> {
-        let config = std::env::var_os("XDG_CONFIG_HOME")
-            .map(std::path::PathBuf::from)
-            .filter(|dir| dir.is_absolute())
-            .map_or_else(
-                || ovr_proto::home_dir().map(|home| home.join(".config")),
-                Ok,
-            )?;
-        let dir = config.join("systemd/user");
+        let dir = directories::BaseDirs::new()
+            .ok_or_else(|| io::Error::other("cannot determine the home directory"))?
+            .config_dir()
+            .join("systemd/user");
         std::fs::create_dir_all(&dir)?;
         std::fs::write(
             dir.join(format!("{NAME}.service")),

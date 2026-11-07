@@ -9,9 +9,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use bytes::{Bytes, BytesMut};
 use ovr_proto::frame::CHUNK;
 use ovr_proto::msg::Exec;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize};
+use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -21,8 +23,8 @@ const DRAIN: Duration = Duration::from_secs(1);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
-    Stdout(Vec<u8>),
-    Stderr(Vec<u8>),
+    Stdout(Bytes),
+    Stderr(Bytes),
     /// Always the last event, after all output.
     Exit(i32),
     /// The command's status could not be collected; also the last event.
@@ -96,25 +98,22 @@ impl Shell {
 /// A running command.
 pub struct Process {
     events: mpsc::Receiver<Event>,
-    input: Option<mpsc::Sender<Vec<u8>>>,
+    input: Option<mpsc::Sender<Bytes>>,
     control: Control,
     exited: watch::Receiver<bool>,
 }
 
 enum Control {
-    Pipe {
-        #[cfg(unix)]
-        pid: Option<u32>,
-        #[cfg(windows)]
-        job: Arc<job::Job>,
-    },
+    /// Delivered by the task that waits for the command, which owns it.
+    Pipe(mpsc::UnboundedSender<Signal>),
     Pty {
         master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
         killer: Box<dyn ChildKiller + Send + Sync>,
         #[cfg(unix)]
         pid: Option<u32>,
+        /// Assigned once the terminal has started the command, so a descendant started in that instant escapes it.
         #[cfg(windows)]
-        _job: Option<job::Job>,
+        job: Option<job::Job>,
     },
 }
 
@@ -133,30 +132,27 @@ impl Process {
         }
     }
 
+    /// The command leads a new process group on Unix and starts suspended inside a Job Object on Windows, so that
+    /// every descendant can be reached.
     fn spawn_pipes(argv: &[OsString], cwd: &Path) -> io::Result<Self> {
         let (program, rest) = argv.split_first().ok_or(io::ErrorKind::InvalidInput)?;
-        let mut command = tokio::process::Command::new(program);
-        command
-            .args(rest)
-            .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        let mut command = CommandWrap::with_new(program, |command| {
+            command
+                .args(rest)
+                .current_dir(cwd)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        });
         #[cfg(unix)]
-        command.process_group(0);
-        let mut child = command.spawn()?;
+        command.wrap(process_wrap::tokio::ProcessGroup::leader());
         #[cfg(windows)]
-        let job = {
-            let job = job::Job::new()?;
-            if let Some(handle) = child.raw_handle() {
-                job.assign(handle)?;
-            }
-            Arc::new(job)
-        };
+        command.wrap(process_wrap::tokio::JobObject);
+        let mut child = command.spawn()?;
 
         let (events_tx, events) = mpsc::channel(16);
-        let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(16);
-        if let Some(mut stdin) = child.stdin.take() {
+        let (input_tx, mut input_rx) = mpsc::channel::<Bytes>(16);
+        if let Some(mut stdin) = child.stdin().take() {
             tokio::spawn(async move {
                 while let Some(data) = input_rx.recv().await {
                     if stdin.write_all(&data).await.is_err() {
@@ -166,7 +162,7 @@ impl Process {
             });
         }
         let (done, exited) = watch::channel(false);
-        let stdout = child.stdout.take().map(|pipe| {
+        let stdout = child.stdout().take().map(|pipe| {
             tokio::spawn(forward(
                 pipe,
                 events_tx.clone(),
@@ -174,7 +170,7 @@ impl Process {
                 exited.clone(),
             ))
         });
-        let stderr = child.stderr.take().map(|pipe| {
+        let stderr = child.stderr().take().map(|pipe| {
             tokio::spawn(forward(
                 pipe,
                 events_tx.clone(),
@@ -183,10 +179,15 @@ impl Process {
             ))
         });
 
-        #[cfg(unix)]
-        let pid = child.id();
+        let (control, mut signals) = mpsc::unbounded_channel::<Signal>();
         tokio::spawn(async move {
-            let status = child.wait().await;
+            let status = loop {
+                tokio::select! {
+                    // The command itself, not its whole tree: descendants such as build servers may outlive it.
+                    status = child.inner_mut().wait() => break status,
+                    Some(signal) = signals.recv() => signal.deliver(&mut *child),
+                }
+            };
             done.send_replace(true);
             for task in [stdout, stderr].into_iter().flatten() {
                 let _ = task.await;
@@ -201,12 +202,7 @@ impl Process {
         Ok(Self {
             events,
             input: Some(input_tx),
-            control: Control::Pipe {
-                #[cfg(unix)]
-                pid,
-                #[cfg(windows)]
-                job,
-            },
+            control: Control::Pipe(control),
             exited,
         })
     }
@@ -245,7 +241,7 @@ impl Process {
         let master = Arc::new(Mutex::new(Some(pair.master)));
 
         let (events_tx, events) = mpsc::channel(16);
-        let (input_tx, mut input_rx) = mpsc::channel::<Vec<u8>>(16);
+        let (input_tx, mut input_rx) = mpsc::channel::<Bytes>(16);
         std::thread::spawn(move || {
             while let Some(data) = input_rx.blocking_recv() {
                 if writer
@@ -273,7 +269,7 @@ impl Process {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         if output
-                            .blocking_send(Event::Stdout(buf[..n].to_vec()))
+                            .blocking_send(Event::Stdout(Bytes::copy_from_slice(&buf[..n])))
                             .is_err()
                         {
                             break;
@@ -313,7 +309,7 @@ impl Process {
                 #[cfg(unix)]
                 pid,
                 #[cfg(windows)]
-                _job: job,
+                job,
             },
             exited,
         })
@@ -326,13 +322,13 @@ impl Process {
 
     /// Where input goes, until [`Process::close_input`].
     #[must_use]
-    pub fn input(&self) -> Option<&mpsc::Sender<Vec<u8>>> {
+    pub fn input(&self) -> Option<&mpsc::Sender<Bytes>> {
         self.input.as_ref()
     }
 
     /// Ends the command's stdin. A terminal has no end of input, so this only applies to pipes.
     pub fn close_input(&mut self) {
-        if matches!(self.control, Control::Pipe { .. }) {
+        if matches!(self.control, Control::Pipe(_)) {
             self.input = None;
         }
     }
@@ -344,28 +340,30 @@ impl Process {
                 .unwrap_or_else(PoisonError::into_inner)
                 .as_ref()
         {
-            let _ = master.resize(PtySize {
+            let resized = master.resize(PtySize {
                 rows,
                 cols,
                 pixel_width: 0,
                 pixel_height: 0,
             });
+            if let Err(err) = resized {
+                tracing::debug!(%err, "cannot resize the terminal");
+            }
         }
     }
 
     /// Interrupts the command as Ctrl-C would: `SIGINT` to its process group on Unix. Windows has no way to deliver
-    /// Ctrl-C to a process without a shared console, so the job is terminated with the Ctrl-C exit status instead.
+    /// Ctrl-C to a process without a shared console, so the job is terminated instead.
     pub fn interrupt(&self) {
         match &self.control {
             Control::Pty { .. } => {
                 if let Some(input) = &self.input {
-                    let _ = input.try_send(vec![0x03]);
+                    let _ = input.try_send(Bytes::from_static(&[0x03]));
                 }
             }
-            #[cfg(unix)]
-            Control::Pipe { pid } => signal_group(*pid, nix::sys::signal::Signal::SIGINT),
-            #[cfg(windows)]
-            Control::Pipe { job } => job.terminate(job::CONTROL_C_EXIT),
+            Control::Pipe(control) => {
+                let _ = control.send(Signal::Interrupt);
+            }
         }
     }
 }
@@ -378,20 +376,45 @@ impl Drop for Process {
             return;
         }
         match &mut self.control {
-            #[cfg(unix)]
-            Control::Pipe { pid } => signal_group(*pid, nix::sys::signal::Signal::SIGKILL),
-            #[cfg(windows)]
-            Control::Pipe { job } => job.terminate(1),
+            Control::Pipe(control) => {
+                let _ = control.send(Signal::Kill);
+            }
             Control::Pty {
                 killer,
                 #[cfg(unix)]
                 pid,
+                #[cfg(windows)]
+                job,
                 ..
             } => {
                 #[cfg(unix)]
                 signal_group(*pid, nix::sys::signal::Signal::SIGKILL);
+                #[cfg(windows)]
+                if let Some(job) = job {
+                    job.terminate(1);
+                }
                 let _ = killer.kill();
             }
+        }
+    }
+}
+
+enum Signal {
+    Interrupt,
+    Kill,
+}
+
+impl Signal {
+    fn deliver(self, child: &mut dyn ChildWrapper) {
+        let delivered = match self {
+            #[cfg(unix)]
+            Self::Interrupt => child.signal(libc::SIGINT),
+            #[cfg(windows)]
+            Self::Interrupt => child.start_kill(),
+            Self::Kill => child.start_kill(),
+        };
+        if let Err(err) = delivered {
+            tracing::debug!(%err, "cannot signal the command");
         }
     }
 }
@@ -399,13 +422,14 @@ impl Drop for Process {
 async fn forward<R: AsyncRead + Unpin>(
     mut pipe: R,
     events: mpsc::Sender<Event>,
-    wrap: fn(Vec<u8>) -> Event,
+    wrap: fn(Bytes) -> Event,
     mut exited: watch::Receiver<bool>,
 ) {
-    let mut buf = vec![0; CHUNK];
+    let mut buf = BytesMut::with_capacity(CHUNK);
     loop {
+        buf.reserve(CHUNK);
         let read = tokio::select! {
-            read = pipe.read(&mut buf) => read,
+            read = pipe.read_buf(&mut buf) => read,
             () = async {
                 let _ = exited.wait_for(|exited| *exited).await;
                 tokio::time::sleep(DRAIN).await;
@@ -417,8 +441,8 @@ async fn forward<R: AsyncRead + Unpin>(
                 tracing::warn!(%err, "reading command output failed");
                 return;
             }
-            Ok(n) => {
-                if events.send(wrap(buf[..n].to_vec())).await.is_err() {
+            Ok(_) => {
+                if events.send(wrap(buf.split().freeze())).await.is_err() {
                     return;
                 }
             }
@@ -511,9 +535,6 @@ mod job {
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
     };
-
-    /// `STATUS_CONTROL_C_EXIT`, the exit status of a console process ended by Ctrl-C.
-    pub const CONTROL_C_EXIT: u32 = 0xC000_013A;
 
     /// A Job Object holding a command and every process it starts.
     pub struct Job(HANDLE);

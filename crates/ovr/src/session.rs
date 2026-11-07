@@ -1,6 +1,8 @@
 //! The client half of a run: sync the snapshot, start the command, and relay terminal I/O until it exits.
 
-use ovr_proto::frame::{self, CHUNK};
+use bytes::BytesMut;
+use futures::{SinkExt, StreamExt};
+use ovr_proto::frame::{self, CHUNK, Reader, Writer};
 use ovr_proto::msg::{Exec, Exit, Failure, Resize, Welcome};
 use ovr_proto::{Frame, FrameKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -15,7 +17,7 @@ pub const INTERRUPTED: i32 = 130;
 /// Local terminal events forwarded to the remote command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Input {
-    Data(Vec<u8>),
+    Data(bytes::Bytes),
     /// Local stdin ended.
     Eof,
     Resize {
@@ -33,8 +35,6 @@ pub struct Io<O, E> {
     pub stderr: E,
 }
 
-type Frames = mpsc::Receiver<Result<Frame, ovr_proto::Error>>;
-
 /// Runs `exec` against `snapshot` over an agent session and returns the remote exit code.
 ///
 /// # Errors
@@ -47,12 +47,11 @@ pub async fn run<S, O, E>(
     io: Io<O, E>,
 ) -> Result<i32, Error>
 where
-    S: AsyncRead + AsyncWrite + Send + 'static,
+    S: AsyncRead + AsyncWrite,
     O: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut frames = frame::spawn_reader(reader);
+    let (mut frames, mut writer) = frame::split(stream);
     let mut synced = false;
     let result = async {
         sync(&mut writer, &mut frames, snapshot, exec).await?;
@@ -67,43 +66,46 @@ where
 
 /// Sends `HELLO`, a speculative thin pack, and `EXEC` without waiting, then repeats the pack in full if the host
 /// lacks the base.
-async fn sync<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    frames: &mut Frames,
+async fn sync<S: AsyncRead + AsyncWrite>(
+    writer: &mut Writer<S>,
+    frames: &mut Reader<S>,
     snapshot: &Snapshot,
     exec: &Exec,
 ) -> Result<(), Error> {
-    frame::send(writer, FrameKind::Hello, &snapshot.hello()).await?;
+    writer
+        .send(Frame::json(FrameKind::Hello, &snapshot.hello())?)
+        .await?;
     let mut welcome = send_pack(writer, frames, snapshot, snapshot.base.as_deref(), true).await?;
-    frame::send(writer, FrameKind::Exec, exec).await?;
+    writer.send(Frame::json(FrameKind::Exec, exec)?).await?;
     let welcome = match welcome.take() {
         Some(welcome) => welcome,
         None => next(frames).await?.expect(FrameKind::Welcome)?,
     };
     if welcome == Welcome::NeedFull {
         send_pack(writer, frames, snapshot, None, false).await?;
-        frame::send(writer, FrameKind::Exec, exec).await?;
+        writer.send(Frame::json(FrameKind::Exec, exec)?).await?;
     }
     Ok(())
 }
 
 /// Streams a pack followed by the empty end-of-pack frame. While `watch` is set, also listens for `WELCOME` and
 /// cuts the pack short when the host needs a full one.
-async fn send_pack<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    frames: &mut Frames,
+async fn send_pack<S: AsyncRead + AsyncWrite>(
+    writer: &mut Writer<S>,
+    frames: &mut Reader<S>,
     snapshot: &Snapshot,
     base: Option<&str>,
     mut watch: bool,
 ) -> Result<Option<Welcome>, Error> {
     let mut welcome = None;
     if let Some(mut pack) = snapshot.pack(base).await? {
-        let mut buf = vec![0; CHUNK];
+        let mut buf = BytesMut::with_capacity(CHUNK);
         let complete = loop {
+            buf.reserve(CHUNK);
             tokio::select! {
-                read = pack.stdout.read(&mut buf) => match read? {
+                read = pack.stdout.read_buf(&mut buf) => match read? {
                     0 => break true,
-                    n => frame::write(writer, FrameKind::Pack, &buf[..n]).await?,
+                    _ => writer.send(Frame::new(FrameKind::Pack, buf.split().freeze())).await?,
                 },
                 reply = next(frames), if watch => {
                     let reply = reply?.expect(FrameKind::Welcome)?;
@@ -119,19 +121,19 @@ async fn send_pack<W: AsyncWrite + Unpin>(
             pack.finish().await?;
         }
     }
-    frame::write(writer, FrameKind::Pack, &[]).await?;
+    writer.send(Frame::empty(FrameKind::Pack)).await?;
     Ok(welcome)
 }
 
-async fn relay<W, O, E>(
-    writer: &mut W,
-    frames: &mut Frames,
+async fn relay<S, O, E>(
+    writer: &mut Writer<S>,
+    frames: &mut Reader<S>,
     snapshot: &Snapshot,
     synced: &mut bool,
     mut io: Io<O, E>,
 ) -> Result<i32, Error>
 where
-    W: AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite,
     O: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
@@ -158,28 +160,31 @@ where
                     kind => return Err(ovr_proto::Error::Unexpected(kind).into()),
                 }
             }
-            input = io.input.recv(), if input_open => match input {
-                Some(Input::Data(data)) => frame::write(writer, FrameKind::In, &data).await?,
-                Some(Input::Resize { cols, rows }) => frame::send(writer, FrameKind::Resize, &Resize { cols, rows }).await?,
-                Some(Input::Interrupt) if interrupted => return Ok(INTERRUPTED),
-                Some(Input::Interrupt) => {
-                    interrupted = true;
-                    frame::write(writer, FrameKind::Interrupt, &[]).await?;
-                }
-                // Interrupts may still follow the end of stdin.
-                Some(Input::Eof) => frame::write(writer, FrameKind::In, &[]).await?,
-                None => {
-                    input_open = false;
-                    frame::write(writer, FrameKind::In, &[]).await?;
-                }
+            input = io.input.recv(), if input_open => {
+                let frame = match input {
+                    Some(Input::Data(data)) => Frame::new(FrameKind::In, data),
+                    Some(Input::Resize { cols, rows }) => Frame::json(FrameKind::Resize, &Resize { cols, rows })?,
+                    Some(Input::Interrupt) if interrupted => return Ok(INTERRUPTED),
+                    Some(Input::Interrupt) => {
+                        interrupted = true;
+                        Frame::empty(FrameKind::Interrupt)
+                    }
+                    // Interrupts may still follow the end of stdin.
+                    Some(Input::Eof) => Frame::empty(FrameKind::In),
+                    None => {
+                        input_open = false;
+                        Frame::empty(FrameKind::In)
+                    }
+                };
+                writer.send(frame).await?;
             },
         }
     }
 }
 
 /// The next frame from the agent, turning `ERROR` frames and a dropped connection into errors.
-async fn next(frames: &mut Frames) -> Result<Frame, Error> {
-    let frame = frames.recv().await.ok_or(Error::Disconnected)??;
+async fn next<S: AsyncRead>(frames: &mut Reader<S>) -> Result<Frame, Error> {
+    let frame = frames.next().await.ok_or(Error::Disconnected)??;
     if frame.kind == FrameKind::Error {
         return Err(Error::Remote(frame.parse::<Failure>()?.message));
     }
@@ -225,7 +230,7 @@ mod tests {
         let (input_tx, input) = mpsc::channel(4);
         if !stdin.is_empty() {
             input_tx
-                .send(Input::Data(stdin.to_vec()))
+                .send(Input::Data(stdin.to_vec().into()))
                 .await
                 .map_err(|_| Error::Disconnected)?;
         }

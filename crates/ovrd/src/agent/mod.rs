@@ -8,11 +8,13 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use futures::SinkExt;
 use ovr_proto::msg::{Banner, Platform};
-use ovr_proto::{FrameKind, PROTOCOL_VERSION, VERSION, frame};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use ovr_proto::{Frame, FrameKind, PROTOCOL_VERSION, VERSION, frame};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::codec::FramedWrite;
 
-use crate::mux::{Mux, Role};
+use crate::mux::Incoming;
 pub use process::Shell;
 
 /// Where checkouts live and how commands start.
@@ -30,7 +32,7 @@ impl Config {
     /// Returns an error when the home directory is unknown.
     pub fn detect() -> io::Result<Self> {
         #[cfg(unix)]
-        let root = ovr_proto::home_dir()?.join("ovr");
+        let root = ovr_proto::paths::home_dir()?.join("ovr");
         #[cfg(windows)]
         let root = {
             let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_owned());
@@ -67,9 +69,9 @@ pub fn hostname() -> String {
 /// Serves runs over `stream` until the laptop closes it.
 pub async fn serve<S>(stream: S, config: Arc<Config>)
 where
-    S: AsyncRead + AsyncWrite + Send + 'static,
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let (_mux, mut incoming) = Mux::new(stream, Role::Acceptor);
+    let mut incoming = Incoming::accept_on(stream);
     while let Some(channel) = incoming.accept().await {
         let config = Arc::clone(&config);
         tokio::spawn(async move { session::serve(channel, &config).await });
@@ -81,11 +83,16 @@ where
 /// # Errors
 ///
 /// Returns an error when stdout is closed before the banner is written.
-pub async fn serve_stdio() -> io::Result<()> {
+pub async fn serve_stdio() -> Result<(), ovr_proto::Error> {
     let config = Arc::new(Config::detect()?);
-    let mut stdout = tokio::io::stdout();
-    frame::send(&mut stdout, FrameKind::Banner, &banner()).await?;
-    stdout.flush().await?;
-    serve(tokio::io::join(tokio::io::stdin(), stdout), config).await;
+    let mut stdout = FramedWrite::new(tokio::io::stdout(), frame::Codec::default());
+    stdout
+        .send(Frame::json(FrameKind::Banner, &banner())?)
+        .await?;
+    serve(
+        tokio::io::join(tokio::io::stdin(), stdout.into_inner()),
+        config,
+    )
+    .await;
     Ok(())
 }

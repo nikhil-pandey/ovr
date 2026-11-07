@@ -22,14 +22,14 @@ async fn main() -> ExitCode {
 }
 
 /// Logs go to stderr, never stdout, which carries the protocol in agent mode. A service started at login logs to
-/// `connect.log` in the state directory instead and, on Windows, gives up its console window.
+/// `connect.log` in the log directory instead and, on Windows, gives up its console window.
 fn logging(service: bool) -> std::io::Result<()> {
     let builder = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO);
     if service {
         let log = std::fs::File::options()
             .create(true)
             .append(true)
-            .open(ovr_proto::state_dir()?.join("connect.log"))?;
+            .open(ovr_proto::paths::log_dir()?.join("connect.log"))?;
         builder
             .with_ansi(false)
             .with_writer(std::sync::Mutex::new(log))

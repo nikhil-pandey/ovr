@@ -10,13 +10,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use futures::{SinkExt, StreamExt};
 use ovr_proto::msg::{HostStatus, Op, Platform, Request, Response};
-use ovr_proto::{FrameKind, VERSION, frame, ipc};
-use tokio::io::AsyncWriteExt;
+use ovr_proto::{Frame, FrameKind, VERSION, frame, ipc};
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
-use crate::mux::Mux;
+use crate::mux::{Channel, Mux};
 use crate::pairing::Codes;
 use crate::tls::Identity;
 use crate::{Error, state};
@@ -36,7 +36,7 @@ const LOCK_WAIT: Duration = Duration::from_secs(2);
 ///
 /// Returns an error when another `ovrd` holds the lock or the socket cannot be bound.
 pub async fn run() -> Result<(), Error> {
-    let dir = ovr_proto::state_dir()?;
+    let dir = ovr_proto::paths::data_dir()?;
     let lock = acquire(dir.join("ovrd.lock")).await?;
     let mut listener = ipc::Listener::bind()?;
     let server = Arc::new(Server {
@@ -97,11 +97,12 @@ pub(crate) struct Server {
     codes: Mutex<Codes>,
 }
 
-async fn handle(server: Arc<Server>, mut stream: ipc::ServerStream, restart: Arc<Notify>) {
-    let request = match frame::read(&mut stream).await {
-        Ok(Some(frame)) => frame.expect::<Request>(FrameKind::Request),
-        Ok(None) => return,
-        Err(err) => Err(err),
+async fn handle(server: Arc<Server>, stream: ipc::ServerStream, restart: Arc<Notify>) {
+    let mut stream = frame::framed(stream);
+    let request = match stream.next().await {
+        Some(Ok(frame)) => frame.expect::<Request>(FrameKind::Request),
+        None => return,
+        Some(Err(err)) => Err(err),
     };
     let request = match request {
         Ok(request) => request,
@@ -111,18 +112,16 @@ async fn handle(server: Arc<Server>, mut stream: ipc::ServerStream, restart: Arc
         }
     };
     if request.version != VERSION {
-        let _ = frame::send(&mut stream, FrameKind::Response, &Response::Restart).await;
+        let _ = respond(&mut stream, &Response::Restart).await;
         restart.notify_one();
         return;
     }
     let response = match request.op {
         Op::Open { host } => match server.open(&host).await {
             Ok((mut channel, lease)) => {
-                if frame::send(&mut stream, FrameKind::Response, &Response::Opened)
-                    .await
-                    .is_ok()
-                {
+                if respond(&mut stream, &Response::Opened).await.is_ok() {
                     // From here on the socket carries the agent session verbatim.
+                    let mut stream = frame::resume(stream);
                     let _ = tokio::io::copy_bidirectional(&mut stream, &mut channel).await;
                 }
                 drop(lease);
@@ -142,20 +141,23 @@ async fn handle(server: Arc<Server>, mut stream: ipc::ServerStream, restart: Arc
             message: err.to_string(),
         }),
     };
-    if frame::send(&mut stream, FrameKind::Response, &response)
-        .await
-        .is_ok()
-    {
-        let _ = stream.shutdown().await;
+    if respond(&mut stream, &response).await.is_ok() {
+        let _ = stream.close().await;
     }
+}
+
+async fn respond(
+    stream: &mut frame::Framed<ipc::ServerStream>,
+    response: &Response,
+) -> Result<(), ovr_proto::Error> {
+    stream
+        .send(Frame::json(FrameKind::Response, response)?)
+        .await
 }
 
 impl Server {
     /// Opens a channel to `host`: a paired host by name, otherwise an SSH destination.
-    async fn open(
-        &self,
-        host: &str,
-    ) -> Result<(tokio::io::DuplexStream, Option<ssh::Lease>), Error> {
+    async fn open(&self, host: &str) -> Result<(Channel, Option<ssh::Lease>), Error> {
         let paired = state::hosts(&self.dir)?
             .into_iter()
             .any(|paired| paired.name == host);

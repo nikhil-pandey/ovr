@@ -1,4 +1,4 @@
-//! The local endpoint between `ovr` and `ovrd`: a Unix socket in the state directory, or a per-user named pipe on
+//! The local endpoint between `ovr` and `ovrd`: a Unix socket in the runtime directory, or a per-user named pipe on
 //! Windows.
 
 use std::io;
@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use crate::state_dir;
+use crate::paths;
 
 /// How long a client waits for a freshly spawned `ovrd` to start listening.
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -22,7 +22,7 @@ pub type ServerStream = tokio::net::windows::named_pipe::NamedPipeServer;
 
 #[cfg(unix)]
 fn endpoint() -> io::Result<PathBuf> {
-    Ok(state_dir()?.join("ovrd.sock"))
+    Ok(paths::runtime_dir()?.join("ovrd.sock"))
 }
 
 #[cfg(windows)]
@@ -83,7 +83,7 @@ pub async fn connect_or_spawn(program: &Path) -> io::Result<ClientStream> {
 
 /// Starts `program` detached from this process, its terminal, and its signals, logging to `ovrd.log`.
 fn spawn(program: &Path) -> io::Result<()> {
-    let log = std::fs::File::create(state_dir()?.join("ovrd.log"))?;
+    let log = std::fs::File::create(paths::log_dir()?.join("ovrd.log"))?;
     let mut command = std::process::Command::new(program);
     command
         .stdin(Stdio::null())

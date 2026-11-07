@@ -8,10 +8,14 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytes.workspace = true
+directories.workspace = true
+futures.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "net", "process", "rt", "sync", "time"] }
+tokio-util = { workspace = true, features = ["codec"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

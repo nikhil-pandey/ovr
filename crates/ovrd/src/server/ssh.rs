@@ -7,12 +7,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use ovr_proto::msg::Banner;
 use ovr_proto::{FrameKind, PROTOCOL_VERSION, VERSION, frame};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
-use crate::mux::{Mux, Role};
+use crate::mux::{Channel, Mux};
 use crate::{Error, target};
 
 /// An agent connection is closed after this long without runs.
@@ -21,8 +22,19 @@ const IDLE: Duration = Duration::from_mins(10);
 /// Covers slow logins, e.g. through a jump host or with a second factor already cached.
 const BANNER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Never prompt, since nobody is there to answer; Git packs are already compressed.
-const OPTIONS: [&str; 5] = ["-o", "BatchMode=yes", "-o", "Compression=no", "-T"];
+/// Never prompt, since nobody is there to answer; Git packs are already compressed. Probe the server so that a
+/// vanished host ends the connection within a minute.
+const OPTIONS: [&str; 9] = [
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "Compression=no",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=3",
+    "-T",
+];
 
 /// Exit status of a shell that cannot find the command.
 const NOT_FOUND: i32 = 127;
@@ -64,7 +76,7 @@ impl Pool {
     /// # Errors
     ///
     /// Returns an error when SSH fails or the agent cannot be installed.
-    pub async fn open(&self, host: &str) -> Result<(DuplexStream, Lease), Error> {
+    pub async fn open(&self, host: &str) -> Result<(Channel, Lease), Error> {
         if host.starts_with('-') {
             return Err(Error::Invalid(format!("invalid host {host:?}")));
         }
@@ -119,20 +131,21 @@ async fn start(host: &str) -> Result<Option<Connection>, Error> {
         .kill_on_drop(true)
         .spawn()
         .map_err(|err| Error::Host(format!("cannot run ssh: {err}")))?;
-    let (Some(stdin), Some(mut stdout)) = (child.stdin.take(), child.stdout.take()) else {
+    let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         return Err(Error::Host("ssh has no stdio".to_owned()));
     };
     let stderr = capture_stderr(&mut child, host);
 
-    let banner = tokio::time::timeout(BANNER_TIMEOUT, frame::read(&mut stdout)).await;
+    let mut agent = frame::framed(tokio::io::join(stdout, stdin));
+    let banner = tokio::time::timeout(BANNER_TIMEOUT, agent.next()).await;
     let banner = match banner {
         Err(_) => {
             return Err(Error::Host(format!(
                 "{host}: timed out waiting for the agent to start"
             )));
         }
-        Ok(Ok(Some(frame))) if frame.kind == FrameKind::Banner => frame.parse::<Banner>()?,
-        Ok(Ok(None)) => {
+        Ok(Some(Ok(frame))) if frame.kind == FrameKind::Banner => frame.parse::<Banner>()?,
+        Ok(None) => {
             let status = child.wait().await?;
             if status.code() == Some(NOT_FOUND) {
                 return Ok(None);
@@ -161,7 +174,7 @@ async fn start(host: &str) -> Result<Option<Connection>, Error> {
     }
     tracing::info!(host, platform = ?banner.platform, "connected over ssh");
 
-    let (mux, _incoming) = Mux::new(tokio::io::join(stdout, stdin), Role::Opener);
+    let mux = Mux::open_on(frame::resume(agent));
     let usage = Arc::new(Usage {
         active: AtomicUsize::new(0),
         idle_since: Mutex::new(Instant::now()),
@@ -257,7 +270,7 @@ async fn binary_for(target: &str) -> Result<PathBuf, Error> {
     if target::current() == Some(target) {
         return Ok(std::env::current_exe()?);
     }
-    let dir = ovr_proto::state_dir()?
+    let dir = ovr_proto::paths::cache_dir()?
         .join("bin")
         .join(VERSION)
         .join(target);

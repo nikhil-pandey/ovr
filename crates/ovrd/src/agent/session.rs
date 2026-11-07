@@ -3,18 +3,18 @@
 use std::collections::VecDeque;
 use std::path::Path;
 
-use ovr_proto::FrameKind;
-use ovr_proto::frame::{self, Frame};
+use bytes::Bytes;
+use futures::{SinkExt, StreamExt};
+use ovr_proto::frame::{self, Reader, Writer};
 use ovr_proto::msg::{Exec, Exit, Failure, Hello, Resize, Welcome};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use ovr_proto::{Frame, FrameKind};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
 use super::Config;
 use super::checkout::Checkout;
 use super::process::{Event, Process};
 use crate::Error;
-
-type Frames = mpsc::Receiver<Result<Frame, ovr_proto::Error>>;
 
 /// Input a command has not consumed yet that is held here while frames keep being read, so that interrupts and a
 /// vanished client are still noticed. Beyond this, frames stop being read and the client is pushed back.
@@ -23,28 +23,33 @@ const INPUT_BACKLOG: usize = 1024 * 1024;
 /// Serves one run on `stream`, reporting failures to the client as `ERROR`.
 pub async fn serve<S>(stream: S, config: &Config)
 where
-    S: AsyncRead + AsyncWrite + Send + 'static,
+    S: AsyncRead + AsyncWrite,
 {
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut frames = frame::spawn_reader(reader);
-    let result = run(&mut writer, &mut frames, config).await;
-    let sent = match result {
-        Ok(code) => frame::send(&mut writer, FrameKind::Exit, &Exit { code }).await,
-        Err(Error::Disconnected) => Ok(()),
+    let (mut frames, mut writer) = frame::split(stream);
+    let last = match run(&mut writer, &mut frames, config).await {
+        Ok(code) => Frame::json(FrameKind::Exit, &Exit { code }),
+        Err(Error::Disconnected) => return,
         Err(err) => {
             tracing::warn!(%err, "run failed");
             let message = err.to_string();
-            frame::send(&mut writer, FrameKind::Error, &Failure { message }).await
+            Frame::json(FrameKind::Error, &Failure { message })
         }
     };
-    if sent.is_ok() {
-        let _ = writer.shutdown().await;
+    let sent = match last {
+        Ok(last) => writer.send(last).await,
+        Err(err) => Err(err),
+    };
+    match sent {
+        Ok(()) => {
+            let _ = writer.close().await;
+        }
+        Err(err) => tracing::info!(%err, "cannot report the end of a run"),
     }
 }
 
-async fn run<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    frames: &mut Frames,
+async fn run<S: AsyncRead + AsyncWrite>(
+    writer: &mut Writer<S>,
+    frames: &mut Reader<S>,
     config: &Config,
 ) -> Result<i32, Error> {
     let hello: Hello = next(frames).await?.expect(FrameKind::Hello)?;
@@ -53,7 +58,9 @@ async fn run<W: AsyncWrite + Unpin>(
         Some(base) if !checkout.has_commit(base).await => Welcome::NeedFull,
         _ => Welcome::Ok,
     };
-    frame::send(writer, FrameKind::Welcome, &welcome).await?;
+    writer
+        .send(Frame::json(FrameKind::Welcome, &welcome)?)
+        .await?;
     if welcome == Welcome::NeedFull {
         // The speculative pack is useless without its base; skip it and its EXEC.
         while next(frames).await?.kind != FrameKind::Exec {}
@@ -63,14 +70,11 @@ async fn run<W: AsyncWrite + Unpin>(
 
     let _lock = checkout.lock().await?;
     let warning = checkout.apply(&hello.snapshot).await?;
-    frame::write(writer, FrameKind::Synced, &[]).await?;
+    writer.send(Frame::empty(FrameKind::Synced)).await?;
     if let Some(warning) = warning {
-        frame::write(
-            writer,
-            FrameKind::Err,
-            format!("ovr: {warning}\n").as_bytes(),
-        )
-        .await?;
+        writer
+            .send(Frame::new(FrameKind::Err, format!("ovr: {warning}\n")))
+            .await?;
     }
     let cwd = checkout.cwd(&exec.cwd)?;
     let code = execute(writer, frames, config, &exec, &cwd).await?;
@@ -79,7 +83,10 @@ async fn run<W: AsyncWrite + Unpin>(
 }
 
 /// Indexes pack frames as they arrive, until the empty end-of-pack frame.
-async fn receive_pack(frames: &mut Frames, checkout: &Checkout) -> Result<(), Error> {
+async fn receive_pack<S: AsyncRead>(
+    frames: &mut Reader<S>,
+    checkout: &Checkout,
+) -> Result<(), Error> {
     let mut indexer = None;
     loop {
         let frame = next(frames).await?;
@@ -104,9 +111,9 @@ async fn receive_pack(frames: &mut Frames, checkout: &Checkout) -> Result<(), Er
     }
 }
 
-async fn execute<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    frames: &mut Frames,
+async fn execute<S: AsyncRead + AsyncWrite>(
+    writer: &mut Writer<S>,
+    frames: &mut Reader<S>,
     config: &Config,
     exec: &Exec,
     cwd: &Path,
@@ -125,8 +132,8 @@ async fn execute<W: AsyncWrite + Unpin>(
         let input = process.input().cloned();
         tokio::select! {
             event = process.next() => match event {
-                Some(Event::Stdout(data)) => frame::write(writer, FrameKind::Out, &data).await?,
-                Some(Event::Stderr(data)) => frame::write(writer, FrameKind::Err, &data).await?,
+                Some(Event::Stdout(data)) => writer.send(Frame::new(FrameKind::Out, data)).await?,
+                Some(Event::Stderr(data)) => writer.send(Frame::new(FrameKind::Err, data)).await?,
                 Some(Event::Exit(code)) => return Ok(code),
                 Some(Event::Lost(err)) => return Err(Error::Invalid(format!("lost track of the command: {err}"))),
                 None => return Err(Error::Invalid("the command ended without a status".to_owned())),
@@ -155,31 +162,28 @@ async fn execute<W: AsyncWrite + Unpin>(
 
 #[derive(Default)]
 struct Backlog {
-    chunks: VecDeque<Vec<u8>>,
+    chunks: VecDeque<Bytes>,
     bytes: usize,
     eof: bool,
 }
 
 impl Backlog {
-    fn push(&mut self, data: Vec<u8>) {
+    fn push(&mut self, data: Bytes) {
         self.bytes += data.len();
         self.chunks.push_back(data);
     }
 
-    fn pop(&mut self) -> Vec<u8> {
+    fn pop(&mut self) -> Bytes {
         let data = self.chunks.pop_front().unwrap_or_default();
         self.bytes -= data.len();
         data
     }
 }
 
-async fn reserve(input: Option<&mpsc::Sender<Vec<u8>>>) -> Option<mpsc::Permit<'_, Vec<u8>>> {
+async fn reserve(input: Option<&mpsc::Sender<Bytes>>) -> Option<mpsc::Permit<'_, Bytes>> {
     input?.reserve().await.ok()
 }
 
-async fn next(frames: &mut Frames) -> Result<Frame, Error> {
-    match frames.recv().await {
-        Some(frame) => Ok(frame?),
-        None => Err(Error::Disconnected),
-    }
+async fn next<S: AsyncRead>(frames: &mut Reader<S>) -> Result<Frame, Error> {
+    Ok(frames.next().await.ok_or(Error::Disconnected)??)
 }

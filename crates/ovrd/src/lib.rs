@@ -13,8 +13,9 @@ mod tls;
 use std::io;
 
 use clap::{Parser, Subcommand};
+use futures::{SinkExt, StreamExt};
 use ovr_proto::msg::{Op, Request, Response};
-use ovr_proto::{FrameKind, VERSION, frame, ipc};
+use ovr_proto::{Frame, FrameKind, VERSION, frame, ipc};
 
 /// Server and host agent for `ovr`.
 #[derive(Debug, Parser)]
@@ -55,9 +56,9 @@ pub enum Error {
     #[diagnostic(code(ovrd::pairing))]
     Pairing(String),
 
-    #[error("git {command} failed: {stderr}")]
+    #[error(transparent)]
     #[diagnostic(code(ovrd::git))]
-    Git { command: String, stderr: String },
+    Git(#[from] ovr_proto::git::Error),
 
     #[error("{0}")]
     #[diagnostic(code(ovrd::invalid))]
@@ -97,15 +98,19 @@ pub async fn run(cli: Cli) -> Result<(), Error> {
 
 /// Asks the running server, started if needed, for a pairing code.
 async fn pair() -> Result<(), Error> {
-    let mut stream = ipc::connect_or_spawn(&std::env::current_exe()?).await?;
+    let stream = ipc::connect_or_spawn(&std::env::current_exe()?).await?;
+    let mut stream = frame::framed(stream);
     let request = Request {
         version: VERSION.to_owned(),
         op: Op::Pair,
     };
-    frame::send(&mut stream, FrameKind::Request, &request).await?;
-    let response: Response = frame::read(&mut stream)
-        .await?
-        .ok_or(Error::Disconnected)?
+    stream
+        .send(Frame::json(FrameKind::Request, &request)?)
+        .await?;
+    let response: Response = stream
+        .next()
+        .await
+        .ok_or(Error::Disconnected)??
         .expect(FrameKind::Response)?;
     match response {
         Response::Pair { addr, code } => {

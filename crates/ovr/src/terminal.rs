@@ -80,7 +80,10 @@ fn forward_stdin(tx: &mpsc::Sender<Input>) {
                 return;
             }
             Ok(n) => {
-                if tx.blocking_send(Input::Data(buf[..n].to_vec())).is_err() {
+                if tx
+                    .blocking_send(Input::Data(bytes::Bytes::copy_from_slice(&buf[..n])))
+                    .is_err()
+                {
                     return;
                 }
             }

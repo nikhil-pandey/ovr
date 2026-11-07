@@ -7,11 +7,11 @@
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
+use ovr_proto::git::{self, lock};
 use ovr_proto::msg::Hello;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStdout, Command};
+use tokio::io::AsyncWriteExt;
+use tokio::process::ChildStdout;
 
 use crate::Error;
 
@@ -47,7 +47,7 @@ impl Snapshot {
     ///
     /// Returns an error outside a Git working tree or when Git fails.
     pub async fn take(cwd: &Path, host: &str) -> Result<Self, Error> {
-        let located = git(
+        let located = git::run(
             cwd,
             [
                 "rev-parse",
@@ -55,7 +55,6 @@ impl Snapshot {
                 "--absolute-git-dir",
                 "--show-prefix",
             ],
-            &[],
         )
         .await
         .map_err(|_| Error::NotARepository)?;
@@ -83,15 +82,15 @@ impl Snapshot {
             }
         }
         let index_env = [("GIT_INDEX_FILE", index.as_os_str())];
-        git(
+        git::run_env(
             &root,
             ["-c", "core.untrackedCache=true", "add", "-A"],
             &index_env,
         )
         .await?;
-        let tree = git(&root, ["write-tree"], &index_env).await?;
+        let tree = git::run_env(&root, ["write-tree"], &index_env).await?;
         let identity = IDENTITY.map(|(key, value)| (key, OsStr::new(value)));
-        let commit = git(
+        let commit = git::run_env(
             &root,
             ["commit-tree", "--no-gpg-sign", "-m", "ovr", tree.trim()],
             &identity,
@@ -103,7 +102,7 @@ impl Snapshot {
             ref_component(host),
             ref_component(&repo)
         );
-        let base = git(
+        let base = git::run(
             &root,
             [
                 "rev-parse",
@@ -111,7 +110,6 @@ impl Snapshot {
                 "--verify",
                 &format!("{host_ref}^{{commit}}"),
             ],
-            &[],
         )
         .await
         .ok()
@@ -146,35 +144,25 @@ impl Snapshot {
         if base == Some(self.commit.as_str()) {
             return Ok(None);
         }
-        let mut child = Command::new("git")
-            .args([
+        let mut child = git::Child::spawn(
+            &self.root,
+            &[
                 "pack-objects",
                 "--stdout",
                 "--revs",
                 "--thin",
                 "--delta-base-offset",
                 "-q",
-            ])
-            .current_dir(&self.root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+            ],
+        )?;
         let revs = match base {
             Some(base) => format!("{}\n^{base}\n", self.commit),
             None => format!("{}\n", self.commit),
         };
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("no stdin"))?;
+        let mut stdin = child.stdin()?;
         stdin.write_all(revs.as_bytes()).await?;
         drop(stdin);
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("no stdout"))?;
+        let stdout = child.stdout()?;
         Ok(Some(Pack { child, stdout }))
     }
 
@@ -184,24 +172,19 @@ impl Snapshot {
     ///
     /// Returns an error when the ref cannot be updated.
     pub async fn synced(&self) -> Result<(), Error> {
-        git(
-            &self.root,
-            ["update-ref", &self.host_ref, &self.commit],
-            &[],
-        )
-        .await
-        .map(drop)
+        git::run(&self.root, ["update-ref", &self.host_ref, &self.commit]).await?;
+        Ok(())
     }
 
     /// Forgets the host's base after a failed sync, so the next run sends the full snapshot.
     pub async fn forget(&self) {
-        let _ = git(&self.root, ["update-ref", "-d", &self.host_ref], &[]).await;
+        let _ = git::run(&self.root, ["update-ref", "-d", &self.host_ref]).await;
     }
 }
 
 /// A running `git pack-objects`.
 pub struct Pack {
-    child: Child,
+    child: git::Child,
     pub stdout: ChildStdout,
 }
 
@@ -211,69 +194,9 @@ impl Pack {
     /// # Errors
     ///
     /// Returns an error when `git pack-objects` failed.
-    pub async fn finish(mut self) -> Result<(), Error> {
-        let mut stderr = String::new();
-        if let Some(mut pipe) = self.child.stderr.take() {
-            let _ = pipe.read_to_string(&mut stderr).await;
-        }
-        let status = self.child.wait().await?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(Error::Git {
-                command: "pack-objects".to_owned(),
-                stderr: stderr.trim().to_owned(),
-            })
-        }
+    pub async fn finish(self) -> Result<(), Error> {
+        Ok(self.child.finish().await?)
     }
-}
-
-/// Runs `git` in `dir` and returns its stdout.
-async fn git<I, S>(dir: &Path, args: I, env: &[(&str, &OsStr)]) -> Result<String, Error>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let args: Vec<_> = args
-        .into_iter()
-        .map(|arg| arg.as_ref().to_owned())
-        .collect();
-    let output = Command::new("git")
-        .args(&args)
-        .current_dir(dir)
-        .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await?;
-    if output.status.success() {
-        String::from_utf8(output.stdout)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err).into())
-    } else {
-        Err(Error::Git {
-            command: args
-                .iter()
-                .map(|arg| arg.to_string_lossy())
-                .find(|arg| !arg.starts_with('-') && !arg.contains('='))
-                .unwrap_or_default()
-                .into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        })
-    }
-}
-
-/// Serialises snapshots of one repository; Git's own index lock would fail the second run instead of waiting.
-async fn lock(path: PathBuf) -> io::Result<std::fs::File> {
-    tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)?;
-        file.lock()?;
-        Ok(file)
-    })
-    .await?
 }
 
 /// Maps a host or repository name onto characters that are always valid in a ref name component.
@@ -295,7 +218,7 @@ mod tests {
 
     async fn run(dir: &Path, args: &[&str]) -> String {
         let identity = IDENTITY.map(|(key, value)| (key, OsStr::new(value)));
-        git(dir, args, &identity)
+        git::run_env(dir, args, &identity)
             .await
             .unwrap_or_else(|err| format!("error: {err}"))
     }

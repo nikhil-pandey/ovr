@@ -112,11 +112,12 @@ indistinguishable.
 hosts, `ProxyCommand`, keys, certificates, Tailscale SSH. The agent answers with a `BANNER` naming its version and
 platform. If the binary is missing, `ovrd` runs `uname -sm`, uploads the matching `ovrd` over SFTP (its own
 executable when the platforms match, otherwise the release archive for that target, downloaded once and cached in
-`~/.local/state/ovr/bin/`), and retries. Nothing is installed by hand, and version skew is impossible: both ends are
+the laptop's cache directory), and retries. Nothing is installed by hand, and version skew is impossible: both ends are
 always the same build. Output before the banner is reported as a noisy shell startup file.
 
 The agent process is the connection: `ovrd` multiplexes every run to that host over its stdio, and closes it ten
-minutes after the last run. This needs no `ControlMaster`, so a Windows laptop gets the same warm path.
+minutes after the last run. This needs no `ControlMaster`, so a Windows laptop gets the same warm path. SSH's
+`ServerAliveInterval` probes notice a vanished host within a minute.
 
 ### Dial-in
 
@@ -135,9 +136,9 @@ For hosts that cannot accept SSH, including every Windows workstation:
   TLS 1.3 and each side checks the other's certificate fingerprint, so **both keys are pinned**. The host runs
   `ovrd connect ADDR CODE` once: it sends its name with an HMAC of both fingerprints keyed by the code, and the
   laptop answers with its own HMAC, so neither side can be impersonated by someone without the code. Codes are
-  single-use and expire after ten minutes, and five wrong guesses revoke every outstanding code. Pairing state
-  lives in `~/.local/state/ovr/` and `%LOCALAPPDATA%\ovr\`; it is a record, like `known_hosts`, not
-  configuration.
+  single-use and expire after ten minutes, and five wrong guesses revoke every outstanding code. The identity and
+  pairing records live in the data directory (see [Files](#files)); they are a record, like `known_hosts`, not
+  configuration. TCP keepalive notices a vanished peer within a minute.
 - After pairing, `ovrd connect` keeps serving: it reconnects with backoff when the laptop sleeps or moves
   networks, and only ever accepts jobs from the laptop it paired with. Pairing installs it to start at login as
   the logged-in user (Scheduled Task on Windows, a `launchd` agent on macOS, a `systemd --user` unit on Linux),
@@ -233,11 +234,12 @@ creates that is not tracked stays, exactly as it would locally.
 
 ### The wire
 
-- Frames are `type:u8, len:u32le, payload`. Control messages (`HELLO`, `WELCOME`, `EXEC`, `SYNCED`, `RESIZE`,
+- Frames are `len:u32le, kind:u8, payload`, where `len` covers the kind and payload, read and written with
+  `tokio-util`'s length-delimited codec. Control messages (`HELLO`, `WELCOME`, `EXEC`, `SYNCED`, `RESIZE`,
   `EXIT`, and `BANNER`/`ACCEPT`/`PAIR` on connection setup) are small JSON and occur a handful of times per run.
   Data frames (`PACK`, `OUT`, `ERR`, `IN`) carry raw bytes, up to 64 KiB each, and are what the stream is made of.
-- One connection to a host carries many runs as independent channels with per-channel flow control, so a slow
-  terminal on one run never stalls another.
+- One connection to a host carries many runs as independent [yamux](https://github.com/libp2p/rust-yamux) streams
+  with per-stream flow control, so a slow terminal on one run never stalls another.
 - The same frames flow `ovr → ovrd` over the local socket and `ovrd → agent` over SSH or TLS; `ovrd`
   forwards them without parsing the data frames.
 - PTY output is read in large chunks and forwarded as-is; no line buffering, no re-encoding. Build output
@@ -268,7 +270,8 @@ The agent is `ovrd` on the host, whether spawned per run over SSH or resident vi
   Windows); otherwise stdout and stderr stay separate pipes, so `ovr box cargo metadata | jq` works. Input, resize,
   and interrupt frames flow the other way. Colors, progress bars, and interactive prompts work.
 - **Lifetime:** the command runs in its own process group on Unix and in a Job Object on Windows. Ctrl-C is
-  forwarded as an interrupt: `^C` on the terminal, or `SIGINT` to the process group. A second Ctrl-C abandons the
+  forwarded as an interrupt: `^C` on the terminal, `SIGINT` to the process group, or, for a Windows command without
+  a terminal, which has no equivalent signal, terminating its Job Object. A second Ctrl-C abandons the
   run and exits `130`. If the stream drops or the run is abandoned, the whole process tree is killed; processes a
   command leaves behind after exiting normally, such as build servers, are left alone.
 - **Concurrency:** a per-checkout file lock serialises runs against the same checkout on the same host.
@@ -303,11 +306,26 @@ caches such as sccache or bazel-remote are a per-host concern and work unchanged
   injection surface.
 - Checkouts live under one root per host and can be deleted at any time; the next run recreates them.
 
+## Files
+
+`ovr` and `ovrd` follow each platform's conventions on the laptop, and on hosts that dial in:
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Identity, pairings, locks | `~/.local/share/ovr` | `~/Library/Application Support/ovr` | `%LOCALAPPDATA%\ovr\data` |
+| Downloaded agents | `~/.cache/ovr` | `~/Library/Caches/ovr` | `%LOCALAPPDATA%\ovr\cache` |
+| Logs | `~/.local/state/ovr` | `~/Library/Logs/ovr` | `%LOCALAPPDATA%\ovr\data` |
+| Socket | `$XDG_RUNTIME_DIR/ovr`, else logs | `~/Library/Application Support/ovr` | named pipe |
+
+XDG variables are honoured on Linux. SSH hosts keep the agent at `~/.cache/ovr/bin/`, resolved by the host's own
+shell. Checkouts live in `~/ovr` and `C:\ovr`, deliberately short and visible.
+
 ## Implementation
 
 - Rust. Two binaries from one workspace: `ovr` (CLI) and `ovrd` (server, agent, dial-in client).
-- Crates: `clap`, `miette`, `tokio`, `serde_json`, `rustls` + `rcgen` + `ring`, `portable-pty`, `crossterm`,
-  `nix` (signals), `windows-sys` (Job Objects, console control, named pipes). File locks are `std::fs::File::lock`.
+- Crates: `clap`, `miette`, `tokio` + `tokio-util` (framing), `yamux` (multiplexing), `serde_json`, `rustls` +
+  `rcgen` + `ring`, `process-wrap` (process groups, Job Objects), `portable-pty`, `crossterm`, `directories`, `nix`
+  (signals), `windows-sys` (ConPTY Job Objects, console control). File locks are `std::fs::File::lock`.
 - Uses the system `ssh` and `git`; reimplements neither.
 - Prebuilt binaries for macOS, Linux, and Windows on arm64 and x86-64.
 

@@ -57,16 +57,18 @@ pub enum Error {
     )]
     NotARepository,
 
-    #[error("git {command} failed: {stderr}")]
+    #[error(transparent)]
     #[diagnostic(code(ovr::git))]
-    Git { command: String, stderr: String },
+    Git(#[from] ovr_proto::git::Error),
 
     #[error("cannot reach ovrd")]
-    #[diagnostic(
-        code(ovr::daemon),
-        help("is ovrd installed next to ovr? ovrd.log in ~/.local/state/ovr has details")
-    )]
-    Daemon(#[source] io::Error),
+    #[diagnostic(code(ovr::daemon))]
+    Daemon {
+        #[source]
+        source: io::Error,
+        #[help]
+        help: String,
+    },
 
     #[error("{0}")]
     #[diagnostic(code(ovr::host))]

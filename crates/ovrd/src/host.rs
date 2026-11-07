@@ -3,8 +3,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::{SinkExt, StreamExt};
+use ovr_proto::frame::{self, Framed, Resumed};
 use ovr_proto::msg::{Failure, Pair, PairOk};
-use ovr_proto::{FrameKind, frame};
+use ovr_proto::{Frame, FrameKind};
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -13,7 +15,7 @@ use tokio_rustls::client::TlsStream;
 use crate::server::PORT;
 use crate::state::{self, Laptop};
 use crate::tls::{self, Identity};
-use crate::{Error, agent, autostart, pairing};
+use crate::{Error, agent, autostart, mux, pairing};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
@@ -34,22 +36,18 @@ pub async fn pair(addr: &str, code: &str) -> Result<(), Error> {
     } else {
         format!("{addr}:{PORT}")
     };
-    let dir = ovr_proto::state_dir()?;
+    let dir = ovr_proto::paths::data_dir()?;
     let identity = Identity::load_or_create(&dir)?;
     let (mut stream, laptop) = dial(&identity, &addr).await?;
 
     let hostname = agent::hostname();
     let mac = pairing::host_mac(&code, &laptop, &identity.fingerprint, &hostname);
-    frame::send(
-        &mut stream,
-        FrameKind::Pair,
-        &Pair {
-            hostname: hostname.clone(),
-            mac,
-        },
-    )
-    .await?;
-    let reply = frame::read(&mut stream).await?.ok_or(Error::Disconnected)?;
+    let pair = Pair {
+        hostname: hostname.clone(),
+        mac,
+    };
+    stream.send(Frame::json(FrameKind::Pair, &pair)?).await?;
+    let reply = stream.next().await.ok_or(Error::Disconnected)??;
     if reply.kind == FrameKind::Error {
         return Err(Error::Pairing(reply.parse::<Failure>()?.message));
     }
@@ -89,7 +87,7 @@ pub async fn pair(addr: &str, code: &str) -> Result<(), Error> {
 ///
 /// Returns an error when this host is not paired or another `ovrd connect` is already serving.
 pub async fn serve() -> Result<(), Error> {
-    let dir = ovr_proto::state_dir()?;
+    let dir = ovr_proto::paths::data_dir()?;
     let lock = std::fs::File::options()
         .create(true)
         .truncate(false)
@@ -126,7 +124,10 @@ pub async fn serve() -> Result<(), Error> {
 }
 
 /// Connects to the pinned laptop and announces this host.
-async fn attach(identity: &Identity, laptop: &Laptop) -> Result<TlsStream<TcpStream>, Error> {
+async fn attach(
+    identity: &Identity,
+    laptop: &Laptop,
+) -> Result<Resumed<TlsStream<TcpStream>>, Error> {
     let (mut stream, fingerprint) = dial(identity, &laptop.addr).await?;
     if fingerprint != laptop.fingerprint {
         return Err(Error::Pairing(format!(
@@ -134,26 +135,31 @@ async fn attach(identity: &Identity, laptop: &Laptop) -> Result<TlsStream<TcpStr
             laptop.addr
         )));
     }
-    frame::send(&mut stream, FrameKind::Banner, &agent::banner()).await?;
-    let reply = tokio::time::timeout(CONNECT_TIMEOUT, frame::read(&mut stream))
+    stream
+        .send(Frame::json(FrameKind::Banner, &agent::banner())?)
+        .await?;
+    let reply = tokio::time::timeout(CONNECT_TIMEOUT, stream.next())
         .await
-        .map_err(|_| Error::Disconnected)??
-        .ok_or(Error::Disconnected)?;
+        .map_err(|_| Error::Disconnected)?
+        .ok_or(Error::Disconnected)??;
     match reply.kind {
-        FrameKind::Accept => Ok(stream),
+        FrameKind::Accept => Ok(frame::resume(stream)),
         FrameKind::Error => Err(Error::Pairing(reply.parse::<Failure>()?.message)),
         kind => Err(ovr_proto::Error::Unexpected(kind).into()),
     }
 }
 
 /// Opens TLS to `addr`, returning the stream and the laptop's fingerprint for the caller to check.
-async fn dial(identity: &Identity, addr: &str) -> Result<(TlsStream<TcpStream>, String), Error> {
+async fn dial(
+    identity: &Identity,
+    addr: &str,
+) -> Result<(Framed<TlsStream<TcpStream>>, String), Error> {
     let connector = TlsConnector::from(identity.client_config()?);
     let name =
         ServerName::try_from(tls::SERVER_NAME).map_err(|err| Error::Invalid(err.to_string()))?;
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, async {
         let tcp = TcpStream::connect(addr).await?;
-        tcp.set_nodelay(true)?;
+        mux::tune(&tcp)?;
         connector.connect(name, tcp).await
     })
     .await
@@ -161,5 +167,5 @@ async fn dial(identity: &Identity, addr: &str) -> Result<(TlsStream<TcpStream>, 
     .map_err(|err| Error::Host(format!("cannot connect to {addr}: {err}")))?;
     let fingerprint = tls::peer_fingerprint(stream.get_ref().1.peer_certificates())
         .ok_or_else(|| Error::Invalid("the laptop presented no certificate".to_owned()))?;
-    Ok((stream, fingerprint))
+    Ok((frame::framed(stream), fingerprint))
 }

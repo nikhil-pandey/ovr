@@ -4,8 +4,9 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStdin, Command};
+use ovr_proto::git;
+use tokio::io::AsyncWriteExt;
+use tokio::process::{ChildStdin, Command};
 
 use crate::Error;
 
@@ -31,11 +32,11 @@ impl Checkout {
         let dir = root.join(repo);
         if !dir.join(".git").is_dir() {
             tokio::fs::create_dir_all(&dir).await?;
-            git(&dir, &["init", "-q"]).await?;
+            git::run(&dir, &["init", "-q"]).await?;
             // Without reflogs, superseded snapshots become garbage as soon as the next one is checked out.
-            git(&dir, &["config", "core.logAllRefUpdates", "false"]).await?;
+            git::run(&dir, &["config", "core.logAllRefUpdates", "false"]).await?;
             if cfg!(windows) {
-                git(&dir, &["config", "core.longpaths", "true"]).await?;
+                git::run(&dir, &["config", "core.longpaths", "true"]).await?;
             }
         }
         Ok(Self { dir })
@@ -44,7 +45,7 @@ impl Checkout {
     /// Whether the object database has `commit` and therefore every object of that snapshot.
     pub async fn has_commit(&self, commit: &str) -> bool {
         is_object_id(commit)
-            && git(
+            && git::run(
                 &self.dir,
                 &["cat-file", "-e", &format!("{commit}^{{commit}}")],
             )
@@ -58,18 +59,8 @@ impl Checkout {
     ///
     /// Returns an error when Git cannot be started.
     pub fn index_pack(&self) -> io::Result<Indexer> {
-        let mut child = Command::new("git")
-            .args(["index-pack", "--stdin", "--fix-thin"])
-            .current_dir(&self.dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("no stdin"))?;
+        let mut child = git::Child::spawn(&self.dir, &["index-pack", "--stdin", "--fix-thin"])?;
+        let stdin = child.stdin()?;
         Ok(Indexer { child, stdin })
     }
 
@@ -79,17 +70,7 @@ impl Checkout {
     ///
     /// Returns an error when the lock file cannot be opened.
     pub async fn lock(&self) -> io::Result<std::fs::File> {
-        let path = self.dir.join(".git").join("ovr.lock");
-        tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::options()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(path)?;
-            file.lock()?;
-            Ok(file)
-        })
-        .await?
+        git::lock(self.dir.join(".git").join("ovr.lock")).await
     }
 
     /// Checks out `snapshot` as `HEAD`. Only files whose content differs are rewritten, so unchanged files keep
@@ -106,12 +87,12 @@ impl Checkout {
                 "snapshot {snapshot} did not arrive"
             )));
         }
-        git(&self.dir, &["reset", "--hard", "-q", snapshot]).await?;
+        git::run(&self.dir, &["reset", "--hard", "-q", snapshot]).await?;
         if !self.dir.join(".gitmodules").is_file() {
             return Ok(None);
         }
         // Submodules come from their remotes with the host's credentials.
-        let updated = git(
+        let updated = git::run(
             &self.dir,
             &["submodule", "update", "--init", "--recursive", "-q"],
         )
@@ -166,7 +147,7 @@ impl Checkout {
 
 /// A running `git index-pack`, fed one frame at a time.
 pub struct Indexer {
-    child: Child,
+    child: git::Child,
     stdin: ChildStdin,
 }
 
@@ -183,41 +164,12 @@ impl Indexer {
     /// # Errors
     ///
     /// Returns an error when the pack could not be indexed.
-    pub async fn finish(mut self) -> Result<(), Error> {
+    pub async fn finish(self) -> Result<(), Error> {
         drop(self.stdin);
-        let mut stderr = String::new();
-        if let Some(mut pipe) = self.child.stderr.take() {
-            let _ = pipe.read_to_string(&mut stderr).await;
-        }
-        if self.child.wait().await?.success() {
-            Ok(())
-        } else {
-            Err(Error::Git {
-                command: "index-pack".to_owned(),
-                stderr: stderr.trim().to_owned(),
-            })
-        }
+        Ok(self.child.finish().await?)
     }
 }
 
 fn is_object_id(id: &str) -> bool {
     matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-async fn git(dir: &Path, args: &[&str]) -> Result<String, Error> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        Err(Error::Git {
-            command: args.first().copied().unwrap_or_default().to_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        })
-    }
 }

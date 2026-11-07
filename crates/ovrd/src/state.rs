@@ -1,4 +1,4 @@
-//! Pairing records in the state directory, written atomically and readable only by the user.
+//! Pairing records in the data directory, written atomically and readable only by the user.
 
 use std::io;
 use std::path::{Path, PathBuf};

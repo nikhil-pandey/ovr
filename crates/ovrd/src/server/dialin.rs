@@ -3,14 +3,16 @@
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
+use futures::{SinkExt, StreamExt};
+use ovr_proto::frame::{self, Framed};
 use ovr_proto::msg::{Banner, Failure, Pair, PairOk};
-use ovr_proto::{Frame, FrameKind, PROTOCOL_VERSION, frame};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use ovr_proto::{Frame, FrameKind, PROTOCOL_VERSION};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
 use super::{PORT, Server};
-use crate::mux::{Mux, Role};
+use crate::mux::{self, Mux};
 use crate::state::PairedHost;
 use crate::{Error, pairing, state, tls};
 
@@ -58,15 +60,15 @@ pub async fn listen(server: Arc<Server>) {
 }
 
 async fn handle(server: &Server, acceptor: &TlsAcceptor, tcp: TcpStream) -> Result<(), Error> {
-    tcp.set_nodelay(true)?;
+    mux::tune(&tcp)?;
     let (mut tls, first) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        let mut tls = acceptor.accept(tcp).await?;
-        let first = frame::read(&mut tls).await?.ok_or(Error::Disconnected)?;
+        let mut tls = frame::framed(acceptor.accept(tcp).await?);
+        let first = tls.next().await.ok_or(Error::Disconnected)??;
         Ok::<_, Error>((tls, first))
     })
     .await
     .map_err(|_| Error::Invalid("handshake timed out".to_owned()))??;
-    let fingerprint = tls::peer_fingerprint(tls.get_ref().1.peer_certificates())
+    let fingerprint = tls::peer_fingerprint(tls.get_ref().get_ref().1.peer_certificates())
         .ok_or_else(|| Error::Invalid("no client certificate".to_owned()))?;
     match first.kind {
         FrameKind::Pair => pair(server, &mut tls, &first, &fingerprint).await,
@@ -76,7 +78,12 @@ async fn handle(server: &Server, acceptor: &TlsAcceptor, tcp: TcpStream) -> Resu
 }
 
 /// Completes `ovrd connect ADDR CODE` when the host proves it holds a code issued here.
-async fn pair<S>(server: &Server, stream: &mut S, frame: &Frame, host: &str) -> Result<(), Error>
+async fn pair<S>(
+    server: &Server,
+    stream: &mut Framed<S>,
+    frame: &Frame,
+    host: &str,
+) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -94,7 +101,9 @@ where
         });
     let Some(code) = code else {
         let message = "the pairing code is wrong or has expired; run `ovrd pair` again".to_owned();
-        frame::send(stream, FrameKind::Error, &Failure { message }).await?;
+        stream
+            .send(Frame::json(FrameKind::Error, &Failure { message })?)
+            .await?;
         return Err(Error::Invalid(format!(
             "failed pairing attempt from {}",
             request.hostname
@@ -109,8 +118,10 @@ where
         },
     )?;
     let mac = pairing::laptop_mac(&code, laptop, host);
-    frame::send(stream, FrameKind::PairOk, &PairOk { mac }).await?;
-    stream.shutdown().await?;
+    stream
+        .send(Frame::json(FrameKind::PairOk, &PairOk { mac })?)
+        .await?;
+    stream.close().await?;
     tracing::info!(name, "paired");
     Ok(())
 }
@@ -118,7 +129,7 @@ where
 /// Serves a paired host's connection until it drops.
 async fn attach<S>(
     server: &Server,
-    mut stream: S,
+    mut stream: Framed<S>,
     frame: &Frame,
     fingerprint: &str,
 ) -> Result<(), Error>
@@ -140,20 +151,18 @@ where
         Some(_) => None,
     };
     if let Some(message) = refusal {
-        frame::send(
-            &mut stream,
-            FrameKind::Error,
-            &Failure {
-                message: message.clone(),
-            },
-        )
-        .await?;
+        let failure = Failure {
+            message: message.clone(),
+        };
+        stream
+            .send(Frame::json(FrameKind::Error, &failure)?)
+            .await?;
         return Err(Error::Invalid(message));
     }
     let Some(paired) = paired else { return Ok(()) };
-    frame::write(&mut stream, FrameKind::Accept, &[]).await?;
+    stream.send(Frame::empty(FrameKind::Accept)).await?;
 
-    let (mux, _incoming) = Mux::new(stream, Role::Opener);
+    let mux = Mux::open_on(frame::resume(stream));
     let id = server
         .dialed
         .insert(&paired.name, mux.clone(), banner.platform);
