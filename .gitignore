@@ -2,3 +2,4 @@
 /bazel-*
 /user.bazelrc
 /dist
+/.zig-cache
