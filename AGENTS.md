@@ -12,7 +12,8 @@ source of truth for behaviour; read it before changing anything user-visible.
 
 ## Principles
 
-- Keep it minimal. No configuration files, no environment variables, no flags that a fixed default can replace.
+- Keep it minimal. No configuration files, no flags that a fixed default can replace, and no environment variables
+  beyond the `OVR_*` directory overrides in `crates/ovr-proto/src/paths.rs`.
 - Keep the README short: what it is, one example, a link to the design. Details belong in `docs/DESIGN.md`, not the
   README.
 - Update `docs/DESIGN.md` in the same change when behaviour changes.

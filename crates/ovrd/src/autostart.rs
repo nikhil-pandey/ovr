@@ -18,14 +18,24 @@ pub fn install() -> io::Result<()> {
     platform::install(&exe)
 }
 
-/// The installing shell's `PATH`, which the service keeps so it finds tunnel CLIs installed by Homebrew or into the
-/// user's home; service managers otherwise start it with a minimal one. A Scheduled Task already gets the user's.
+/// The installing shell's `PATH`, so the service finds tunnel CLIs installed by Homebrew or into the user's home.
 #[cfg(unix)]
 fn path() -> String {
     std::env::var_os("PATH")
         .map(|path| path.to_string_lossy().into_owned())
         .filter(|path| !path.is_empty())
         .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_owned())
+}
+
+/// The installing shell's `PATH` and the directory overrides it sets, which the service keeps; service managers
+/// otherwise start it with a minimal environment. A Scheduled Task already gets the user's.
+#[cfg(unix)]
+fn environment() -> Vec<(&'static str, String)> {
+    let overrides = ovr_proto::paths::OVERRIDES.into_iter().filter_map(|var| {
+        let value = std::env::var(var).ok()?;
+        Path::new(&value).is_absolute().then_some((var, value))
+    });
+    std::iter::once(("PATH", path())).chain(overrides).collect()
 }
 
 fn run(program: &str, args: &[&str]) -> io::Result<()> {
@@ -43,7 +53,9 @@ fn run(program: &str, args: &[&str]) -> io::Result<()> {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::{Path, io, path, run};
+    use std::fmt::Write;
+
+    use super::{Path, environment, io, run};
 
     const LABEL: &str = "dev.ovr.connect";
 
@@ -65,14 +77,19 @@ mod platform {
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>{path}</string></dict>
+  <dict>{environment}</dict>
   <key>StandardErrorPath</key><string>{log}</string>
 </dict>
 </plist>
 "#,
                 exe = escape(&exe.to_string_lossy()),
                 log = escape(&log.to_string_lossy()),
-                path = escape(&path()),
+                environment = environment()
+                    .iter()
+                    .fold(String::new(), |mut out, (key, value)| {
+                        let _ = write!(out, "<key>{key}</key><string>{}</string>", escape(value));
+                        out
+                    }),
             ),
         )?;
         let domain = format!("gui/{}", nix::unistd::getuid());
@@ -94,7 +111,9 @@ mod platform {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod platform {
-    use super::{NAME, Path, io, path, run};
+    use std::fmt::Write;
+
+    use super::{NAME, Path, environment, io, run};
 
     pub fn install(exe: &Path) -> io::Result<()> {
         let dir = directories::BaseDirs::new()
@@ -106,14 +125,20 @@ mod platform {
             dir.join(format!("{NAME}.service")),
             format!(
                 "[Unit]\nDescription=ovr host agent\nAfter=network-online.target\n\n\
-                 [Service]\nExecStart=\"{exe}\" connect --service\nEnvironment=\"PATH={path}\"\n\
+                 [Service]\nExecStart=\"{exe}\" connect --service\n{environment}\
                  Restart=always\nRestartSec=5\nKillMode=process\n\n\
                  [Install]\nWantedBy=default.target\n",
                 exe = exe.display(),
-                path = path()
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('%', "%%"),
+                environment = environment()
+                    .iter()
+                    .fold(String::new(), |mut out, (key, value)| {
+                        let value = value
+                            .replace('\\', "\\\\")
+                            .replace('"', "\\\"")
+                            .replace('%', "%%");
+                        let _ = writeln!(out, "Environment=\"{key}={value}\"");
+                        out
+                    }),
             ),
         )?;
         run("systemctl", &["--user", "daemon-reload"])?;

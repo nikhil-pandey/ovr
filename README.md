@@ -8,7 +8,7 @@ ovr winbox -- dotnet build
 ```
 
 `ovr HOST -- CMD...` runs `CMD` on another machine against your local, uncommitted working tree and streams the output
-back. No configuration.
+back. No configuration required.
 
 Status: early development. See [docs/DESIGN.md](docs/DESIGN.md).
 

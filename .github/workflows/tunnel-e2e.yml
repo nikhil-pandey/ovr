@@ -133,10 +133,12 @@ jobs:
           cargo build --release --locked -p ovrd
           echo "$GITHUB_WORKSPACE/target/release" >>"$GITHUB_PATH"
       - run: .github/e2e/install-cloudflared.sh
-      # Checkouts go to the larger scratch disk on Linux, and to the drive with the most room on Windows, where deep
-      # trees also need long paths. OVR_DISK is where the specs measure free space.
+      # OVR_CHECKOUTS puts checkouts on the larger scratch disk on Linux, and on the drive with the most room on
+      # Windows, where deep trees also need long paths. The specs measure free space there.
       - if: runner.os == 'Linux'
-        run: sudo mkdir -p /mnt/ovr && sudo chown "$USER" /mnt/ovr && ln -s /mnt/ovr ~/ovr
+        run: |
+          sudo mkdir -p /mnt/ovr && sudo chown "$USER" /mnt/ovr
+          echo "OVR_CHECKOUTS=/mnt/ovr" >>"$GITHUB_ENV"
       - if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -145,8 +147,7 @@ jobs:
           $drive = Get-PSDrive -PSProvider FileSystem | Where-Object Free | Sort-Object Free -Descending | Select-Object -First 1
           $dir = Join-Path $drive.Root ovr
           New-Item -ItemType Directory -Force $dir | Out-Null
-          if ($dir -ne 'C:\ovr') { New-Item -ItemType Junction -Path C:\ovr -Target $dir | Out-Null }
-          "OVR_DISK=$dir" >> $env:GITHUB_ENV
+          "OVR_CHECKOUTS=$dir" >> $env:GITHUB_ENV
       - name: Publish specs and a key the initiator can encrypt to
         run: |
           mkdir -p "$RUNNER_TEMP/key" key

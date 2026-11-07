@@ -37,8 +37,9 @@ Constraints that shape the design:
 
 ## Principles
 
-- **No configuration.** No project file, no user file, no environment variables read by `ovr`. The only state is
-  what `ssh` already has and the pairing and tunnel records created by `ovrd pair`.
+- **No configuration.** No project file and no user file. The only state is what `ssh` already has and the pairing
+  and tunnel records created by `ovrd pair`. A few environment variables move where files live (see
+  [Files](#files)); none is needed.
 - **No environment forwarding.** The remote command sees the remote user's login environment, nothing from the
   initiator. Credentials never leave the machine by accident.
 - **Git decides what is sent.** Tracked and untracked files are sent; `.gitignore`d files are never sent. Build
@@ -117,13 +118,13 @@ ovrd connect [ADDR]         on a host: keep serving the initiator it paired with
  │ ovr HOST -- cargo test                       │         ┌─────────────────────────────────┐
  │   snapshot tree ──► thin pack                │  ssh    │ linux-box                       │
  │   │ unix socket                              │ ───────►│   ssh HOST ovrd agent           │
- │   ▼                                          │         │   ~/ovr/<repo>-<key>/ (warm)    │
+ │   ▼                                          │         │   <checkouts>/<repo>-<key>/     │
  │ ovrd                                         │         └─────────────────────────────────┘
  │   ├─ ssh hosts: spawn ssh, upload agent      │
  │   └─ dialed-in hosts: TLS listener :7420     │  TLS    ┌─────────────────────────────────┐
  │        paired keys, hostname ─► connection   │ ◄─dials─│ winbox                          │
  │                                              │   out   │   ovrd connect <initiator> CODE │
- │ one agent protocol over either stream        │         │   C:\ovr\<repo>-<key>\ (warm)   │
+ │ one agent protocol over either stream        │         │   <checkouts>\<repo>-<key>\     │
  └──────────────────────────────────────────────┘         └─────────────────────────────────┘
 ```
 
@@ -178,10 +179,11 @@ For hosts that cannot accept SSH, including every Windows workstation:
 - After pairing, `ovrd connect` keeps serving: it reconnects with backoff when the initiator sleeps or moves
   networks, and only ever accepts jobs from the initiator it paired with. Pairing installs it to start at login as
   the logged-in user (Scheduled Task on Windows, a `launchd` agent on macOS, a `systemd --user` unit on Linux),
-  never as SYSTEM or root, and it works only inside `~/ovr` / `C:\ovr`. Restarting the service leaves run keepers
-  alone (`KillMode=process` on Linux). The service keeps the `PATH` it was installed from, so it finds tunnel CLIs
-  wherever the user installed them. With `--foreground`, or where no service manager is available, it serves in
-  the foreground instead and installs nothing. A Linux host that should serve without a login session needs
+  never as SYSTEM or root, and it works only inside its checkouts directory. Restarting the service leaves run
+  keepers alone (`KillMode=process` on Linux). The service keeps the `PATH` and `OVR_*` directory variables it was
+  installed from, so it finds tunnel CLIs wherever the user installed them and its files where the user moved them;
+  a Scheduled Task reads the user's persistent environment instead. With `--foreground`, or where no service
+  manager is available, it serves in the foreground instead and installs nothing. A Linux host that should serve without a login session needs
   `loginctl enable-linger`.
 - `ovrd connect ADDR` without a code moves a paired host to a new address of the same initiator. It needs no code
   because the pinned key, not the address, identifies the initiator: the host accepts the new address only once the
@@ -352,11 +354,11 @@ creates that is not tracked stays, exactly as it would locally.
 
 ### Checkout location
 
-The checkout lives at `~/ovr/<repo>-<key>` on Unix and `C:\ovr\<repo>-<key>` on Windows, where `<repo>` is the
+The checkout lives at `<checkouts>/<repo>-<key>` (see [Files](#files)), where `<repo>` is the
 basename of the local repository root and `<key>` is a short hash of the initiator's identity and that root's absolute
 path. Every run from the same local checkout shares one remote checkout; another initiator, another clone, or another
 Git worktree gets its own, so they never overwrite each other. Moving the local repository starts a fresh, cold
-checkout. The path is stable and short, so incremental state (`target/`, Bazel's output base, `obj/`) and
+checkout. The path is stable, so incremental state (`target/`, Bazel's output base, `obj/`) and
 path-keyed caches such as sccache stay valid across runs. Submodules are fetched by the host from their
 URLs with the host user's credentials; the checkout has no `origin`, so relative submodule URLs do not resolve, and
 a failed update is shown as a warning before the command runs. Git LFS content is not sent.
@@ -422,7 +424,7 @@ disconnect, not a stop.
 
 Windows works as a host (via dial-in) and as the initiator.
 
-- **Host:** `ovrd connect` installed as a Scheduled Task at logon. Job Objects, ConPTY, `C:\ovr\<repo>-<key>`,
+- **Host:** `ovrd connect` installed as a Scheduled Task at logon. Job Objects, ConPTY,
   `core.longpaths=true` set on the checkout. `cargo`, `bazel`, and `dotnet` locate their toolchains themselves;
   `ovr` runs no `vcvars` or setup scripts.
 - **Initiator:** `ovrd` listens the same way and the CLI talks to it over a named pipe. The snapshot applies
@@ -443,7 +445,7 @@ caches such as sccache or bazel-remote are a per-host concern and work unchanged
 - SSH hosts: authentication and host verification are OpenSSH's, using your existing configuration.
 - Dial-in hosts: mutual TLS 1.3 with keys pinned at pairing. A host serves only the initiator it paired with; the
   initiator accepts only hosts it paired. Pairing codes are one-shot, expiring, and rate-limited.
-- Dial-in agents run as a normal user, inside `~/ovr` / `C:\ovr` only.
+- Dial-in agents run as a normal user, inside their checkouts directory only.
 - No environment is forwarded, so local tokens and keys cannot leak into the remote process.
 - `.gitignore`d files never leave the initiator, and neither does Git history: hosts hold only snapshots.
 - Commands travel as argument vectors and the SSH agent binary is uploaded over SFTP, so there is no shell
@@ -462,10 +464,27 @@ caches such as sccache or bazel-remote are a per-host concern and work unchanged
 | Downloaded agents | `~/.cache/ovr` | `~/Library/Caches/ovr` | `%LOCALAPPDATA%\ovr\cache` |
 | Logs | `~/.local/state/ovr` | `~/Library/Logs/ovr` | `%LOCALAPPDATA%\ovr\data` |
 | Runs (hosts) | `~/.local/state/ovr/runs` | `~/Library/Application Support/ovr/runs` | `%LOCALAPPDATA%\ovr\data\runs` |
+| Checkouts (hosts) | `~/.local/share/ovr/checkouts` | `~/Library/Application Support/ovr/checkouts` | `%LOCALAPPDATA%\ovr\data\checkouts` |
 | Socket | `$XDG_RUNTIME_DIR/ovr`, else logs | `~/Library/Application Support/ovr` | named pipe |
 
-XDG variables are honoured on Linux. SSH hosts keep the agent at `~/.cache/ovr/bin/`, resolved by the host's own
-shell. Checkouts live in `~/ovr` and `C:\ovr`, deliberately short and visible.
+XDG variables are honoured on Linux. On every platform, absolute paths in these variables move a directory; empty
+or relative values are ignored:
+
+| Variable | Moves |
+|---|---|
+| `OVR_DATA_DIR` | identity, pairings, tunnels, locks; checkouts and the macOS and Windows socket and runs follow |
+| `OVR_CACHE_DIR` | downloaded agents |
+| `OVR_STATE_DIR` | logs, and runs at `runs/` beneath it |
+| `OVR_CHECKOUTS` | checkouts, for example onto a fast NVMe disk: `OVR_CHECKOUTS=/nvme/ovr` |
+
+They are read where the files are: on a host by its `ovrd`. Set them where that `ovrd` starts: in the shell that runs
+`ovrd connect`, which records them in the login service; as user environment variables on Windows; and for SSH hosts
+where a non-interactive `ssh HOST env` shows them. `ovr` and the local `ovrd` must see the same values.
+
+Checkouts can be deleted at any time; the next run sends everything again. Some build tools reject paths with spaces,
+which macOS's default has, and MSBuild still trips on Windows paths beyond 260 characters; `OVR_CHECKOUTS` moves
+checkouts to a short path for those. SSH hosts keep the agent at `~/.cache/ovr/bin/`, resolved by the host's own shell
+before `ovrd` runs.
 
 ## Implementation
 

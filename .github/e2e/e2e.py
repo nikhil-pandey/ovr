@@ -140,15 +140,30 @@ def os_version() -> str:
     return f"Windows {platform.version()}"
 
 
+def absolute_env(var: str) -> Path | None:
+    value = os.environ.get(var)
+    return Path(value) if value and Path(value).is_absolute() else None
+
+
 def checkout_root() -> Path:
-    """Where ovrd keeps checkouts: `~/ovr` on Unix, `C:\\ovr` on Windows."""
-    if sys.platform == "win32":
-        return Path(os.environ.get("SystemDrive", "C:") + "\\ovr")
-    return Path.home() / "ovr"
+    """Where ovrd keeps checkouts, as `ovr_proto::paths::checkouts_dir` places them."""
+    if root := absolute_env("OVR_CHECKOUTS"):
+        return root
+    if data := absolute_env("OVR_DATA_DIR"):
+        return data / "checkouts"
+    match sys.platform:
+        case "darwin":
+            return Path.home() / "Library/Application Support/ovr/checkouts"
+        case "win32":
+            return Path(os.environ["LOCALAPPDATA"]) / "ovr/data/checkouts"
+    data_home = absolute_env("XDG_DATA_HOME") or Path.home() / ".local/share"
+    return data_home / "ovr/checkouts"
 
 
 def runs_dir() -> Path:
     """Where a host keeps run records, as `ovr_proto::paths::runs_dir` places them."""
+    if state := absolute_env("OVR_STATE_DIR"):
+        return state / "runs"
     match sys.platform:
         case "darwin":
             return Path.home() / "Library/Application Support/ovr/runs"
@@ -834,9 +849,7 @@ def main() -> None:
 
     p = sub.add_parser("specs", help="record this runner's specs")
     p.add_argument("--role", required=True)
-    p.add_argument(
-        "--disk", default=os.environ.get("OVR_DISK") or str(checkout_root()), help="where to measure free disk"
-    )
+    p.add_argument("--disk", default=str(checkout_root()), help="where to measure free disk")
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_specs)
 

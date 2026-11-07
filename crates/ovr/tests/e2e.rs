@@ -18,13 +18,17 @@ use ovr_proto::{Frame, FrameKind, frame};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Everything an XDG-aware tool could read instead of `HOME`.
-const XDG: [&str; 5] = [
+/// Everything `ovr` or an XDG-aware tool could read instead of `HOME`.
+const XDG: [&str; 9] = [
     "XDG_CACHE_HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_RUNTIME_DIR",
     "XDG_STATE_HOME",
+    "OVR_DATA_DIR",
+    "OVR_CACHE_DIR",
+    "OVR_STATE_DIR",
+    "OVR_CHECKOUTS",
 ];
 
 /// An initiator and a host on this machine, each with its own home, and a repository to run against.

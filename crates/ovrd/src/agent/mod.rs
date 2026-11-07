@@ -32,21 +32,14 @@ pub struct Config {
 }
 
 impl Config {
-    /// `~/ovr` on Unix or `C:\ovr` on Windows, the runs directory, the user's shell, and this `ovrd` as keeper.
+    /// The checkouts and runs directories, the user's shell, and this `ovrd` as keeper.
     ///
     /// # Errors
     ///
-    /// Returns an error when the home directory is unknown.
+    /// Returns an error when the home directory is unknown or a directory cannot be created.
     pub fn detect() -> io::Result<Self> {
-        #[cfg(unix)]
-        let root = ovr_proto::paths::home_dir()?.join("ovr");
-        #[cfg(windows)]
-        let root = {
-            let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_owned());
-            PathBuf::from(format!(r"{drive}\ovr"))
-        };
         Ok(Self {
-            root,
+            root: ovr_proto::paths::checkouts_dir()?,
             runs: ovr_proto::paths::runs_dir()?,
             shell: Shell::detect(),
             keeper: Some(std::env::current_exe()?),
