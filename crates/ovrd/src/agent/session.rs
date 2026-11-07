@@ -34,17 +34,21 @@ where
             Some(err.to_string())
         }
     };
-    if let Some(message) = failure {
-        match Frame::json(FrameKind::Error, &Failure { message }) {
-            Ok(frame) => {
-                if let Err(err) = writer.send(frame).await {
-                    tracing::info!(%err, "cannot report a failure");
-                }
+    let Some(message) = failure else {
+        let _ = writer.close().await;
+        return;
+    };
+    match Frame::json(FrameKind::Error, &Failure { message }) {
+        Ok(frame) => {
+            if let Err(err) = writer.send(frame).await {
+                tracing::info!(%err, "cannot report a failure");
             }
-            Err(err) => tracing::warn!(%err, "cannot encode a failure"),
         }
+        Err(err) => tracing::warn!(%err, "cannot encode a failure"),
     }
     let _ = writer.close().await;
+    // A client still sending a pack would otherwise wait forever for room to write, and never read why.
+    while let Some(Ok(_)) = frames.next().await {}
 }
 
 async fn dispatch<S: AsyncRead + AsyncWrite>(
@@ -252,4 +256,64 @@ async fn replay<S: AsyncRead + AsyncWrite>(
 
 async fn next<S: AsyncRead>(frames: &mut Reader<S>) -> Result<Frame, Error> {
     Ok(frames.next().await.ok_or(Error::Disconnected)??)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::time::Duration;
+
+    use super::super::Shell;
+    use super::*;
+    use crate::mux::{Incoming, Mux};
+
+    #[tokio::test]
+    async fn a_failed_sync_lets_the_client_finish_sending_and_hear_why()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let config = Config {
+            root: dir.path().join("checkouts"),
+            runs: dir.path().join("runs"),
+            shell: Shell::new("/bin/sh"),
+            keeper: None,
+        };
+        // Through the mux, whose flow control stalls a writer the other end stopped reading.
+        let (initiator, host) = tokio::io::duplex(1 << 16);
+        let mux = Mux::open_on(initiator);
+        let mut incoming = Incoming::accept_on(host);
+        let host = tokio::spawn(async move {
+            if let Some(channel) = incoming.accept().await {
+                serve(channel, &config).await;
+            }
+            // The connection outlives the stream, as with a real host.
+            std::future::pending::<Incoming>().await
+        });
+
+        let (mut frames, mut writer) = frame::split(mux.open().await?);
+        let hello = Hello {
+            checkout: "repo-key".to_owned(),
+            seq: 1,
+            base: None,
+            snapshot: "0".repeat(40),
+            initiator: "me".to_owned(),
+        };
+        writer.send(Frame::json(FrameKind::Hello, &hello)?).await?;
+        // Not a pack: git gives up on the first frame, well before the rest is sent.
+        let sent = tokio::time::timeout(Duration::from_secs(10), async {
+            for _ in 0..64 {
+                writer
+                    .send(Frame::new(FrameKind::Pack, vec![0xff; 64 * 1024]))
+                    .await?;
+            }
+            writer.send(Frame::empty(FrameKind::Pack)).await
+        })
+        .await;
+        assert!(matches!(sent, Ok(Ok(()))), "{sent:?}");
+
+        let welcome: Welcome = next(&mut frames).await?.expect(FrameKind::Welcome)?;
+        assert_eq!(welcome, Welcome::Ok);
+        let failure: Failure = next(&mut frames).await?.expect(FrameKind::Error)?;
+        assert!(failure.message.contains("pack"), "{}", failure.message);
+        host.abort();
+        Ok(())
+    }
 }

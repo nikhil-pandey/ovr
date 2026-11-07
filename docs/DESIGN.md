@@ -301,6 +301,10 @@ orders them.
   warm run never pays a TCP or TLS handshake, let alone a jump host. Runs, in turn, outlive connections; see
   [Runs](#runs).
 - **Overlapped.** Opening the host stream and building the snapshot run concurrently.
+- **Failures mid-sync are heard.** An agent that fails while the pack is still arriving, say on a full disk,
+  answers `ERROR` and then reads and discards the rest of the stream, and the client listens to the agent while
+  it sends. Either side alone keeps a pack larger than the stream's window from stalling forever on a host that
+  stopped reading.
 
 ### How the remote applies it
 
