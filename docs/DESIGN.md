@@ -182,10 +182,11 @@ For hosts that cannot accept SSH, including every Windows workstation:
   nearest hop, which stays up.
 - After pairing, `ovrd connect` keeps serving: it reconnects when the initiator sleeps or moves networks, and only
   ever accepts jobs from the initiator it paired with. Retries back off from one second to at most two seconds
-  between a failed attempt and the next for a `host:port` address, so a host notices within seconds that the
-  initiator is back, and to at most ten for a tunnel, where each attempt restarts the provider's local forwarder.
-  Each attempt still has its own 10-second connection timeout. Only a new reason for failing is logged, so a host
-  waiting all night for a sleeping laptop leaves one line, not thousands. Pairing installs it to start at login as
+  between a failed attempt and the next for a `host:port` address, and to at most ten for a tunnel, where each
+  attempt restarts the provider's local forwarder. This caps only the retry wait, not recovery time: connection
+  attempts retain their 10-second timeout, heartbeat failure detection can take 45 seconds, and the CLI has its
+  own reconnect backoff. At info level, only changes in the failure reason are logged; repeated identical failures
+  are debug events. Pairing installs it to start at login as
   the logged-in user (Scheduled Task on Windows, a `launchd` agent on macOS, a `systemd --user` unit on Linux),
   never as SYSTEM or root, and it works only inside its checkouts directory. Restarting the service leaves run
   keepers alone (`KillMode=process` on Linux). The service keeps the `PATH` and `OVR_*` directory variables it was
@@ -320,11 +321,13 @@ orders them.
 - **Timed.** The client emits `debug` events for the wall-clock time from starting the run to `ATTACHED` and for
   each phase: opening the host stream, waiting for the snapshot lock, building the snapshot, looking up the base,
   producing and sending each pack (with its bytes, and whether it was full or cut short by `need_full`), receiving
-  `SYNCED`, recording the base, and receiving `ATTACHED`, tagged with the checkout and run to match the host's log.
+  `SYNCED`, recording the base, and receiving `ATTACHED`. Events carry the host, plus the checkout and snapshot
+  sequence during sync, and the run number once attached, to match the host's log.
   Phases overlap, so they do not add up to the total, and time until `SYNCED` includes the host's work. The CLI
   installs no subscriber, so its output is unchanged; to see them, run the developer example
   `cargo run --release -p ovr --example timing -- HOST -- CMD... 2> timings.log`, whose stderr mixes the events
-  with the command's.
+  with the command's. Put an `ovrd` of the same version on `PATH` first; the example is built in `examples/`,
+  not beside the server binary.
 
 ### How the remote applies it
 

@@ -20,7 +20,7 @@ use crate::tunnel::{self, Addr, Running};
 use crate::{Error, agent, autostart, mux, pairing};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Longest wait between attempts to reach the initiator directly, so a host notices it is back within seconds.
+/// Longest wait after a failed attempt to reach the initiator directly; not a recovery deadline.
 const MAX_BACKOFF: Duration = Duration::from_secs(2);
 /// Longest wait between attempts through a tunnel, each of which restarts the provider's local forwarder.
 const MAX_TUNNEL_BACKOFF: Duration = Duration::from_secs(10);

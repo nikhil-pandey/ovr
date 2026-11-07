@@ -152,6 +152,7 @@ pub async fn run(cli: Cli) -> Result<i32, Error> {
     }
 }
 
+#[tracing::instrument(level = "debug", skip_all, fields(%host))]
 async fn run_on(host: String, argv: Vec<String>, detach: bool) -> Result<i32, Error> {
     let started = Instant::now();
     let cwd = std::env::current_dir()?;

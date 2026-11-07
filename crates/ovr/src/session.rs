@@ -133,6 +133,11 @@ impl<S: AsyncRead + AsyncWrite> Stream<S> {
 /// # Errors
 ///
 /// Returns an error when syncing fails, the command cannot be started, or the connection drops.
+#[tracing::instrument(
+    level = "debug",
+    skip_all,
+    fields(checkout = %delivery.checkout, seq = delivery.snapshot.seq)
+)]
 pub async fn start<S, E>(
     stream: S,
     delivery: &Delivery<'_>,
