@@ -1,6 +1,7 @@
 //! The agent: `ovrd` on a host, serving runs from the initiator over a multiplexed connection.
 
 pub mod checkout;
+pub mod clean;
 pub mod keeper;
 mod log;
 pub mod process;
@@ -25,6 +26,8 @@ pub use process::Shell;
 pub struct Config {
     pub root: PathBuf,
     pub runs: PathBuf,
+    /// Where agents uploaded over SSH live, so that cleaning removes other versions.
+    pub agents: PathBuf,
     pub shell: Shell,
     /// The `ovrd` that keeps runs, as `ovrd keep`; `None` keeps them in this process, which only tests want, since
     /// runs then end with it.
@@ -32,22 +35,16 @@ pub struct Config {
 }
 
 impl Config {
-    /// `~/ovr` on Unix or `C:\ovr` on Windows, the runs directory, the user's shell, and this `ovrd` as keeper.
+    /// The checkouts, runs, and uploaded agents directories, the user's shell, and this `ovrd` as keeper.
     ///
     /// # Errors
     ///
-    /// Returns an error when the home directory is unknown.
+    /// Returns an error when the home directory is unknown or a directory cannot be created.
     pub fn detect() -> io::Result<Self> {
-        #[cfg(unix)]
-        let root = ovr_proto::paths::home_dir()?.join("ovr");
-        #[cfg(windows)]
-        let root = {
-            let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_owned());
-            PathBuf::from(format!(r"{drive}\ovr"))
-        };
         Ok(Self {
-            root,
+            root: ovr_proto::paths::checkouts_dir()?,
             runs: ovr_proto::paths::runs_dir()?,
+            agents: ovr_proto::paths::home_dir()?.join(ovr_proto::paths::SSH_AGENTS),
             shell: Shell::detect(),
             keeper: Some(std::env::current_exe()?),
         })

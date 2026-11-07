@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 use ovr_proto::frame::Resumed;
 use ovr_proto::ipc::ClientStream;
-use ovr_proto::msg::{Attach, Exec, Op, Resize, Response, RunInfo, RunState};
+use ovr_proto::msg::{Attach, Cleaned, Exec, Op, Resize, Response, RunInfo, RunState};
 use ovr_proto::{Frame, FrameKind};
 
 use crate::session::{End, Io, Mode, Position, Signal, Stream};
@@ -54,6 +54,14 @@ pub enum Command {
     Logs { host: String, run: u64 },
     /// Kill a run's whole process tree.
     Kill { host: String, run: u64 },
+    /// Remove checkouts and finished runs, keeping those in use, and agents of other versions.
+    Clean {
+        /// Remove this initiator's from these hosts; otherwise everyone's from this machine.
+        hosts: Vec<String>,
+        /// This machine, and this initiator's from every host with an open connection.
+        #[arg(long, conflicts_with = "hosts")]
+        all: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -138,6 +146,7 @@ pub async fn run(cli: Cli) -> Result<i32, Error> {
             session::kill(stream, run).await?;
             Ok(0)
         }
+        (Some(Command::Clean { hosts, all }), _) => clean(hosts, all).await,
         (None, Some(host)) => run_on(host, cli.run.cmd, cli.run.detach).await,
         (None, None) => Err(Error::Host("no host given".to_owned())),
     }
@@ -391,6 +400,71 @@ fn age(seconds: u64) -> String {
         3600..86400 => format!("{}h", seconds / 3600),
         _ => format!("{}d", seconds / 86400),
     }
+}
+
+async fn clean(hosts: Vec<String>, all: bool) -> Result<i32, Error> {
+    let mut code = 0;
+    if all || hosts.is_empty() {
+        match daemon::request(Op::Clean).await? {
+            (_, Response::Cleaned(cleaned)) => report("this machine", &cleaned),
+            (_, other) => {
+                eprintln!("ovr: this machine: {}", daemon::unexpected(other));
+                code = FAILURE;
+            }
+        }
+    }
+    let hosts = if all {
+        daemon::connected().await?
+    } else {
+        hosts
+    };
+    let cwd = std::env::current_dir()?;
+    for host in hosts {
+        let cleaned = async {
+            let (stream, initiator) = daemon::open(&host).await?;
+            session::clean(stream, &initiator).await
+        };
+        match cleaned.await {
+            Ok(cleaned) => {
+                snapshot::forget_host(&cwd, &host).await;
+                report(&host, &cleaned);
+            }
+            Err(err) => {
+                eprintln!("ovr: {host}: {err}");
+                code = FAILURE;
+            }
+        }
+    }
+    Ok(code)
+}
+
+fn report(target: &str, cleaned: &Cleaned) {
+    let count = |n: u64, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+    println!(
+        "{target}: removed {}, {}, {}; freed {}",
+        count(cleaned.checkouts, "checkout"),
+        count(cleaned.runs, "run"),
+        count(cleaned.agents, "agent"),
+        bytes(cleaned.bytes)
+    );
+    for checkout in &cleaned.kept {
+        println!("{target}: kept {checkout}: in use");
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 async fn hosts() -> Result<i32, Error> {

@@ -3,3 +3,5 @@
 /user.bazelrc
 /dist
 /.zig-cache
+__pycache__/
+*.pyc

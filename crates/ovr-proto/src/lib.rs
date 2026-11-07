@@ -17,7 +17,7 @@ pub use frame::{Frame, FrameKind};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Agent protocol version. Dial-in hosts may run an older `ovrd`; they are accepted while this matches.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// FNV-1a: a stable, dependency-free hash for short names derived from paths. Not for anything secret.
 #[must_use]

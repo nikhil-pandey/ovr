@@ -134,13 +134,29 @@ impl Child {
 ///
 /// Returns an error when the file cannot be opened or locked.
 pub async fn lock(path: PathBuf) -> io::Result<std::fs::File> {
+    lock_with(path, std::fs::File::lock).await
+}
+
+/// Like [`lock`], but shared with other shared holders.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be opened or locked.
+pub async fn lock_shared(path: PathBuf) -> io::Result<std::fs::File> {
+    lock_with(path, std::fs::File::lock_shared).await
+}
+
+async fn lock_with(
+    path: PathBuf,
+    lock: fn(&std::fs::File) -> io::Result<()>,
+) -> io::Result<std::fs::File> {
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::options()
             .create(true)
             .truncate(false)
             .write(true)
             .open(path)?;
-        file.lock()?;
+        lock(&file)?;
         Ok(file)
     })
     .await?

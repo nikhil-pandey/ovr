@@ -2,12 +2,16 @@
 //! until it exits. Every offset is tracked, so a stream that breaks can be resumed on a new one.
 
 use std::convert::Infallible;
+use std::future::poll_fn;
+use std::pin::Pin;
+use std::task::ready;
 
 use bytes::{Bytes, BytesMut};
-use futures::{SinkExt, StreamExt};
+use futures::{Sink, SinkExt, StreamExt};
 use ovr_proto::frame::{self, CHUNK, INPUT_WINDOW, Reader, Writer};
 use ovr_proto::msg::{
-    Attach, Attached, Consumed, Exec, Exit, Failure, Resize, RunInfo, RunList, Runs, Welcome,
+    Attach, Attached, Clean, Cleaned, Consumed, Exec, Exit, Failure, Resize, RunInfo, RunList,
+    Runs, Welcome,
 };
 use ovr_proto::{Frame, FrameKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -222,6 +226,23 @@ pub async fn list<S: AsyncRead + AsyncWrite>(
     Ok(list.runs)
 }
 
+/// Removes `initiator`'s checkouts and finished runs from the host, and agents of other versions.
+///
+/// # Errors
+///
+/// Returns an error when the host cannot clean up or the connection drops.
+pub async fn clean<S: AsyncRead + AsyncWrite>(
+    stream: S,
+    initiator: &str,
+) -> Result<Cleaned, Error> {
+    let mut stream = Stream::new(stream);
+    let clean = Clean {
+        initiator: initiator.to_owned(),
+    };
+    stream.send(Frame::json(FrameKind::Clean, &clean)?).await?;
+    Ok(next(&mut stream.frames).await?.expect(FrameKind::Cleaned)?)
+}
+
 /// Kills `run`'s whole process tree and waits for it to end.
 ///
 /// # Errors
@@ -245,7 +266,8 @@ pub async fn kill<S: AsyncRead + AsyncWrite>(stream: S, run: u64) -> Result<(), 
 }
 
 /// Sends `HELLO`, a speculative thin pack, and `EXEC` without waiting, then repeats the pack in full if the host
-/// lacks the base.
+/// lacks the base. Everything after `HELLO` is sent while listening to the host, since a host that fails mid-sync
+/// says why and stops reading: waiting for it to read would hang.
 async fn sync<S: AsyncRead + AsyncWrite>(
     stream: &mut Stream<S>,
     delivery: &Delivery<'_>,
@@ -254,53 +276,93 @@ async fn sync<S: AsyncRead + AsyncWrite>(
     stream
         .send(Frame::json(FrameKind::Hello, &delivery.hello())?)
         .await?;
-    let mut welcome = send_pack(stream, delivery, delivery.base.as_deref(), true).await?;
-    stream.send(Frame::json(FrameKind::Exec, exec)?).await?;
-    let welcome = match welcome.take() {
+    let mut welcome = None;
+    send_pack(stream, delivery, delivery.base.as_deref(), &mut welcome).await?;
+    send_heeding(stream, Frame::json(FrameKind::Exec, exec)?, &mut welcome).await?;
+    let welcome = match welcome {
         Some(welcome) => welcome,
         None => next(&mut stream.frames).await?.expect(FrameKind::Welcome)?,
     };
     if welcome == Welcome::NeedFull {
-        send_pack(stream, delivery, None, false).await?;
-        stream.send(Frame::json(FrameKind::Exec, exec)?).await?;
+        let mut welcome = Some(welcome);
+        send_pack(stream, delivery, None, &mut welcome).await?;
+        send_heeding(stream, Frame::json(FrameKind::Exec, exec)?, &mut welcome).await?;
     }
     Ok(())
 }
 
-/// Streams a pack followed by the empty end-of-pack frame. While `watch` is set, also listens for `WELCOME` and
-/// cuts the pack short when the host needs a full one.
+/// Streams a pack followed by the empty end-of-pack frame. A pack sent before the host's `WELCOME` is cut short
+/// once that says the host needs a full one.
 async fn send_pack<S: AsyncRead + AsyncWrite>(
     stream: &mut Stream<S>,
     delivery: &Delivery<'_>,
     base: Option<&str>,
-    mut watch: bool,
-) -> Result<Option<Welcome>, Error> {
-    let mut welcome = None;
+    welcome: &mut Option<Welcome>,
+) -> Result<(), Error> {
+    let speculative = welcome.is_none();
     if let Some(mut pack) = delivery.pack(base).await? {
         let mut buf = BytesMut::with_capacity(CHUNK);
         let complete = loop {
+            if speculative && *welcome == Some(Welcome::NeedFull) {
+                break false;
+            }
             buf.reserve(CHUNK);
             tokio::select! {
-                read = pack.stdout.read_buf(&mut buf) => match read? {
-                    0 => break true,
-                    _ => stream.writer.send(Frame::new(FrameKind::Pack, buf.split().freeze())).await?,
-                },
-                reply = next(&mut stream.frames), if watch => {
-                    let reply = reply?.expect(FrameKind::Welcome)?;
-                    welcome = Some(reply);
-                    watch = false;
-                    if reply == Welcome::NeedFull {
-                        break false;
+                read = pack.stdout.read_buf(&mut buf) => {
+                    if read? == 0 {
+                        break true;
                     }
+                    let frame = Frame::new(FrameKind::Pack, buf.split().freeze());
+                    send_heeding(stream, frame, welcome).await?;
                 }
+                heard = heed(&mut stream.frames, welcome) => heard?,
             }
         };
         if complete {
             pack.finish().await?;
         }
     }
-    stream.send(Frame::empty(FrameKind::Pack)).await?;
-    Ok(welcome)
+    send_heeding(stream, Frame::empty(FrameKind::Pack), welcome).await
+}
+
+/// Sends `frame` while heeding the host, without ever dropping a frame half sent.
+async fn send_heeding<S: AsyncRead + AsyncWrite>(
+    stream: &mut Stream<S>,
+    frame: Frame,
+    welcome: &mut Option<Welcome>,
+) -> Result<(), Error> {
+    let Stream { frames, writer } = stream;
+    let mut frame = Some(frame);
+    let mut writer = Pin::new(writer);
+    loop {
+        let sent = poll_fn(|cx| {
+            if frame.is_some() {
+                ready!(writer.as_mut().poll_ready(cx))?;
+                if let Some(frame) = frame.take() {
+                    writer.as_mut().start_send(frame)?;
+                }
+            }
+            writer.as_mut().poll_flush(cx)
+        });
+        tokio::select! {
+            biased;
+            sent = sent => return Ok(sent?),
+            heard = heed(frames, welcome) => heard?,
+        }
+    }
+}
+
+/// Takes the host's one reply while sending, its `WELCOME`; anything else, such as `ERROR`, fails the sync.
+async fn heed<S: AsyncRead>(
+    frames: &mut Reader<S>,
+    welcome: &mut Option<Welcome>,
+) -> Result<(), Error> {
+    let frame = next(frames).await?;
+    if welcome.is_some() {
+        return Err(ovr_proto::Error::Unexpected(frame.kind).into());
+    }
+    *welcome = Some(frame.expect(FrameKind::Welcome)?);
+    Ok(())
 }
 
 /// Receives output, forwards signals, and sends input concurrently, so neither a slow local terminal nor a command
@@ -600,6 +662,7 @@ mod tests {
         Config {
             root: host_root.to_owned(),
             runs: host_root.join(".runs"),
+            agents: host_root.join(".agents"),
             shell: Shell::new("/bin/sh"),
             keeper: None,
         }
@@ -917,6 +980,57 @@ mod tests {
         assert_eq!(
             (end, stdout.as_slice()),
             (End::Exit(0), &b"data\neof\n"[..])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_host_that_fails_mid_pack_is_heard_instead_of_waited_on() -> Result<(), Error> {
+        let repo = repo()?;
+        // Incompressible, so the pack outgrows every buffer between the two ends.
+        let mut state = 1u64;
+        let noise: Vec<u8> = (0..2 << 20)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                (state >> 56) as u8
+            })
+            .collect();
+        std::fs::write(repo.path().join("noise"), noise)?;
+        let snapshot = Snapshot::take(repo.path()).await?;
+        let delivery = snapshot.deliver_to("box", "me").await?;
+
+        // A host that fails after the first pack frame, says why, and stops reading without closing the stream.
+        let (client, host) = tokio::io::duplex(1 << 16);
+        let host = tokio::spawn(async move {
+            let (mut frames, mut writer) = frame::split(host);
+            frames.next().await;
+            writer
+                .send(Frame::json(FrameKind::Welcome, &Welcome::Ok)?)
+                .await?;
+            frames.next().await;
+            let failure = Failure {
+                message: "disk full".to_owned(),
+            };
+            writer
+                .send(Frame::json(FrameKind::Error, &failure)?)
+                .await?;
+            std::future::pending::<()>().await;
+            Ok::<_, ovr_proto::Error>((frames, writer))
+        });
+
+        let exec = exec(&snapshot, "true");
+        let started = tokio::time::timeout(
+            Duration::from_secs(10),
+            start(client, &delivery, &exec, &mut tokio::io::sink()),
+        )
+        .await;
+        host.abort();
+        assert!(
+            matches!(started, Ok(Err(Error::Remote(ref message))) if message == "disk full"),
+            "{:?}",
+            started.map(|started| started.map(|_| ()))
         );
         Ok(())
     }

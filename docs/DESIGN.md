@@ -37,8 +37,9 @@ Constraints that shape the design:
 
 ## Principles
 
-- **No configuration.** No project file, no user file, no environment variables read by `ovr`. The only state is
-  what `ssh` already has and the pairing and tunnel records created by `ovrd pair`.
+- **No configuration.** No project file and no user file. The only state is what `ssh` already has and the pairing
+  and tunnel records created by `ovrd pair`. A few environment variables move where files live (see
+  [Files](#files)); none is needed.
 - **No environment forwarding.** The remote command sees the remote user's login environment, nothing from the
   initiator. Credentials never leave the machine by accident.
 - **Git decides what is sent.** Tracked and untracked files are sent; `.gitignore`d files are never sent. Build
@@ -82,6 +83,7 @@ ovr ps [HOST]               list runs: running, and finished in the last 7 days
 ovr attach HOST RUN         reconnect a terminal to a run, as if it had been started here
 ovr logs HOST RUN           print a run's output, following it until the run ends
 ovr kill HOST RUN           kill a run's whole process tree
+ovr clean [HOST...|--all]   remove checkouts and finished runs not in use: this machine's, or yours on HOSTs
 
 ovrd                        the initiator server; started automatically by ovr, or by launchd/systemd --user
 ovrd pair [PROVIDER]        print a one-shot command for a host that must dial in; PROVIDER opens a tunnel first
@@ -105,6 +107,9 @@ ovrd connect [ADDR]         on a host: keep serving the initiator it paired with
   has started. `attach` and `logs` exit with the run's code once it ends, so `ovr logs box 12 && deploy` works.
 - Runs belong to the initiator that started them: `ovr ps` lists only this initiator's runs. Without `HOST` it asks
   every dialed-in host and every SSH host with an open connection.
+- `ovr clean HOST...` removes this initiator's checkouts and finished runs from each host, and agents of other
+  versions. Without `HOST` it cleans this machine: every initiator's checkouts and runs, and downloaded agents of
+  other versions. `--all` does both, for every host with an open connection. See [Cleaning up](#cleaning-up).
 - `ADDR` is `host:port`, or a tunnel: `cloudflare:HOSTNAME` or `devtunnel:ID`. `PROVIDER` is `cloudflare` or
   `devtunnel`. `ovrd connect ADDR CODE --foreground` pairs and serves without installing anything at login, for CI
   runners and other short-lived hosts.
@@ -114,17 +119,17 @@ ovrd connect [ADDR]         on a host: keep serving the initiator it paired with
 ```
  Initiator                                                Hosts
  ┌──────────────────────────────────────────────┐
- │ ovr HOST -- cargo test                       │         ┌─────────────────────────────────┐
- │   snapshot tree ──► thin pack                │  ssh    │ linux-box                       │
- │   │ unix socket                              │ ───────►│   ssh HOST ovrd agent           │
- │   ▼                                          │         │   ~/ovr/<repo>-<key>/ (warm)    │
- │ ovrd                                         │         └─────────────────────────────────┘
+ │ ovr HOST -- cargo test                       │         ┌───────────────────────────────────────┐
+ │   snapshot tree ──► thin pack                │  ssh    │ linux-box                             │
+ │   │ unix socket                              │ ───────►│   ssh HOST ovrd agent                 │
+ │   ▼                                          │         │   <checkouts>/<owner>/<repo>-<key>/   │
+ │ ovrd                                         │         └───────────────────────────────────────┘
  │   ├─ ssh hosts: spawn ssh, upload agent      │
- │   └─ dialed-in hosts: TLS listener :7420     │  TLS    ┌─────────────────────────────────┐
- │        paired keys, hostname ─► connection   │ ◄─dials─│ winbox                          │
- │                                              │   out   │   ovrd connect <initiator> CODE │
- │ one agent protocol over either stream        │         │   C:\ovr\<repo>-<key>\ (warm)   │
- └──────────────────────────────────────────────┘         └─────────────────────────────────┘
+ │   └─ dialed-in hosts: TLS listener :7420     │  TLS    ┌───────────────────────────────────────┐
+ │        paired keys, hostname ─► connection   │ ◄─dials─│ winbox                                │
+ │                                              │   out   │   ovrd connect <initiator> CODE       │
+ │ one agent protocol over either stream        │         │   <checkouts>\<owner>\<repo>-<key>\   │
+ └──────────────────────────────────────────────┘         └───────────────────────────────────────┘
 ```
 
 Every run is **one stream** to the host's agent: handshake, sync, execution, and terminal I/O travel over it.
@@ -178,10 +183,11 @@ For hosts that cannot accept SSH, including every Windows workstation:
 - After pairing, `ovrd connect` keeps serving: it reconnects with backoff when the initiator sleeps or moves
   networks, and only ever accepts jobs from the initiator it paired with. Pairing installs it to start at login as
   the logged-in user (Scheduled Task on Windows, a `launchd` agent on macOS, a `systemd --user` unit on Linux),
-  never as SYSTEM or root, and it works only inside `~/ovr` / `C:\ovr`. Restarting the service leaves run keepers
-  alone (`KillMode=process` on Linux). The service keeps the `PATH` it was installed from, so it finds tunnel CLIs
-  wherever the user installed them. With `--foreground`, or where no service manager is available, it serves in
-  the foreground instead and installs nothing. A Linux host that should serve without a login session needs
+  never as SYSTEM or root, and it works only inside its checkouts directory. Restarting the service leaves run
+  keepers alone (`KillMode=process` on Linux). The service keeps the `PATH` and `OVR_*` directory variables it was
+  installed from, so it finds tunnel CLIs wherever the user installed them and its files where the user moved them;
+  a Scheduled Task reads the user's persistent environment instead. With `--foreground`, or where no service
+  manager is available, it serves in the foreground instead and installs nothing. A Linux host that should serve without a login session needs
   `loginctl enable-linger`.
 - `ovrd connect ADDR` without a code moves a paired host to a new address of the same initiator. It needs no code
   because the pinned key, not the address, identifies the initiator: the host accepts the new address only once the
@@ -241,11 +247,13 @@ allowed on the critical path. Every decision below exists to hit that.
 - **Trees, not history.** The remote never needs your Git history; it needs the files. A snapshot is a
   **parentless commit** over the working tree, so the first sync sends exactly the working tree (compressed, ~size of
   a source tarball), never the repository's history. A ten-year monorepo costs the same as a fresh one.
-- **Thin packs, not bundles.** New objects go out as `git pack-objects --thin --stdout --revs` with input
-  `<snapshot>\n^<previous snapshot>`. Thin packs may delta against objects the receiver already has, so editing one
-  line of a 1 MB file sends a few bytes of delta, not a recompressed blob. The remote runs
-  `git index-pack --stdin --fix-thin`, which writes a pack directly; no loose objects, no `git fetch`, no refs
-  negotiation.
+- **Thin packs, not bundles.** New objects go out as `git pack-objects --thin --shallow --stdout --revs` with input
+  `<snapshot>\n^<previous snapshot>`. Snapshots have no parents, so `--shallow` is what makes the previous
+  snapshot's trees and blobs count as already sent; without it every changed sync would resend the whole tree. Thin
+  packs may delta against objects the receiver already has, so editing one line of a 1 MB file sends a few bytes of
+  delta, not a recompressed blob. The remote runs `git index-pack --stdin --fix-thin`, which writes a pack directly;
+  no loose objects, no `git fetch`, no refs negotiation. The host logs each sync with its checkout, the bytes
+  received, and how long receiving and applying took.
 - **Nothing when nothing changed.** If the snapshot tree equals the tree last sent to this host, no pack is built
   and zero bytes of sync cross the wire; the exec request goes immediately.
 - **Already compressed.** Pack data is zlib-compressed by Git, so SSH compression is disabled and the TLS transport
@@ -299,6 +307,10 @@ orders them.
   warm run never pays a TCP or TLS handshake, let alone a jump host. Runs, in turn, outlive connections; see
   [Runs](#runs).
 - **Overlapped.** Opening the host stream and building the snapshot run concurrently.
+- **Failures mid-sync are heard.** An agent that fails while the pack is still arriving, say on a full disk,
+  answers `ERROR` and then reads and discards the rest of the stream, and the client listens to the agent while
+  it sends. Either side alone keeps a pack larger than the stream's window from stalling forever on a host that
+  stopped reading.
 
 ### How the remote applies it
 
@@ -324,7 +336,7 @@ creates that is not tracked stays, exactly as it would locally.
 
 - Frames are `len:u32le, kind:u8, payload`, where `len` covers the kind and payload, read and written with
   `tokio-util`'s length-delimited codec. Control messages (`HELLO`, `WELCOME`, `EXEC`, `SYNCED`, `RESIZE`,
-  `CONSUMED`, `EXIT`, `ATTACH`, `ATTACHED`, `KILL`, `RUNS`, `RUN_LIST`, and `BANNER`/`ACCEPT`/`PAIR` on connection
+  `CONSUMED`, `EXIT`, `ATTACH`, `ATTACHED`, `KILL`, `RUNS`, `RUN_LIST`, `CLEAN`, `CLEANED`, and `BANNER`/`ACCEPT`/`PAIR` on connection
   setup) are small JSON.
   Data frames (`PACK`, `OUT`, `ERR`, `IN`) carry raw bytes, up to 64 KiB each, and are what the stream is made of.
 - One connection to a host carries many runs as independent [yamux](https://github.com/libp2p/rust-yamux) streams
@@ -346,14 +358,35 @@ creates that is not tracked stays, exactly as it would locally.
 
 ### Checkout location
 
-The checkout lives at `~/ovr/<repo>-<key>` on Unix and `C:\ovr\<repo>-<key>` on Windows, where `<repo>` is the
-basename of the local repository root and `<key>` is a short hash of the initiator's identity and that root's absolute
-path. Every run from the same local checkout shares one remote checkout; another initiator, another clone, or another
+The checkout lives at `<checkouts>/<owner>/<repo>-<key>` (see [Files](#files)), where `<owner>` is the first 16
+hex digits of the initiator's fingerprint, `<repo>` is the basename of the local repository root, and `<key>` is a
+short hash of the initiator's identity and that root's absolute path. Every run from the same local checkout shares one remote checkout; another initiator, another clone, or another
 Git worktree gets its own, so they never overwrite each other. Moving the local repository starts a fresh, cold
-checkout. The path is stable and short, so incremental state (`target/`, Bazel's output base, `obj/`) and
+checkout. The path is stable, so incremental state (`target/`, Bazel's output base, `obj/`) and
 path-keyed caches such as sccache stay valid across runs. Submodules are fetched by the host from their
 URLs with the host user's credentials; the checkout has no `origin`, so relative submodule URLs do not resolve, and
 a failed update is shown as a warning before the command runs. Git LFS content is not sent.
+
+### Cleaning up
+
+Checkouts stay as a warm cache until removed; finished runs go after seven days. `ovr clean` removes them sooner and
+never touches what is in use:
+
+- A checkout being synced or watched is claimed: the stream holds a shared lock on
+  `<checkouts>/.locks/<owner>/<name>` from the start of a sync, and from an `ATTACH`, until it ends. Cleaning takes
+  that lock exclusively without waiting, so such a checkout is kept with its runs, and a sync that starts meanwhile
+  waits for the clean.
+- A run still running, or ended but with its keeper still serving the end to clients, is kept, with its checkout.
+- A checkout is moved into `<checkouts>/.trash` before it is deleted, so one that cannot be removed whole, such as on
+  Windows while a leftover build server holds a file open, stays intact and is reported as in use. Whatever could not
+  be deleted from the trash is retried by the next clean.
+- Agents uploaded over SSH for other versions are removed from `~/.cache/ovr/bin`, and on the initiator, agents
+  downloaded for other versions.
+- For each host cleaned, `ovr` forgets the snapshots it recorded for that host in the current repository, so the next
+  run sends everything without guessing first. Other repositories find out from the host's `WELCOME`.
+
+Each target prints what it removed, the bytes freed, and each checkout it kept. Identity, pairings, tunnels, and logs
+are never removed.
 
 ## Agent
 
@@ -392,7 +425,7 @@ disconnect, not a stop.
   checkout and snapshot, the initiator identity that started it, the start time, the output log (`out`, plus `err`
   for runs without a terminal), and, once the command ends, its exit code. Logs keep the last 32 to 64 MiB of
   each stream; offsets count from the start of the run, so a client always knows what it missed. Finished runs are
-  removed after seven days.
+  removed after seven days, or by `ovr clean`.
 - **Reconnect.** When a run's stream breaks, `ovr` says so on stderr, reconnects with backoff, and sends
   `ATTACH{run, out, err}` with the byte offsets it already has; the keeper replays the rest and continues live. A
   terminal run gets the current window size. Input typed while disconnected is dropped rather than replayed late.
@@ -416,7 +449,7 @@ disconnect, not a stop.
 
 Windows works as a host (via dial-in) and as the initiator.
 
-- **Host:** `ovrd connect` installed as a Scheduled Task at logon. Job Objects, ConPTY, `C:\ovr\<repo>-<key>`,
+- **Host:** `ovrd connect` installed as a Scheduled Task at logon. Job Objects, ConPTY,
   `core.longpaths=true` set on the checkout. `cargo`, `bazel`, and `dotnet` locate their toolchains themselves;
   `ovr` runs no `vcvars` or setup scripts.
 - **Initiator:** `ovrd` listens the same way and the CLI talks to it over a named pipe. The snapshot applies
@@ -437,12 +470,13 @@ caches such as sccache or bazel-remote are a per-host concern and work unchanged
 - SSH hosts: authentication and host verification are OpenSSH's, using your existing configuration.
 - Dial-in hosts: mutual TLS 1.3 with keys pinned at pairing. A host serves only the initiator it paired with; the
   initiator accepts only hosts it paired. Pairing codes are one-shot, expiring, and rate-limited.
-- Dial-in agents run as a normal user, inside `~/ovr` / `C:\ovr` only.
+- Dial-in agents run as a normal user, inside their checkouts directory only.
 - No environment is forwarded, so local tokens and keys cannot leak into the remote process.
 - `.gitignore`d files never leave the initiator, and neither does Git history: hosts hold only snapshots.
 - Commands travel as argument vectors and the SSH agent binary is uploaded over SFTP, so there is no shell
   injection surface.
-- Checkouts live under one root per host and can be deleted at any time; the next run recreates them.
+- Checkouts live under one root per host, one directory per initiator, and can be deleted at any time; the next run
+  recreates them.
 - Run directories, logs included, and keeper sockets are private to the host user. `ovr ps` shows only the
   current initiator's runs, but that is a convenience, not a boundary: every run belongs to the host user.
 
@@ -456,10 +490,27 @@ caches such as sccache or bazel-remote are a per-host concern and work unchanged
 | Downloaded agents | `~/.cache/ovr` | `~/Library/Caches/ovr` | `%LOCALAPPDATA%\ovr\cache` |
 | Logs | `~/.local/state/ovr` | `~/Library/Logs/ovr` | `%LOCALAPPDATA%\ovr\data` |
 | Runs (hosts) | `~/.local/state/ovr/runs` | `~/Library/Application Support/ovr/runs` | `%LOCALAPPDATA%\ovr\data\runs` |
+| Checkouts (hosts) | `~/.local/share/ovr/checkouts` | `~/Library/Application Support/ovr/checkouts` | `%LOCALAPPDATA%\ovr\data\checkouts` |
 | Socket | `$XDG_RUNTIME_DIR/ovr`, else logs | `~/Library/Application Support/ovr` | named pipe |
 
-XDG variables are honoured on Linux. SSH hosts keep the agent at `~/.cache/ovr/bin/`, resolved by the host's own
-shell. Checkouts live in `~/ovr` and `C:\ovr`, deliberately short and visible.
+XDG variables are honoured on Linux. On every platform, absolute paths in these variables move a directory; empty
+or relative values are ignored:
+
+| Variable | Moves |
+|---|---|
+| `OVR_DATA_DIR` | identity, pairings, tunnels, locks; checkouts and the macOS and Windows socket and runs follow |
+| `OVR_CACHE_DIR` | downloaded agents |
+| `OVR_STATE_DIR` | logs, and runs at `runs/` beneath it |
+| `OVR_CHECKOUTS` | checkouts, for example onto a fast NVMe disk: `OVR_CHECKOUTS=/nvme/ovr` |
+
+They are read where the files are: on a host by its `ovrd`. Set them where that `ovrd` starts: in the shell that runs
+`ovrd connect`, which records them in the login service; as user environment variables on Windows; and for SSH hosts
+where a non-interactive `ssh HOST env` shows them. `ovr` and the local `ovrd` must see the same values.
+
+Checkouts can be deleted at any time, by hand or with `ovr clean`; the next run sends everything again. Some build tools reject paths with spaces,
+which macOS's default has, and MSBuild still trips on Windows paths beyond 260 characters; `OVR_CHECKOUTS` moves
+checkouts to a short path for those. SSH hosts keep the agent at `~/.cache/ovr/bin/`, resolved by the host's own shell
+before `ovrd` runs.
 
 ## Implementation
 

@@ -18,13 +18,17 @@ use ovr_proto::{Frame, FrameKind, frame};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Everything an XDG-aware tool could read instead of `HOME`.
-const XDG: [&str; 5] = [
+/// Everything `ovr` or an XDG-aware tool could read instead of `HOME`.
+const XDG: [&str; 9] = [
     "XDG_CACHE_HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_RUNTIME_DIR",
     "XDG_STATE_HOME",
+    "OVR_DATA_DIR",
+    "OVR_CACHE_DIR",
+    "OVR_STATE_DIR",
+    "OVR_CHECKOUTS",
 ];
 
 /// An initiator and a host on this machine, each with its own home, and a repository to run against.
@@ -437,6 +441,70 @@ fn runs_in_the_foreground_and_the_background() -> Result {
     );
     let ps = text(&world.run(&["ps"])?.stdout);
     assert_eq!(row(&ps, "sleep 30"), Some((run, "exited 137".to_owned())));
+    Ok(())
+}
+
+#[test]
+fn cleans_hosts_and_this_machine_but_not_what_is_running() -> Result {
+    let world = World::new()?;
+    assert_eq!(world.run(&["box", "--", "true"])?.status.code(), Some(0));
+    let stale = world.host().join(".cache/ovr/bin/ovrd-0.0.1");
+    std::fs::write(&stale, "")?;
+    let started = world.file("started");
+    let script = format!("touch {}; sleep 30", started.display());
+    let background = world.run(&["-d", "box", "--", "sh", "-c", &script])?;
+    let run = text(&background.stdout).trim().to_owned();
+    wait_for("the background run", || started.exists())?;
+
+    let busy = world.run(&["clean", "box"])?;
+    assert_eq!(busy.status.code(), Some(0));
+    let report = text(&busy.stdout);
+    assert!(
+        report.starts_with("box: removed 0 checkouts, 1 run, 1 agent; freed ")
+            && report.contains("\nbox: kept repo-"),
+        "{report}"
+    );
+    assert!(!stale.exists());
+
+    assert_eq!(world.run(&["kill", "box", &run])?.status.code(), Some(0));
+    // The keeper lets go of the run once it has told everyone attached how it ended.
+    let lock = std::fs::File::options()
+        .write(true)
+        .open(world.run_dir(&run).join("lock"))?;
+    wait_for("the keeper to exit", || lock.try_lock().is_ok())?;
+    drop(lock);
+    let idle = text(&world.run(&["clean", "box"])?.stdout);
+    assert!(
+        idle.starts_with("box: removed 1 checkout, 1 run, 0 agents; freed ")
+            && !idle.contains("kept"),
+        "{idle}"
+    );
+    #[cfg(target_os = "macos")]
+    let checkouts = world
+        .host()
+        .join("Library/Application Support/ovr/checkouts");
+    #[cfg(not(target_os = "macos"))]
+    let checkouts = world.host().join(".local/share/ovr/checkouts");
+    for owner in std::fs::read_dir(&checkouts)? {
+        let owner = owner?;
+        if !owner.file_name().to_string_lossy().starts_with('.') {
+            assert_eq!(std::fs::read_dir(owner.path())?.count(), 0);
+        }
+    }
+    let refs = Command::new("git")
+        .args(["for-each-ref", "refs/ovr"])
+        .current_dir(world.file("repo"))
+        .output()?;
+    assert_eq!(text(&refs.stdout), "");
+
+    let here = world.run(&["clean"])?;
+    assert_eq!(
+        (here.status.code(), text(&here.stdout).as_str()),
+        (
+            Some(0),
+            "this machine: removed 0 checkouts, 0 runs, 0 agents; freed 0 B\n"
+        )
+    );
     Ok(())
 }
 

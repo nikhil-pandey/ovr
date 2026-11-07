@@ -171,6 +171,9 @@ impl Delivery<'_> {
     /// Streams the objects of the snapshot that `base` lacks, or the whole snapshot without a base. Returns `None`
     /// when there is nothing to send.
     ///
+    /// Snapshots have no parents, and Git leaves out the trees and blobs of an excluded commit only when it is a
+    /// parent of a sent one, unless told to look at every excluded commit with `--shallow`.
+    ///
     /// # Errors
     ///
     /// Returns an error when `git pack-objects` cannot be started.
@@ -186,6 +189,7 @@ impl Delivery<'_> {
                 "--stdout",
                 "--revs",
                 "--thin",
+                "--shallow",
                 "--delta-base-offset",
                 "-q",
             ],
@@ -256,6 +260,18 @@ impl Pack {
 }
 
 /// Maps a host or repository name onto characters that are always valid in a ref name component.
+/// Forgets what every checkout on `host` was last sent from the repository around `cwd`, if there is one, after the
+/// host's checkouts were removed.
+pub async fn forget_host(cwd: &Path, host: &str) {
+    let prefix = format!("refs/ovr/hosts/{}/", ref_component(host));
+    let Ok(refs) = git::run(cwd, ["for-each-ref", "--format=%(refname)", &prefix]).await else {
+        return;
+    };
+    for name in refs.lines() {
+        let _ = git::run(cwd, ["update-ref", "-d", name]).await;
+    }
+}
+
 fn ref_component(name: &str) -> String {
     name.chars()
         .map(|c| {
@@ -341,6 +357,50 @@ mod tests {
 
         to_box.forget().await;
         assert_eq!(second.deliver_to("user@box", "me").await?.base, None);
+        Ok(())
+    }
+
+    async fn pack_len(snapshot: &Snapshot, base: Option<&str>) -> Result<usize, Error> {
+        let delivery = snapshot.deliver_to("box", "me").await?;
+        let mut pack = delivery
+            .pack(base)
+            .await?
+            .ok_or_else(|| io::Error::other("nothing to send"))?;
+        let mut bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut pack.stdout, &mut bytes).await?;
+        pack.finish().await?;
+        Ok(bytes.len())
+    }
+
+    #[tokio::test]
+    async fn a_pack_against_a_base_leaves_out_what_the_base_has() -> Result<(), Error> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        run(root, &["init", "-q"]).await;
+        std::fs::create_dir(root.join("src"))?;
+        // Pseudo-random text, so that neither compression nor deltas can shrink the files.
+        let mut state: u64 = 1;
+        for index in 0..20 {
+            let text: String = (0..4096)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1);
+                    char::from(b'a' + u8::try_from(state >> 59).unwrap_or(0) % 26)
+                })
+                .collect();
+            std::fs::write(root.join(format!("src/{index}.rs")), text)?;
+        }
+        let first = Snapshot::take(root).await?;
+        std::fs::write(root.join("src/new.rs"), "fn new() {}\n")?;
+        let second = Snapshot::take(root).await?;
+
+        let full = pack_len(&second, None).await?;
+        let thin = pack_len(&second, Some(&first.commit)).await?;
+        assert!(
+            thin * 10 < full,
+            "{thin} bytes against the base, {full} without"
+        );
         Ok(())
     }
 }
