@@ -76,7 +76,10 @@ def raw(who: str, prefix: str, line: str) -> None:
 
 
 def gib(n: float) -> str:
-    return f"{n / GIB:.2f} GiB"
+    for unit, size in (("GiB", GIB), ("MiB", MIB), ("KiB", 1024)):
+        if n >= size:
+            return f"{n / size:.1f} {unit}"
+    return f"{n:.0f} B"
 
 
 def duration(s: float | None) -> str:
@@ -697,6 +700,7 @@ def cmd_report(args: argparse.Namespace) -> None:
             f"{duration(repo['pack_seconds'])} |"
         )
 
+    steps = [name for name in STEPS if any(name in row.get("steps", {}) for row in results)]
     for os_name in OSES:
         host_rows = [row for row in results if row["os"] == os_name]
         if not host_rows:
@@ -705,15 +709,15 @@ def cmd_report(args: argparse.Namespace) -> None:
             "",
             f"## {os_name} host",
             "",
-            "| Repository | " + " | ".join(STEPS) + " | First sync rate |",
-            "|---|" + "---|" * (len(STEPS) + 1),
+            "| Repository | " + " | ".join(steps) + " | First sync rate |",
+            "|---|" + "---|" * (len(steps) + 1),
         ]
         for row in host_rows:
             if "skipped" in row:
-                md.append(f"| {row['repo']} | skipped: {row['skipped']} |" + " |" * len(STEPS))
+                md.append(f"| {row['repo']} | skipped: {row['skipped']} |" + " |" * len(steps))
                 continue
             cells = []
-            for name in STEPS:
+            for name in steps:
                 step = row["steps"].get(name)
                 if step is None:
                     cells.append("–")
