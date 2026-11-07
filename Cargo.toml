@@ -3,16 +3,16 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.99.1"
 license = "MIT"
 repository = "https://github.com/nikhil-pandey/ovr"
 
 [workspace.dependencies]
-ovr = { path = "crates/ovr", version = "0.1.0" }
-ovr-proto = { path = "crates/ovr-proto", version = "0.1.0" }
-ovrd = { path = "crates/ovrd", version = "0.1.0" }
+ovr = { path = "crates/ovr", version = "0.2.0" }
+ovr-proto = { path = "crates/ovr-proto", version = "0.2.0" }
+ovrd = { path = "crates/ovrd", version = "0.2.0" }
 
 bytes = "1.12.1"
 clap = "4.6.7"
