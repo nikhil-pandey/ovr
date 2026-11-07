@@ -9,36 +9,67 @@ use ovr_proto::msg::{Failure, Pair, PairOk};
 use ovr_proto::{Frame, FrameKind};
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
-use crate::server::PORT;
+use crate::mux::Incoming;
 use crate::state::{self, Initiator};
 use crate::tls::{self, Identity};
+use crate::tunnel::{self, Addr, Running};
 use crate::{Error, agent, autostart, mux, pairing};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
-/// Pairs with the initiator at `addr` using `code`, then serves it from now on.
+/// How long a tunnel may take to carry connections once its forwarder is up: a new quick tunnel's hostname, for
+/// one, can take a minute or more to resolve at the provider's edge.
+const TUNNEL_WAIT: Duration = Duration::from_mins(3);
+const TUNNEL_RETRY: Duration = Duration::from_secs(2);
+
+type Stream = Framed<TlsStream<TcpStream>>;
+
+/// `ovrd connect`: pair with the initiator at `addr` using `code`, or move to `addr` without one, then keep serving
+/// it, in the foreground if asked to or if it cannot be started at login. Without `addr`, serve the paired initiator.
 ///
 /// # Errors
 ///
-/// Returns an error when the initiator is unreachable or rejects the code.
-pub async fn pair(addr: &str, code: &str) -> Result<(), Error> {
+/// Returns an error when the initiator is unreachable, rejects the code, or is not the one this host paired with.
+pub async fn connect(
+    addr: Option<Addr>,
+    code: Option<&str>,
+    foreground: bool,
+) -> Result<(), Error> {
+    match (addr, code) {
+        (Some(addr), Some(code)) => pair(&addr, code).await?,
+        (Some(addr), None) => move_to(&addr).await?,
+        (None, _) => return serve().await,
+    }
+    if foreground {
+        return serve().await;
+    }
+    match autostart::install() {
+        Ok(()) => {
+            println!("ovrd connect now runs in the background and at every login");
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("cannot start ovrd connect at login ({err}); serving until interrupted");
+            serve().await
+        }
+    }
+}
+
+/// Pairs with the initiator at `addr` using `code`.
+async fn pair(addr: &Addr, code: &str) -> Result<(), Error> {
     let code = pairing::normalize(code).ok_or_else(|| {
         Error::Invalid(format!(
             "{code:?} is not a pairing code; it looks like 7KQX-M4RT"
         ))
     })?;
-    let addr = if addr.contains(':') {
-        addr.to_owned()
-    } else {
-        format!("{addr}:{PORT}")
-    };
     let dir = ovr_proto::paths::data_dir()?;
     let identity = Identity::load_or_create(&dir)?;
-    let (mut stream, initiator) = dial(&identity, &addr).await?;
+    let (_forwarder, mut stream, initiator) = dial(&identity, addr).await?;
 
     let hostname = agent::hostname();
     let mac = pairing::Proof::host(&initiator, &identity.fingerprint, &hostname).sign(&code);
@@ -60,22 +91,37 @@ pub async fn pair(addr: &str, code: &str) -> Result<(), Error> {
     state::set_initiator(
         &dir,
         &Initiator {
-            addr: addr.clone(),
+            addr: addr.to_string(),
             fingerprint: initiator,
         },
     )?;
     println!("paired with {addr}; serving as {hostname}");
+    Ok(())
+}
 
-    match autostart::install() {
-        Ok(()) => {
-            println!("ovrd connect now runs in the background and at every login");
-            Ok(())
-        }
-        Err(err) => {
-            eprintln!("cannot start ovrd connect at login ({err}); serving until interrupted");
-            serve().await
-        }
+/// Points this host at `addr` once the initiator there proves it is the one this host paired with.
+async fn move_to(addr: &Addr) -> Result<(), Error> {
+    let dir = ovr_proto::paths::data_dir()?;
+    let mut initiator = paired(&dir)?;
+    let identity = Identity::load_or_create(&dir)?;
+    let (_forwarder, _stream, fingerprint) = dial(&identity, addr).await?;
+    if fingerprint != initiator.fingerprint {
+        return Err(Error::Pairing(format!(
+            "{addr} is a different initiator than the one this host paired with; pair with it using a code"
+        )));
     }
+    initiator.addr = addr.to_string();
+    state::set_initiator(&dir, &initiator)?;
+    println!("moved to {addr}; serving as {}", agent::hostname());
+    Ok(())
+}
+
+fn paired(dir: &std::path::Path) -> Result<Initiator, Error> {
+    state::initiator(dir)?.ok_or_else(|| {
+        Error::Invalid(
+            "not paired; run the `ovrd connect ADDR CODE` command `ovrd pair` prints".to_owned(),
+        )
+    })
 }
 
 /// Serves the paired initiator forever, reconnecting with backoff.
@@ -93,22 +139,20 @@ pub async fn serve() -> Result<(), Error> {
     if lock.try_lock().is_err() {
         return Err(Error::Invalid("ovrd connect is already running".to_owned()));
     }
-    let initiator = state::initiator(&dir)?.ok_or_else(|| {
-        Error::Invalid(
-            "not paired; run the `ovrd connect ADDR CODE` command `ovrd pair` prints".to_owned(),
-        )
-    })?;
+    let initiator = paired(&dir)?;
+    let addr: Addr = initiator.addr.parse().map_err(Error::Invalid)?;
     let identity = Identity::load_or_create(&dir)?;
     let config = Arc::new(agent::Config::detect()?);
-    tracing::info!(addr = initiator.addr, "serving");
+    tracing::info!(%addr, "serving");
 
     let mut backoff = Duration::from_secs(1);
     loop {
-        match attach(&identity, &initiator).await {
-            Ok(stream) => {
+        match attach(&identity, &addr, &initiator.fingerprint).await {
+            Ok((forwarder, stream)) => {
                 tracing::info!("connected");
                 backoff = Duration::from_secs(1);
-                agent::serve(stream, Arc::clone(&config)).await;
+                agent::serve(Incoming::accept_with_heartbeat(stream), Arc::clone(&config)).await;
+                drop(forwarder);
                 tracing::info!("disconnected");
             }
             Err(err) => {
@@ -120,16 +164,16 @@ pub async fn serve() -> Result<(), Error> {
     }
 }
 
-/// Connects to the pinned initiator and announces this host.
+/// Connects to the pinned initiator and announces this host. The forwarder, if any, must outlive the stream.
 async fn attach(
     identity: &Identity,
-    initiator: &Initiator,
-) -> Result<Resumed<TlsStream<TcpStream>>, Error> {
-    let (mut stream, fingerprint) = dial(identity, &initiator.addr).await?;
-    if fingerprint != initiator.fingerprint {
+    addr: &Addr,
+    pinned: &str,
+) -> Result<(Option<Running>, Resumed<TlsStream<TcpStream>>), Error> {
+    let (forwarder, mut stream, fingerprint) = dial(identity, addr).await?;
+    if fingerprint != pinned {
         return Err(Error::Pairing(format!(
-            "{} presented a different identity than when paired; pair again if the initiator was reset",
-            initiator.addr
+            "{addr} presented a different identity than when paired; pair again if the initiator was reset"
         )));
     }
     stream
@@ -140,22 +184,54 @@ async fn attach(
         .map_err(|_| Error::Disconnected)?
         .ok_or(Error::Disconnected)??;
     match reply.kind {
-        FrameKind::Accept => Ok(frame::resume(stream)),
+        FrameKind::Accept => Ok((forwarder, frame::resume(stream))),
         FrameKind::Error => Err(Error::Pairing(reply.parse::<Failure>()?.message)),
         kind => Err(ovr_proto::Error::Unexpected(kind).into()),
     }
 }
 
-/// Opens TLS to `addr`, returning the stream and the initiator's fingerprint for the caller to check.
+/// Opens TLS to `addr`, through a new forwarder for a tunnel, returning the forwarder, the stream, and the
+/// initiator's fingerprint for the caller to check. A tunnel gets a while to start carrying connections, with a
+/// fresh forwarder for every attempt.
 async fn dial(
     identity: &Identity,
-    addr: &str,
-) -> Result<(Framed<TlsStream<TcpStream>>, String), Error> {
+    addr: &Addr,
+) -> Result<(Option<Running>, Stream, String), Error> {
+    let deadline = Instant::now()
+        + match addr {
+            Addr::Direct(_) => Duration::ZERO,
+            Addr::Tunnel { .. } => TUNNEL_WAIT,
+        };
+    loop {
+        let (forwarder, target) = match addr {
+            Addr::Direct(target) => (None, target.clone()),
+            Addr::Tunnel { provider, name } => {
+                let (forwarder, local) = tunnel::forward(*provider, name).await?;
+                (Some(forwarder), local.to_string())
+            }
+        };
+        match handshake(identity, &target, addr).await {
+            Ok((stream, fingerprint)) => return Ok((forwarder, stream, fingerprint)),
+            Err(err) if Instant::now() < deadline => {
+                drop(forwarder);
+                tracing::debug!(%err, "the tunnel is not carrying connections yet");
+                tokio::time::sleep(TUNNEL_RETRY).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn handshake(
+    identity: &Identity,
+    target: &str,
+    addr: &Addr,
+) -> Result<(Stream, String), Error> {
     let connector = TlsConnector::from(identity.client_config()?);
     let name =
         ServerName::try_from(tls::SERVER_NAME).map_err(|err| Error::Invalid(err.to_string()))?;
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, async {
-        let tcp = TcpStream::connect(addr).await?;
+        let tcp = TcpStream::connect(target).await?;
         mux::tune(&tcp)?;
         connector.connect(name, tcp).await
     })

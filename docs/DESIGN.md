@@ -28,8 +28,9 @@ workflow onto it. `ovr` keeps editing local and sends the heavy work elsewhere w
 Constraints that shape the design:
 
 - **Hosts are reached one of two ways.** Over SSH when the host accepts it, or by the host dialing **out** to your
-  initiator when it does not. Windows workstations, machines behind NAT, and locked-down boxes are the second kind.
-  Overlay networks such as Tailscale make the initiator reachable from anywhere; `ovr` does not care which.
+  initiator when it does not. Windows workstations, machines behind NAT, locked-down boxes, and CI runners are the
+  second kind. Overlay networks such as Tailscale make the initiator reachable from anywhere, and where none reaches,
+  `ovrd` can open a tunnel; `ovr` does not care which.
 - **Bandwidth may be limited.** Sync sends deltas, never whole trees.
 - **Mixed platforms.** macOS, Linux, and Windows on arm64 and x86-64, on either side. You pick a host whose OS and
   architecture match your target; `ovr` does not pick for you.
@@ -37,7 +38,7 @@ Constraints that shape the design:
 ## Principles
 
 - **No configuration.** No project file, no user file, no environment variables read by `ovr`. The only state is
-  what `ssh` already has and the pairing records created by `ovrd pair`.
+  what `ssh` already has and the pairing and tunnel records created by `ovrd pair`.
 - **No environment forwarding.** The remote command sees the remote user's login environment, nothing from the
   initiator. Credentials never leave the machine by accident.
 - **Git decides what is sent.** Tracked and untracked files are sent; `.gitignore`d files are never sent. Build
@@ -56,7 +57,8 @@ Constraints that shape the design:
 - Host selection, pools, load balancing. You name the host.
 - Two-way sync or remote editing. Use your editor's remote mode for that.
 - Copying build outputs back. Run the thing remotely, or `scp` what you need.
-- Provisioning machines, SSH keys, or network connectivity.
+- Provisioning machines, SSH keys, networks, or tunnel accounts. Tunnels use a provider CLI you already have.
+- Keeping CI jobs alive. A tunnel reaches a runner for as long as its job runs, no longer.
 
 ## Two binaries
 
@@ -82,9 +84,11 @@ ovr logs HOST RUN           print a run's output, following it until the run end
 ovr kill HOST RUN           kill a run's whole process tree
 
 ovrd                        the initiator server; started automatically by ovr, or by launchd/systemd --user
-ovrd pair                   print a one-shot command to run on a host that must dial in
+ovrd pair [PROVIDER]        print a one-shot command for a host that must dial in; PROVIDER opens a tunnel first
+ovrd tunnel                 list open tunnels and the command that points a paired host at each
+ovrd tunnel close PROVIDER  close a tunnel that `ovrd pair` opened
 ovrd connect ADDR CODE      on a host: pair with the initiator at ADDR and keep serving it (printed by `pair`)
-ovrd connect                on a host: keep serving the initiator it already paired with
+ovrd connect [ADDR]         on a host: keep serving the initiator it paired with, at ADDR from now on if given
 ```
 
 - `HOST` is a dialed-in host's name (its hostname, as shown by `ovr hosts`) or an SSH destination: an alias from
@@ -101,6 +105,9 @@ ovrd connect                on a host: keep serving the initiator it already pai
   has started. `attach` and `logs` exit with the run's code once it ends, so `ovr logs box 12 && deploy` works.
 - Runs belong to the initiator that started them: `ovr ps` lists only this initiator's runs. Without `HOST` it asks
   every dialed-in host and every SSH host with an open connection.
+- `ADDR` is `host:port`, or a tunnel: `cloudflare:HOSTNAME` or `devtunnel:ID`. `PROVIDER` is `cloudflare` or
+  `devtunnel`. `ovrd connect ADDR CODE --foreground` pairs and serves without installing anything at login, for CI
+  runners and other short-lived hosts.
 
 ## Architecture
 
@@ -164,18 +171,60 @@ For hosts that cannot accept SSH, including every Windows workstation:
   initiator answers with its own HMAC, so neither side can be impersonated by someone without the code. Codes are
   single-use and expire after ten minutes, and five wrong guesses revoke every outstanding code. The identity and
   pairing records live in the data directory (see [Files](#files)); they are a record, like `known_hosts`, not
-  configuration. TCP keepalive notices a vanished peer within a minute.
+  configuration.
+- Both ends send a heartbeat on the connection every 15 seconds and close it after 45 seconds without one, so a
+  vanished peer is noticed within a minute even through a tunnel or proxy, where TCP keepalive only probes the
+  nearest hop, which stays up.
 - After pairing, `ovrd connect` keeps serving: it reconnects with backoff when the initiator sleeps or moves
   networks, and only ever accepts jobs from the initiator it paired with. Pairing installs it to start at login as
   the logged-in user (Scheduled Task on Windows, a `launchd` agent on macOS, a `systemd --user` unit on Linux),
   never as SYSTEM or root, and it works only inside `~/ovr` / `C:\ovr`. Restarting the service leaves run keepers
-  alone (`KillMode=process` on Linux). Where no service manager is available it keeps serving in the foreground. A
-  Linux host that should serve without a login session needs `loginctl enable-linger`.
+  alone (`KillMode=process` on Linux). With `--foreground`, or where no service manager is available, it serves in
+  the foreground instead and installs nothing. A Linux host that should serve without a login session needs
+  `loginctl enable-linger`.
+- `ovrd connect ADDR` without a code moves a paired host to a new address of the same initiator. It needs no code
+  because the pinned key, not the address, identifies the initiator: the host accepts the new address only once the
+  initiator there presents that key.
 - The host is addressable by its hostname: `ovr winbox -- dotnet test`. `ovr hosts` lists what is connected.
 - Reachability is the network's job. On Tailscale, `100.x.y.z` is the initiator's stable address and the WireGuard
   layer already authenticates peers; the pinned keys are defense in depth and also make the design work over any
-  other overlay or a plain LAN.
+  other overlay, a plain LAN, or a tunnel.
 - Dial-in works for any host, not just Windows. A Linux box behind NAT with no SSH server runs the same command.
+
+### Tunnels
+
+When no network path reaches the initiator, as for a CI runner or a machine on another network without an overlay,
+`ovrd` opens one with a tunnel provider's CLI: `cloudflared` for Cloudflare quick tunnels, or `devtunnel` for
+Microsoft Dev Tunnels.
+
+```
+ initiator$ ovrd pair cloudflare
+ run this on the host within 10 minutes:
+   ovrd connect cloudflare:quiet-river-delta.trycloudflare.com 7KQX-M4RT
+
+ runner$ ovrd connect cloudflare:quiet-river-delta.trycloudflare.com 7KQX-M4RT --foreground
+ paired with cloudflare:quiet-river-delta.trycloudflare.com; serving as runner
+```
+
+- **A tunnel only carries bytes.** Pairing and pinned mutual TLS run end to end through it unchanged, so the
+  provider sees ciphertext and connection metadata, and whoever finds the public address can do no more than a
+  stranger on the same LAN. Tunnels are therefore opened for anonymous access: no account, token, or other
+  credential appears in any printed command or log, and `ovr` never handles a provider login. The initiator needs
+  the provider's CLI installed, and for Dev Tunnels logged in; the host needs the CLI installed.
+- **The initiator's `ovrd` owns the tunnel.** `ovrd pair PROVIDER` opens a tunnel to `:7420` unless one for that
+  provider is already open, then prints the host's command with the tunnel's address. From then on `ovrd` restarts
+  the provider's CLI when it exits and reopens the tunnel whenever `ovrd` starts, so the tunnel outlives the
+  terminal that asked for it. Only `ovrd tunnel close PROVIDER` closes it, which also deletes what `ovrd` created at
+  the provider. Open tunnels are recorded in the data directory.
+- **The host's `ovrd connect` owns the forwarder.** Given a tunnel address, it starts the provider's local forwarder
+  on a free port, dials through it, and restarts it on every reconnect. The forwarder lives and dies with
+  `ovrd connect`, so the one printed command is all a host needs, whether it serves at login or in a CI job.
+- **Addresses.** A Dev Tunnel keeps its ID across restarts, so paired hosts reconnect on their own; it suits hosts
+  that stay. A Cloudflare quick tunnel gets a new hostname whenever it restarts, for example when the initiator
+  reboots; it suits short-lived hosts such as CI runners. `ovrd tunnel` shows each tunnel's current address with the
+  `ovrd connect ADDR` command that moves a paired host to it.
+- **CI runners.** `--foreground` serves for as long as the job runs and installs nothing. When the job ends, its
+  runs end with it.
 
 Nothing about the initiator-side `ovrd` is tied to a laptop; the same server can run on an always-on VM later
 (see Milestones). It usually runs on your laptop because that needs no additional machine.
@@ -277,7 +326,8 @@ creates that is not tracked stays, exactly as it would locally.
   setup) are small JSON.
   Data frames (`PACK`, `OUT`, `ERR`, `IN`) carry raw bytes, up to 64 KiB each, and are what the stream is made of.
 - One connection to a host carries many runs as independent [yamux](https://github.com/libp2p/rust-yamux) streams
-  with per-stream flow control, so a slow terminal on one run never stalls another.
+  with per-stream flow control, so a slow terminal on one run never stalls another. On a dial-in connection the
+  host opens the first stream for heartbeats, before any run.
 - The same frames flow `ovr → ovrd` over the local socket and `ovrd → agent` over SSH or TLS; `ovrd`
   forwards them without parsing the data frames.
 - PTY output is read in large chunks and forwarded as-is; no line buffering, no re-encoding. Build output
@@ -380,6 +430,8 @@ caches such as sccache or bazel-remote are a per-host concern and work unchanged
 ## Security
 
 - Hosts come only from the command line and from explicit pairing; `ovrd` never discovers or scans anything.
+- Tunnels are transport only and anonymous by design: authentication is the pinned mutual TLS inside them, so a
+  tunnel's public address is not a secret, and no provider credential is ever printed or logged.
 - SSH hosts: authentication and host verification are OpenSSH's, using your existing configuration.
 - Dial-in hosts: mutual TLS 1.3 with keys pinned at pairing. A host serves only the initiator it paired with; the
   initiator accepts only hosts it paired. Pairing codes are one-shot, expiring, and rate-limited.
@@ -398,7 +450,7 @@ caches such as sccache or bazel-remote are a per-host concern and work unchanged
 
 | | Linux | macOS | Windows |
 |---|---|---|---|
-| Identity, pairings, locks | `~/.local/share/ovr` | `~/Library/Application Support/ovr` | `%LOCALAPPDATA%\ovr\data` |
+| Identity, pairings, tunnels, locks | `~/.local/share/ovr` | `~/Library/Application Support/ovr` | `%LOCALAPPDATA%\ovr\data` |
 | Downloaded agents | `~/.cache/ovr` | `~/Library/Caches/ovr` | `%LOCALAPPDATA%\ovr\cache` |
 | Logs | `~/.local/state/ovr` | `~/Library/Logs/ovr` | `%LOCALAPPDATA%\ovr\data` |
 | Runs (hosts) | `~/.local/state/ovr/runs` | `~/Library/Application Support/ovr/runs` | `%LOCALAPPDATA%\ovr\data\runs` |
@@ -413,7 +465,7 @@ shell. Checkouts live in `~/ovr` and `C:\ovr`, deliberately short and visible.
 - Crates: `clap`, `miette`, `tokio` + `tokio-util` (framing), `yamux` (multiplexing), `serde_json`, `rustls` +
   `rcgen` + `ring`, `process-wrap` (process groups, Job Objects), `portable-pty`, `crossterm`, `directories`, `nix`
   (signals), `windows-sys` (ConPTY Job Objects, console control). File locks are `std::fs::File::lock`.
-- Uses the system `ssh` and `git`; reimplements neither.
+- Uses the system `ssh`, `git`, and tunnel CLIs (`cloudflared`, `devtunnel`); reimplements none of them.
 - Prebuilt binaries for macOS, Linux, and Windows on arm64 and x86-64.
 
 ## Milestones
@@ -424,7 +476,9 @@ shell. Checkouts live in `~/ovr` and `C:\ovr`, deliberately short and visible.
    exit-code passthrough on Linux and macOS.
 3. **Dial-in.** `ovrd pair` / `ovrd connect`, pairing, mutual TLS, reconnect, `ovr hosts`.
 4. **Windows.** Windows agent (Job Objects, ConPTY, paths, Scheduled Task install) and Windows initiator.
-5. **Later, only if needed.** `ovrd` on an always-on VM shared by several people's machines, copying outputs back, a
+5. **Tunnels.** `ovrd pair PROVIDER` with Cloudflare quick tunnels and Dev Tunnels, tunnel addresses and
+   `--foreground` for `ovrd connect`, and heartbeats on dial-in connections.
+6. **Later, only if needed.** `ovrd` on an always-on VM shared by several people's machines, copying outputs back, a
    remembered default host.
 
 ## Prior art
@@ -444,4 +498,3 @@ shell. Checkouts live in `~/ovr` and `C:\ovr`, deliberately short and visible.
   snapshot's parent when the remote already has it.
 - Whether `ovrd` should also accept a Tailscale `whois` check on dial-in as an additional gate, or whether pinned
   keys alone are enough.
-

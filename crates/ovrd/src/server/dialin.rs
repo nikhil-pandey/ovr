@@ -158,7 +158,7 @@ where
     let Some(paired) = paired else { return Ok(()) };
     stream.send(Frame::empty(FrameKind::Accept)).await?;
 
-    let mux = Mux::open_on(frame::resume(stream));
+    let mux = Mux::open_with_heartbeat(frame::resume(stream));
     let id = server
         .dialed
         .insert(&paired.name, mux.clone(), banner.platform);

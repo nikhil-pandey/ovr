@@ -136,8 +136,12 @@ pub enum Op {
     Hosts,
     /// List hosts with an open connection: dialed-in hosts that are online and SSH hosts in use.
     Connected,
-    /// Issue a pairing code.
-    Pair,
+    /// Issue a pairing code, for an address through a tunnel from `tunnel` if given, which is opened first.
+    Pair { tunnel: Option<Provider> },
+    /// List open tunnels.
+    Tunnels,
+    /// Close the tunnel from `provider` and delete what `ovrd` created there.
+    CloseTunnel { provider: Provider },
 }
 
 /// `RESPONSE`: the local `ovrd`'s answer to a [`Request`].
@@ -158,6 +162,10 @@ pub enum Response {
         addr: String,
         code: String,
     },
+    Tunnels {
+        tunnels: Vec<TunnelStatus>,
+    },
+    TunnelClosed,
     /// `ovrd` is a different version and is exiting; reconnect to start the matching one.
     Restart,
     Failed {
@@ -170,6 +178,53 @@ pub struct HostStatus {
     pub name: String,
     /// Present while the host is connected.
     pub platform: Option<Platform>,
+}
+
+/// A tunnel provider, whose CLI `ovrd` runs to reach the initiator from networks that cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Provider {
+    /// Cloudflare quick tunnels, through `cloudflared`.
+    Cloudflare,
+    /// Microsoft Dev Tunnels, through `devtunnel`.
+    Devtunnel,
+}
+
+impl Provider {
+    pub const ALL: [Self; 2] = [Self::Cloudflare, Self::Devtunnel];
+
+    /// The name used in commands and addresses, as in `cloudflare:HOSTNAME`.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cloudflare => "cloudflare",
+            Self::Devtunnel => "devtunnel",
+        }
+    }
+}
+
+impl std::fmt::Display for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for Provider {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|provider| provider.name() == name)
+            .ok_or_else(|| format!("unknown tunnel provider {name:?}; use cloudflare or devtunnel"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelStatus {
+    pub provider: Provider,
+    /// The address hosts dial, as in `cloudflare:HOSTNAME`; absent while the tunnel is starting or restarting.
+    pub addr: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

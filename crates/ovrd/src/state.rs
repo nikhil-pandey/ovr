@@ -3,6 +3,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use ovr_proto::msg::Provider;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -20,12 +21,25 @@ pub struct Initiator {
     pub fingerprint: String,
 }
 
+/// A tunnel the initiator keeps open, as recorded by `ovrd pair PROVIDER`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tunnel {
+    pub provider: Provider,
+    /// What `ovrd` created at the provider, for Dev Tunnels the tunnel ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
 fn hosts_path(dir: &Path) -> PathBuf {
     dir.join("hosts.json")
 }
 
 fn initiator_path(dir: &Path) -> PathBuf {
     dir.join("initiator.json")
+}
+
+fn tunnels_path(dir: &Path) -> PathBuf {
+    dir.join("tunnels.json")
 }
 
 /// # Errors
@@ -60,6 +74,20 @@ pub fn initiator(dir: &Path) -> io::Result<Option<Initiator>> {
 /// Returns an error when the record cannot be written.
 pub fn set_initiator(dir: &Path, initiator: &Initiator) -> io::Result<()> {
     write(&initiator_path(dir), initiator)
+}
+
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read or parsed.
+pub fn tunnels(dir: &Path) -> io::Result<Vec<Tunnel>> {
+    Ok(read(&tunnels_path(dir))?.unwrap_or_default())
+}
+
+/// # Errors
+///
+/// Returns an error when the records cannot be written.
+pub fn set_tunnels(dir: &Path, tunnels: &[Tunnel]) -> io::Result<()> {
+    write(&tunnels_path(dir), &tunnels)
 }
 
 fn read<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
