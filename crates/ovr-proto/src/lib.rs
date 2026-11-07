@@ -17,7 +17,15 @@ pub use frame::{Frame, FrameKind};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Agent protocol version. Dial-in hosts may run an older `ovrd`; they are accepted while this matches.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// FNV-1a: a stable, dependency-free hash for short names derived from paths. Not for anything secret.
+#[must_use]
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

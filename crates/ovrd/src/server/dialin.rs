@@ -88,8 +88,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request: Pair = frame.parse()?;
-    let laptop = &server.identity.fingerprint;
-    let proof = pairing::Proof::host(laptop, host, &request.hostname);
+    let initiator = &server.identity.fingerprint;
+    let proof = pairing::Proof::host(initiator, host, &request.hostname);
     let code = server
         .codes
         .lock()
@@ -113,7 +113,7 @@ where
             fingerprint: host.to_owned(),
         },
     )?;
-    let mac = pairing::Proof::laptop(laptop, host).sign(&code);
+    let mac = pairing::Proof::initiator(initiator, host).sign(&code);
     stream
         .send(Frame::json(FrameKind::PairOk, &PairOk { mac })?)
         .await?;
@@ -137,11 +137,11 @@ where
         .into_iter()
         .find(|host| host.fingerprint == fingerprint);
     let refusal = match &paired {
-        None => {
-            Some("this host is not paired with the laptop; pair again with `ovrd pair`".to_owned())
-        }
+        None => Some(
+            "this host is not paired with the initiator; pair again with `ovrd pair`".to_owned(),
+        ),
         Some(_) if banner.protocol != PROTOCOL_VERSION => Some(format!(
-            "ovrd {} on this host is incompatible with the laptop; install the laptop's version",
+            "ovrd {} on this host is incompatible with the initiator; install the initiator's version",
             banner.version
         )),
         Some(_) => None,

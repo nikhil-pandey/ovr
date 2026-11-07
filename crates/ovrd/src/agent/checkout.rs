@@ -15,21 +15,21 @@ pub struct Checkout {
 }
 
 impl Checkout {
-    /// Opens `<root>/<repo>`, creating an empty repository there on first use.
+    /// Opens `<root>/<name>`, creating an empty repository there on first use.
     ///
     /// # Errors
     ///
     /// Returns an error for an invalid name or when the repository cannot be created.
-    pub async fn open(root: &Path, repo: &str) -> Result<Self, Error> {
-        let valid = !repo.is_empty()
-            && repo != "."
-            && repo != ".."
-            && !repo.contains(['/', '\\', ':', '\0'])
-            && !repo.starts_with('-');
+    pub async fn open(root: &Path, name: &str) -> Result<Self, Error> {
+        let valid = !name.is_empty()
+            && name != "."
+            && name != ".."
+            && !name.contains(['/', '\\', ':', '\0'])
+            && !name.starts_with('-');
         if !valid {
-            return Err(Error::Invalid(format!("invalid repository name {repo:?}")));
+            return Err(Error::Invalid(format!("invalid checkout name {name:?}")));
         }
-        let dir = root.join(repo);
+        let dir = root.join(name);
         if !dir.join(".git").is_dir() {
             tokio::fs::create_dir_all(&dir).await?;
             git::run(&dir, &["init", "-q"]).await?;
@@ -40,6 +40,17 @@ impl Checkout {
             }
         }
         Ok(Self { dir })
+    }
+
+    /// The existing checkout in `dir`.
+    #[must_use]
+    pub fn at(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// Whether the object database has `commit` and therefore every object of that snapshot.
@@ -64,30 +75,41 @@ impl Checkout {
         Ok(Indexer { child, stdin })
     }
 
-    /// Serialises runs against this checkout across connections and processes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the lock file cannot be opened.
-    pub async fn lock(&self) -> io::Result<std::fs::File> {
-        git::lock(self.dir.join(".git").join("ovr.lock")).await
-    }
-
-    /// Checks out `snapshot` as `HEAD`. Only files whose content differs are rewritten, so unchanged files keep
-    /// their timestamps; tracked files changed on the host are restored: the laptop is the source of truth.
+    /// Checks out the newest snapshot this checkout has seen as `HEAD`: `snapshot`, numbered `seq`, or one with a
+    /// higher number that a concurrent run already applied, so a run that arrives late never rolls edits back. Only
+    /// files whose content differs are rewritten, so unchanged files keep their timestamps; tracked files changed on
+    /// the host are restored: the initiator is the source of truth. Commands already running carry on.
     ///
     /// Returns a warning for the client when submodules could not be updated.
     ///
     /// # Errors
     ///
     /// Returns an error when `snapshot` is missing or Git fails.
-    pub async fn apply(&self, snapshot: &str) -> Result<Option<String>, Error> {
+    pub async fn apply(&self, snapshot: &str, seq: u64) -> Result<Option<String>, Error> {
         if !self.has_commit(snapshot).await {
             return Err(Error::Invalid(format!(
                 "snapshot {snapshot} did not arrive"
             )));
         }
-        git::run(&self.dir, &["reset", "--hard", "-q", snapshot]).await?;
+        let git_dir = self.dir.join(".git");
+        let _lock = git::lock(git_dir.join("ovr.lock")).await?;
+        let applied_path = git_dir.join("ovr-applied");
+        let applied = std::fs::read_to_string(&applied_path)
+            .ok()
+            .and_then(|text| {
+                let (seq, commit) = text.trim().split_once(' ')?;
+                Some((seq.parse::<u64>().ok()?, commit.to_owned()))
+            });
+        let (target, newest) = match applied {
+            Some((newer, commit)) if newer > seq && self.has_commit(&commit).await => {
+                (commit, false)
+            }
+            _ => (snapshot.to_owned(), true),
+        };
+        git::run(&self.dir, &["reset", "--hard", "-q", &target]).await?;
+        if newest {
+            std::fs::write(&applied_path, format!("{seq} {snapshot}\n"))?;
+        }
         if !self.dir.join(".gitmodules").is_file() {
             return Ok(None);
         }

@@ -6,6 +6,7 @@
 //! | data: identity, pairings, locks | `~/.local/share/ovr` | `~/Library/Application Support/ovr` | `%LOCALAPPDATA%\ovr\data` |
 //! | cache: downloaded agents | `~/.cache/ovr` | `~/Library/Caches/ovr` | `%LOCALAPPDATA%\ovr\cache` |
 //! | logs | `~/.local/state/ovr` | `~/Library/Logs/ovr` | data |
+//! | runs, on hosts | `~/.local/state/ovr/runs` | data `/runs` | data `\runs` |
 //! | runtime: socket | `$XDG_RUNTIME_DIR/ovr`, else logs | data | data |
 //!
 //! XDG variables are honoured on Linux; empty or relative values fall back to the defaults.
@@ -50,6 +51,19 @@ pub fn log_dir() -> io::Result<PathBuf> {
             .to_owned()
     };
     create(&dir)
+}
+
+/// Run records on a host: each run's request, output log, and end.
+///
+/// # Errors
+///
+/// Returns an error when the home directory is unknown or the directory cannot be created.
+pub fn runs_dir() -> io::Result<PathBuf> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let parent = log_dir()?;
+    #[cfg(any(windows, target_os = "macos"))]
+    let parent = data_dir()?;
+    create(&parent.join("runs"))
 }
 
 /// The local socket. Without a per-session runtime

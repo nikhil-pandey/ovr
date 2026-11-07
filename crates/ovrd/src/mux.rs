@@ -1,5 +1,5 @@
 //! Multiplexes runs over one host connection with yamux, so that any number of runs share a single SSH session or
-//! dial-in TLS connection. The laptop opens a stream per run; the host accepts them.
+//! dial-in TLS connection. The initiator opens a stream per run; the host accepts them.
 //!
 //! yamux sends no keepalives of its own: SSH connections use `ServerAliveInterval`, and dial-in connections use TCP
 //! keepalive (see [`tune`]), so that a vanished peer still ends the connection.
@@ -22,7 +22,7 @@ enum Command {
     Close,
 }
 
-/// The laptop's handle on a host connection; clones share it. The connection closes when every clone is dropped.
+/// The initiator's handle on a host connection; clones share it. The connection closes when every clone is dropped.
 #[derive(Clone)]
 pub struct Mux {
     commands: mpsc::UnboundedSender<Command>,
@@ -70,7 +70,7 @@ impl Mux {
     }
 }
 
-/// Channels the laptop opens on a host connection. Dropping this closes the connection.
+/// Channels the initiator opens on a host connection. Dropping this closes the connection.
 pub struct Incoming {
     streams: mpsc::UnboundedReceiver<yamux::Stream>,
     _commands: mpsc::UnboundedSender<Command>,
@@ -100,7 +100,7 @@ impl Incoming {
 }
 
 /// Sets up a TCP connection for multiplexing: no Nagle delay, and keepalive probes that end the connection within
-/// about a minute of the peer vanishing, e.g. when a laptop sleeps.
+/// about a minute of the peer vanishing, e.g. when an initiator sleeps.
 ///
 /// # Errors
 ///
@@ -197,8 +197,8 @@ mod tests {
 
     #[tokio::test]
     async fn channels_are_independent_and_end_with_the_connection() -> io::Result<()> {
-        let (laptop, host) = tokio::io::duplex(1 << 16);
-        let mux = Mux::open_on(laptop);
+        let (initiator, host) = tokio::io::duplex(1 << 16);
+        let mux = Mux::open_on(initiator);
         let mut incoming = Incoming::accept_on(host);
 
         // A channel nobody reads must not stall another.

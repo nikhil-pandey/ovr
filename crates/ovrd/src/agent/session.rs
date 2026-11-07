@@ -1,59 +1,92 @@
-//! The agent half of a run; see the client half in `ovr`'s `session` module for the sequence.
+//! The agent half of a stream; see the client half in `ovr`'s `session` module for the sequence.
+//!
+//! A stream starts a run (`HELLO`), resumes one (`ATTACH`), or lists runs (`RUNS`). Once a run has started, the
+//! agent only relays frames between the client and the run's keeper, so the stream's end never ends the run.
 
-use std::collections::VecDeque;
-use std::convert::Infallible;
-use std::path::Path;
-
-use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use ovr_proto::frame::{self, INPUT_WINDOW, MAX_LEN, Reader, Writer};
-use ovr_proto::msg::{Consumed, Exec, Exit, Failure, Hello, Resize, Welcome};
+use ovr_proto::frame::{self, Reader, Writer};
+use ovr_proto::msg::{Attach, Attached, Exec, Failure, Hello, RunList, Runs, Welcome};
 use ovr_proto::{Frame, FrameKind};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 use super::Config;
 use super::checkout::Checkout;
-use super::process::{Event, Process};
+use super::keeper;
+use super::log::{Progress, Stream, Tail};
+use super::runs::{self, Meta, Run, Store};
 use crate::Error;
 
-/// Exit code of a run interrupted before its command started, as a shell reports for `SIGINT`.
-const INTERRUPTED: i32 = 130;
-
-/// Serves one run on `stream`, reporting failures to the client as `ERROR`.
+/// Serves one stream on `stream`, reporting failures to the client as `ERROR`.
 pub async fn serve<S>(stream: S, config: &Config)
 where
     S: AsyncRead + AsyncWrite,
 {
     let (mut frames, mut writer) = frame::split(stream);
-    let last = match run(&mut writer, &mut frames, config).await {
-        Ok(code) => Frame::json(FrameKind::Exit, &Exit { code }),
+    let result = dispatch(&mut writer, &mut frames, config).await;
+    let failure = match result {
+        Ok(()) => None,
         Err(Error::Disconnected) => return,
         Err(err) => {
-            tracing::warn!(%err, "run failed");
-            let message = err.to_string();
-            Frame::json(FrameKind::Error, &Failure { message })
+            tracing::warn!(%err, "stream failed");
+            Some(err.to_string())
         }
     };
-    let sent = match last {
-        Ok(last) => writer.send(last).await,
-        Err(err) => Err(err),
-    };
-    match sent {
-        Ok(()) => {
-            let _ = writer.close().await;
+    if let Some(message) = failure {
+        match Frame::json(FrameKind::Error, &Failure { message }) {
+            Ok(frame) => {
+                if let Err(err) = writer.send(frame).await {
+                    tracing::info!(%err, "cannot report a failure");
+                }
+            }
+            Err(err) => tracing::warn!(%err, "cannot encode a failure"),
         }
-        Err(err) => tracing::info!(%err, "cannot report the end of a run"),
     }
+    let _ = writer.close().await;
 }
 
-async fn run<S: AsyncRead + AsyncWrite>(
+async fn dispatch<S: AsyncRead + AsyncWrite>(
     writer: &mut Writer<S>,
     frames: &mut Reader<S>,
     config: &Config,
-) -> Result<i32, Error> {
-    let hello: Hello = next(frames).await?.expect(FrameKind::Hello)?;
-    let checkout = Checkout::open(&config.root, &hello.repo).await?;
+) -> Result<(), Error> {
+    let first = next(frames).await?;
+    let store = Store::new(config.runs.clone());
+    match first.kind {
+        FrameKind::Hello => {
+            let run = start(writer, frames, config, &store, first.parse()?).await?;
+            let attach = Attach {
+                run: run.id,
+                out: 0,
+                err: 0,
+            };
+            attach_to(writer, frames, &run, attach).await
+        }
+        FrameKind::Attach => {
+            let attach: Attach = first.parse()?;
+            attach_to(writer, frames, &store.open(attach.run)?, attach).await
+        }
+        FrameKind::Runs => {
+            let Runs { initiator } = first.parse()?;
+            let runs = store.list(&initiator)?;
+            writer
+                .send(Frame::json(FrameKind::RunList, &RunList { runs })?)
+                .await?;
+            Ok(())
+        }
+        kind => Err(ovr_proto::Error::Unexpected(kind).into()),
+    }
+}
+
+/// Syncs the checkout, records the run, and starts its keeper.
+async fn start<S: AsyncRead + AsyncWrite>(
+    writer: &mut Writer<S>,
+    frames: &mut Reader<S>,
+    config: &Config,
+    store: &Store,
+    hello: Hello,
+) -> Result<Run, Error> {
+    let checkout = Checkout::open(&config.root, &hello.checkout).await?;
     let welcome = match &hello.base {
         Some(base) if !checkout.has_commit(base).await => Welcome::NeedFull,
         _ => Welcome::Ok,
@@ -68,31 +101,24 @@ async fn run<S: AsyncRead + AsyncWrite>(
     receive_pack(frames, &checkout).await?;
     let exec: Exec = next(frames).await?.expect(FrameKind::Exec)?;
 
-    // Frames keep being read while queued behind another run, so Ctrl-C or a vanished client ends the wait.
-    let mut stdin = Stdin::default();
-    let lock = checkout.lock();
-    tokio::pin!(lock);
-    let _lock = loop {
-        tokio::select! {
-            lock = &mut lock => break lock?,
-            frame = next(frames) => match stdin.receive(frame?)? {
-                Some(Signal::Interrupt) => return Ok(INTERRUPTED),
-                Some(Signal::Resize(size)) => stdin.size = Some(size),
-                None => {}
-            },
-        }
-    };
-    let warning = checkout.apply(&hello.snapshot).await?;
+    let warning = checkout.apply(&hello.snapshot, hello.seq).await?;
     writer.send(Frame::empty(FrameKind::Synced)).await?;
     if let Some(warning) = warning {
         writer
             .send(Frame::new(FrameKind::Err, format!("ovr: {warning}\n")))
             .await?;
     }
-    let cwd = checkout.cwd(&exec.cwd)?;
-    let code = execute(writer, frames, config, &exec, &cwd, stdin).await?;
-    checkout.collect_garbage();
-    Ok(code)
+    let meta = Meta {
+        initiator: hello.initiator,
+        checkout: hello.checkout,
+        dir: checkout.dir().to_owned(),
+        cwd: checkout.cwd(&exec.cwd)?,
+        exec,
+        started: runs::now(),
+    };
+    let run = store.create(&meta).await?;
+    keeper::start(config, &run).await?;
+    Ok(run)
 }
 
 /// Indexes pack frames as they arrive, until the empty end-of-pack frame.
@@ -124,134 +150,87 @@ async fn receive_pack<S: AsyncRead>(
     }
 }
 
-/// Relays output and input concurrently, so that a blocked client terminal never stops interrupts from arriving and a
-/// command ignoring its input never stops output from leaving.
-async fn execute<S: AsyncRead + AsyncWrite>(
+/// Relays between the client and the run's keeper or, once the run has ended, replays its log from disk.
+async fn attach_to<S: AsyncRead + AsyncWrite>(
     writer: &mut Writer<S>,
     frames: &mut Reader<S>,
-    config: &Config,
-    exec: &Exec,
-    cwd: &Path,
-    mut stdin: Stdin,
-) -> Result<i32, Error> {
-    let (mut process, mut output) = Process::spawn(&config.shell, exec, cwd).map_err(|err| {
-        Error::Invalid(format!(
-            "cannot start {}: {err}",
-            exec.argv.first().map_or("shell", |p| p)
-        ))
-    })?;
-    if let Some(Resize { cols, rows }) = stdin.size.take() {
-        process.resize(cols, rows);
+    run: &Run,
+    attach: Attach,
+) -> Result<(), Error> {
+    if run.ended()?.is_none()
+        && let Ok(stream) = keeper::connect(run).await
+    {
+        let (mut kept_frames, mut kept_writer) = frame::split(stream);
+        let attached = async {
+            kept_writer
+                .send(Frame::json(FrameKind::Attach, &attach)?)
+                .await?;
+            kept_frames
+                .next()
+                .await
+                .ok_or(Error::Disconnected)?
+                .map_err(Error::from)
+        };
+        // A keeper that is just finishing may close without answering; the log on disk then has everything.
+        if let Ok(attached) = attached.await {
+            writer.send(attached).await?;
+            return relay(writer, frames, &mut kept_writer, &mut kept_frames).await;
+        }
     }
-    let mut consumed = stdin.consumed.subscribe();
+    replay(writer, run, attach).await
+}
 
-    let send_output = async {
+/// Copies frames both ways until the keeper is done, which ends the stream, or the client goes away, which leaves
+/// the run be.
+async fn relay<C, K>(
+    writer: &mut Writer<C>,
+    frames: &mut Reader<C>,
+    kept_writer: &mut Writer<K>,
+    kept_frames: &mut Reader<K>,
+) -> Result<(), Error>
+where
+    C: AsyncRead + AsyncWrite,
+    K: AsyncRead + AsyncWrite,
+{
+    let up = async {
         loop {
-            tokio::select! {
-                event = output.next() => match event {
-                    Some(Event::Stdout(data)) => writer.send(Frame::new(FrameKind::Out, data)).await?,
-                    Some(Event::Stderr(data)) => writer.send(Frame::new(FrameKind::Err, data)).await?,
-                    Some(Event::Exit(code)) => return Ok(code),
-                    Some(Event::Lost(err)) => {
-                        return Err(Error::Invalid(format!("lost track of the command: {err}")));
-                    }
-                    None => return Err(Error::Invalid("the command ended without a status".to_owned())),
-                },
-                Ok(()) = consumed.changed() => {
-                    let bytes = *consumed.borrow_and_update();
-                    writer.send(Frame::json(FrameKind::Consumed, &Consumed { bytes })?).await?;
-                }
-            }
+            kept_writer.send(next(frames).await?).await?;
         }
     };
-    let take_input = async {
-        loop {
-            if stdin.eof && stdin.chunks.is_empty() {
-                process.close_input();
-            }
-            let input = process.input().cloned();
-            tokio::select! {
-                permit = reserve(input.as_ref()), if !stdin.chunks.is_empty() => match permit {
-                    Some(permit) => permit.send(stdin.pop()),
-                    None => stdin.discard(),
-                },
-                frame = next(frames) => match stdin.receive(frame?)? {
-                    Some(Signal::Interrupt) => process.interrupt(),
-                    Some(Signal::Resize(Resize { cols, rows })) => process.resize(cols, rows),
-                    None => {}
-                },
-            }
+    let down = async {
+        while let Some(frame) = kept_frames.next().await {
+            writer.send(frame?).await?;
         }
+        Ok::<(), Error>(())
     };
     tokio::select! {
-        code = send_output => code,
-        Err::<Infallible, Error>(err) = take_input => Err(err),
+        result = up => result,
+        result = down => result,
     }
 }
 
-/// Input for the command that it has not taken yet. The client stops sending once [`INPUT_WINDOW`] is unconsumed, so holding it here costs bounded memory and frames can always be read.
-#[derive(Default)]
-struct Stdin {
-    chunks: VecDeque<Bytes>,
-    held: u64,
-    consumed: watch::Sender<u64>,
-    eof: bool,
-    /// The command closed its input; anything more is discarded.
-    closed: bool,
-    /// The latest terminal size, received before the command started.
-    size: Option<Resize>,
-}
-
-enum Signal {
-    Interrupt,
-    Resize(Resize),
-}
-
-impl Stdin {
-    /// Holds input from `frame`, or returns the signal it carries.
-    fn receive(&mut self, frame: Frame) -> Result<Option<Signal>, Error> {
-        match frame.kind {
-            FrameKind::In if frame.payload.is_empty() => self.eof = true,
-            FrameKind::In if self.closed => self.consume(frame.payload.len()),
-            FrameKind::In => {
-                self.held += frame.payload.len() as u64;
-                if self.held > INPUT_WINDOW + MAX_LEN as u64 {
-                    return Err(Error::Invalid(
-                        "the client sent more input than it may".to_owned(),
-                    ));
-                }
-                self.chunks.push_back(frame.payload);
-            }
-            FrameKind::Resize => return Ok(Some(Signal::Resize(frame.parse()?))),
-            FrameKind::Interrupt => return Ok(Some(Signal::Interrupt)),
-            kind => return Err(ovr_proto::Error::Unexpected(kind).into()),
-        }
-        Ok(None)
-    }
-
-    /// The next chunk, counted as consumed now that the command is taking it.
-    fn pop(&mut self) -> Bytes {
-        let data = self.chunks.pop_front().unwrap_or_default();
-        self.held -= data.len() as u64;
-        self.consume(data.len());
-        data
-    }
-
-    /// The command closed its input, so what is held can never be delivered.
-    fn discard(&mut self) {
-        self.closed = true;
-        while !self.chunks.is_empty() {
-            self.pop();
-        }
-    }
-
-    fn consume(&self, bytes: usize) {
-        self.consumed.send_modify(|total| *total += bytes as u64);
-    }
-}
-
-async fn reserve(input: Option<&mpsc::Sender<Bytes>>) -> Option<mpsc::Permit<'_, Bytes>> {
-    input?.reserve().await.ok()
+/// Sends the log of a run that has no keeper from the requested offsets, then how it ended.
+async fn replay<S: AsyncRead + AsyncWrite>(
+    writer: &mut Writer<S>,
+    run: &Run,
+    attach: Attach,
+) -> Result<(), Error> {
+    let last = keeper::last_frame(run)?;
+    let (_ended, progress) = watch::channel(Progress::finished(&run.dir)?);
+    let mut out = Tail::open(&run.dir, Stream::Out, attach.out, progress.clone())?;
+    let mut err = Tail::open(&run.dir, Stream::Err, attach.err, progress)?;
+    let attached = Attached {
+        run: run.id,
+        tty: run.meta()?.exec.tty,
+        out: out.pos(),
+        err: err.pos(),
+    };
+    writer
+        .send(Frame::json(FrameKind::Attached, &attached)?)
+        .await?;
+    keeper::send_log(writer, &mut out, &mut err, None).await?;
+    writer.send(last).await?;
+    Ok(())
 }
 
 async fn next<S: AsyncRead>(frames: &mut Reader<S>) -> Result<Frame, Error> {

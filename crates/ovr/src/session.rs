@@ -1,29 +1,37 @@
-//! The client half of a run: sync the snapshot, start the command, and relay terminal I/O until it exits.
+//! The client half of a stream: start a run by syncing the snapshot, or attach to one, then relay terminal I/O
+//! until it exits. Every offset is tracked, so a stream that breaks can be resumed on a new one.
 
 use std::convert::Infallible;
 
 use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
 use ovr_proto::frame::{self, CHUNK, INPUT_WINDOW, Reader, Writer};
-use ovr_proto::msg::{Consumed, Exec, Exit, Failure, Resize, Welcome};
+use ovr_proto::msg::{
+    Attach, Attached, Consumed, Exec, Exit, Failure, Resize, RunInfo, RunList, Runs, Welcome,
+};
 use ovr_proto::{Frame, FrameKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
 use crate::Error;
-use crate::snapshot::Snapshot;
+use crate::snapshot::Delivery;
 
-/// Exit code reported when a second interrupt abandons the run, as a shell does for `SIGINT`.
+/// Exit code reported when a second interrupt stops the run, as a shell does for `SIGINT`.
 pub const INTERRUPTED: i32 = 130;
 
 /// Local terminal events forwarded to the remote command, ahead of any pending input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
-    Resize { cols: u16, rows: u16 },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
     Interrupt,
+    /// Leave the run running: the terminal is going away.
+    Detach,
 }
 
-/// Where a run's input comes from and its output goes.
+/// Where a run's input comes from and its output goes, for as many streams as it takes.
 pub struct Io<O, E> {
     /// Local stdin; it ends when the sender is dropped.
     pub stdin: mpsc::Receiver<Bytes>,
@@ -32,55 +40,214 @@ pub struct Io<O, E> {
     pub stderr: E,
 }
 
-/// Runs `exec` against `snapshot` over an agent session and returns the remote exit code.
+/// How far a client has got with a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Position {
+    pub run: u64,
+    pub tty: bool,
+    /// Output written so far, per stream.
+    pub out: u64,
+    pub err: u64,
+    /// The command was interrupted once; another interrupt stops the run.
+    pub interrupted: bool,
+}
+
+impl Position {
+    #[must_use]
+    pub fn new(attached: Attached) -> Self {
+        Self {
+            run: attached.run,
+            tty: attached.tty,
+            out: attached.out,
+            err: attached.err,
+            interrupted: false,
+        }
+    }
+
+    /// Where a new stream resumes.
+    #[must_use]
+    pub fn resume(&self) -> Attach {
+        Attach {
+            run: self.run,
+            out: self.out,
+            err: self.err,
+        }
+    }
+
+    /// Moves to where the host resumed, returning how many bytes of output were dropped in between.
+    pub fn resumed(&mut self, attached: Attached) -> u64 {
+        let dropped = attached.out.saturating_sub(self.out) + attached.err.saturating_sub(self.err);
+        self.out = attached.out;
+        self.err = attached.err;
+        dropped
+    }
+}
+
+/// Whether a client drives the run or only watches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Input, resizes, and interrupts reach the command; a second interrupt stops it.
+    Drive,
+    /// Output only; an interrupt stops watching.
+    Watch,
+}
+
+/// How a relay ended, short of an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum End {
+    /// The run ended, or this client stopped it or stopped watching, with this exit code.
+    Exit(i32),
+    /// The client is going away and leaves the run running.
+    Detached,
+}
+
+/// Both halves of a stream.
+pub struct Stream<S> {
+    frames: Reader<S>,
+    writer: Writer<S>,
+}
+
+impl<S: AsyncRead + AsyncWrite> Stream<S> {
+    fn new(stream: S) -> Self {
+        let (frames, writer) = frame::split(stream);
+        Self { frames, writer }
+    }
+
+    /// Sends one frame, such as the end of input for a run left in the background.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stream is broken.
+    pub async fn send(&mut self, frame: Frame) -> Result<(), Error> {
+        Ok(self.writer.send(frame).await?)
+    }
+}
+
+/// Syncs `delivery`, starts `exec`, and returns once the run has started, writing the host's warnings to `stderr`.
 ///
 /// # Errors
 ///
-/// Returns an error when syncing fails, the agent reports a failure, or the connection drops.
-pub async fn run<S, O, E>(
+/// Returns an error when syncing fails, the command cannot be started, or the connection drops.
+pub async fn start<S, E>(
     stream: S,
-    snapshot: &Snapshot,
+    delivery: &Delivery<'_>,
     exec: &Exec,
-    io: Io<O, E>,
-) -> Result<i32, Error>
+    stderr: &mut E,
+) -> Result<(Stream<S>, Position), Error>
 where
     S: AsyncRead + AsyncWrite,
-    O: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
-    let (mut frames, mut writer) = frame::split(stream);
+    let mut stream = Stream::new(stream);
     let mut synced = false;
-    let result = async {
-        sync(&mut writer, &mut frames, snapshot, exec).await?;
-        relay(&mut writer, &mut frames, snapshot, &mut synced, io).await
+    let started = async {
+        sync(&mut stream, delivery, exec).await?;
+        loop {
+            let frame = next(&mut stream.frames).await?;
+            match frame.kind {
+                FrameKind::Synced => {
+                    synced = true;
+                    delivery.synced().await?;
+                }
+                FrameKind::Err => {
+                    stderr.write_all(&frame.payload).await?;
+                    stderr.flush().await?;
+                }
+                FrameKind::Attached => return Ok(Position::new(frame.parse()?)),
+                kind => return Err(ovr_proto::Error::Unexpected(kind).into()),
+            }
+        }
     }
     .await;
-    if result.is_err() && !synced {
-        snapshot.forget().await;
+    match started {
+        Ok(position) => Ok((stream, position)),
+        Err(err) => {
+            if !synced {
+                delivery.forget().await;
+            }
+            Err(err)
+        }
     }
-    result
+}
+
+/// Resumes run `attach.run` from the given offsets.
+///
+/// # Errors
+///
+/// Returns an error when the host has no such run or the connection drops.
+pub async fn attach<S: AsyncRead + AsyncWrite>(
+    stream: S,
+    attach: Attach,
+) -> Result<(Stream<S>, Attached), Error> {
+    let mut stream = Stream::new(stream);
+    stream
+        .send(Frame::json(FrameKind::Attach, &attach)?)
+        .await?;
+    let attached = next(&mut stream.frames)
+        .await?
+        .expect(FrameKind::Attached)?;
+    Ok((stream, attached))
+}
+
+/// `initiator`'s runs on the host.
+///
+/// # Errors
+///
+/// Returns an error when the host cannot list them.
+pub async fn list<S: AsyncRead + AsyncWrite>(
+    stream: S,
+    initiator: &str,
+) -> Result<Vec<RunInfo>, Error> {
+    let mut stream = Stream::new(stream);
+    let runs = Runs {
+        initiator: initiator.to_owned(),
+    };
+    stream.send(Frame::json(FrameKind::Runs, &runs)?).await?;
+    let list: RunList = next(&mut stream.frames).await?.expect(FrameKind::RunList)?;
+    Ok(list.runs)
+}
+
+/// Kills `run`'s whole process tree and waits for it to end.
+///
+/// # Errors
+///
+/// Returns an error when there is no such run or the connection drops.
+pub async fn kill<S: AsyncRead + AsyncWrite>(stream: S, run: u64) -> Result<(), Error> {
+    let from_end = Attach {
+        run,
+        out: u64::MAX,
+        err: u64::MAX,
+    };
+    let (mut stream, _) = attach(stream, from_end).await?;
+    stream.send(Frame::empty(FrameKind::Kill)).await?;
+    loop {
+        match next(&mut stream.frames).await?.kind {
+            FrameKind::Exit => return Ok(()),
+            FrameKind::Out | FrameKind::Err | FrameKind::Consumed => {}
+            kind => return Err(ovr_proto::Error::Unexpected(kind).into()),
+        }
+    }
 }
 
 /// Sends `HELLO`, a speculative thin pack, and `EXEC` without waiting, then repeats the pack in full if the host
 /// lacks the base.
 async fn sync<S: AsyncRead + AsyncWrite>(
-    writer: &mut Writer<S>,
-    frames: &mut Reader<S>,
-    snapshot: &Snapshot,
+    stream: &mut Stream<S>,
+    delivery: &Delivery<'_>,
     exec: &Exec,
 ) -> Result<(), Error> {
-    writer
-        .send(Frame::json(FrameKind::Hello, &snapshot.hello())?)
+    stream
+        .send(Frame::json(FrameKind::Hello, &delivery.hello())?)
         .await?;
-    let mut welcome = send_pack(writer, frames, snapshot, snapshot.base.as_deref(), true).await?;
-    writer.send(Frame::json(FrameKind::Exec, exec)?).await?;
+    let mut welcome = send_pack(stream, delivery, delivery.base.as_deref(), true).await?;
+    stream.send(Frame::json(FrameKind::Exec, exec)?).await?;
     let welcome = match welcome.take() {
         Some(welcome) => welcome,
-        None => next(frames).await?.expect(FrameKind::Welcome)?,
+        None => next(&mut stream.frames).await?.expect(FrameKind::Welcome)?,
     };
     if welcome == Welcome::NeedFull {
-        send_pack(writer, frames, snapshot, None, false).await?;
-        writer.send(Frame::json(FrameKind::Exec, exec)?).await?;
+        send_pack(stream, delivery, None, false).await?;
+        stream.send(Frame::json(FrameKind::Exec, exec)?).await?;
     }
     Ok(())
 }
@@ -88,23 +255,22 @@ async fn sync<S: AsyncRead + AsyncWrite>(
 /// Streams a pack followed by the empty end-of-pack frame. While `watch` is set, also listens for `WELCOME` and
 /// cuts the pack short when the host needs a full one.
 async fn send_pack<S: AsyncRead + AsyncWrite>(
-    writer: &mut Writer<S>,
-    frames: &mut Reader<S>,
-    snapshot: &Snapshot,
+    stream: &mut Stream<S>,
+    delivery: &Delivery<'_>,
     base: Option<&str>,
     mut watch: bool,
 ) -> Result<Option<Welcome>, Error> {
     let mut welcome = None;
-    if let Some(mut pack) = snapshot.pack(base).await? {
+    if let Some(mut pack) = delivery.pack(base).await? {
         let mut buf = BytesMut::with_capacity(CHUNK);
         let complete = loop {
             buf.reserve(CHUNK);
             tokio::select! {
                 read = pack.stdout.read_buf(&mut buf) => match read? {
                     0 => break true,
-                    _ => writer.send(Frame::new(FrameKind::Pack, buf.split().freeze())).await?,
+                    _ => stream.writer.send(Frame::new(FrameKind::Pack, buf.split().freeze())).await?,
                 },
-                reply = next(frames), if watch => {
+                reply = next(&mut stream.frames), if watch => {
                     let reply = reply?.expect(FrameKind::Welcome)?;
                     welcome = Some(reply);
                     watch = false;
@@ -118,30 +284,42 @@ async fn send_pack<S: AsyncRead + AsyncWrite>(
             pack.finish().await?;
         }
     }
-    writer.send(Frame::empty(FrameKind::Pack)).await?;
+    stream.send(Frame::empty(FrameKind::Pack)).await?;
     Ok(welcome)
 }
 
 /// Receives output, forwards signals, and sends input concurrently, so neither a slow local terminal nor a command
-/// that ignores its input keeps a second Ctrl-C from abandoning the run.
-async fn relay<S, O, E>(
-    writer: &mut Writer<S>,
-    frames: &mut Reader<S>,
-    snapshot: &Snapshot,
-    synced: &mut bool,
-    io: Io<O, E>,
-) -> Result<i32, Error>
+/// that ignores its input keeps a second Ctrl-C from stopping the run. Returns [`Error::Disconnected`] when the
+/// stream breaks; `position` then says where to resume.
+///
+/// # Errors
+///
+/// Returns an error when the host reports a failure, the stream breaks, or the output cannot be written; the run is
+/// killed in the last case, as `SIGPIPE` would kill a local command.
+pub async fn relay<S, O, E>(
+    stream: &mut Stream<S>,
+    io: &mut Io<O, E>,
+    position: &mut Position,
+    mode: Mode,
+) -> Result<End, Error>
 where
     S: AsyncRead + AsyncWrite,
     O: AsyncWrite + Unpin,
     E: AsyncWrite + Unpin,
 {
+    let Stream { frames, writer } = stream;
     let Io {
-        mut stdin,
-        mut signals,
-        mut stdout,
-        mut stderr,
+        stdin,
+        signals,
+        stdout,
+        stderr,
     } = io;
+    let Position {
+        out,
+        err,
+        interrupted,
+        ..
+    } = position;
     let (consumed_tx, mut consumed) = watch::channel(0);
     let (control_tx, mut control) = mpsc::unbounded_channel();
 
@@ -149,38 +327,36 @@ where
         loop {
             let frame = next(frames).await?;
             match frame.kind {
-                FrameKind::Synced => {
-                    *synced = true;
-                    snapshot.synced().await?;
-                }
                 FrameKind::Out => {
-                    stdout.write_all(&frame.payload).await?;
-                    stdout.flush().await?;
+                    write(stdout, &frame.payload).await?;
+                    *out += frame.payload.len() as u64;
                 }
                 FrameKind::Err => {
-                    stderr.write_all(&frame.payload).await?;
-                    stderr.flush().await?;
+                    write(stderr, &frame.payload).await?;
+                    *err += frame.payload.len() as u64;
                 }
                 FrameKind::Consumed => {
                     consumed_tx.send_replace(frame.parse::<Consumed>()?.bytes);
                 }
-                FrameKind::Exit => return Ok(frame.parse::<Exit>()?.code),
+                FrameKind::Exit => return Ok(Stop::Exit(frame.parse::<Exit>()?.code)),
                 kind => return Err(ovr_proto::Error::Unexpected(kind).into()),
             }
         }
     };
     let forward_signals = async {
-        let mut interrupted = false;
         while let Some(signal) = signals.recv().await {
-            let frame = match signal {
-                Signal::Resize { cols, rows } => {
-                    Frame::json(FrameKind::Resize, &Resize { cols, rows })?
-                }
-                Signal::Interrupt if interrupted => return Ok(INTERRUPTED),
-                Signal::Interrupt => {
-                    interrupted = true;
+            let frame = match (signal, mode) {
+                (Signal::Detach, _) => return Ok(Stop::Detach),
+                (Signal::Interrupt, Mode::Watch) => return Ok(Stop::Exit(INTERRUPTED)),
+                (Signal::Interrupt, Mode::Drive) if *interrupted => return Ok(Stop::Kill),
+                (Signal::Interrupt, Mode::Drive) => {
+                    *interrupted = true;
                     Frame::empty(FrameKind::Interrupt)
                 }
+                (Signal::Resize { cols, rows }, Mode::Drive) => {
+                    Frame::json(FrameKind::Resize, &Resize { cols, rows })?
+                }
+                (Signal::Resize { .. }, Mode::Watch) => continue,
             };
             let _ = control_tx.send(frame);
         }
@@ -188,9 +364,9 @@ where
     };
     let send = async {
         let mut sent = 0;
-        let mut stdin_open = true;
+        let mut stdin_open = mode == Mode::Drive;
         loop {
-            // The agent holds what the command has not consumed yet; this bounds how much.
+            // The keeper holds what the command has not consumed yet; this bounds how much.
             let room = sent < *consumed.borrow_and_update() + INPUT_WINDOW;
             let frame = tokio::select! {
                 biased;
@@ -211,19 +387,52 @@ where
                 break;
             }
         }
-        // Nothing more can be sent; the agent's last frames, or the lost connection, end the run.
+        // Nothing more can be sent; the host's last frames, or the broken stream, end the relay.
         std::future::pending::<Infallible>().await
     };
-    tokio::select! {
-        result = receive => result,
-        result = forward_signals => result,
+    let stop = tokio::select! {
+        stop = receive => stop,
+        stop = forward_signals => stop,
         never = send => match never {},
+    };
+    match stop {
+        Ok(Stop::Exit(code)) => Ok(End::Exit(code)),
+        Ok(Stop::Detach) => Ok(End::Detached),
+        Ok(Stop::Kill) => {
+            let _ = writer.send(Frame::empty(FrameKind::Kill)).await;
+            Ok(End::Exit(INTERRUPTED))
+        }
+        Err(Error::Output(err)) => {
+            let _ = writer.send(Frame::empty(FrameKind::Kill)).await;
+            Err(Error::Output(err))
+        }
+        Err(err) => Err(err),
     }
 }
 
-/// The next frame from the agent, turning `ERROR` frames and a dropped connection into errors.
+enum Stop {
+    Exit(i32),
+    Detach,
+    Kill,
+}
+
+async fn write<W: AsyncWrite + Unpin>(out: &mut W, data: &[u8]) -> Result<(), Error> {
+    async {
+        out.write_all(data).await?;
+        out.flush().await
+    }
+    .await
+    .map_err(Error::Output)
+}
+
+/// The next frame from the host, turning `ERROR` frames into errors and a broken stream into
+/// [`Error::Disconnected`].
 async fn next<S: AsyncRead>(frames: &mut Reader<S>) -> Result<Frame, Error> {
-    let frame = frames.next().await.ok_or(Error::Disconnected)??;
+    let frame = match frames.next().await {
+        Some(Ok(frame)) => frame,
+        None | Some(Err(ovr_proto::Error::Io(_))) => return Err(Error::Disconnected),
+        Some(Err(err)) => return Err(err.into()),
+    };
     if frame.kind == FrameKind::Error {
         return Err(Error::Remote(frame.parse::<Failure>()?.message));
     }
@@ -237,6 +446,7 @@ mod tests {
     use ovrd::agent::{Config, Shell};
 
     use super::*;
+    use crate::snapshot::Snapshot;
 
     struct Run {
         code: i32,
@@ -262,7 +472,8 @@ mod tests {
         stdin: &[u8],
         signals: mpsc::Receiver<Signal>,
     ) -> Result<Run, Error> {
-        let snapshot = Snapshot::take(&repo.join(cwd), "box").await?;
+        let snapshot = Snapshot::take(&repo.join(cwd)).await?;
+        let delivery = snapshot.deliver_to("box", "me").await?;
         let exec = Exec {
             argv: vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
             cwd: snapshot.prefix.clone(),
@@ -270,10 +481,7 @@ mod tests {
             cols: 80,
             rows: 24,
         };
-        let config = Config {
-            root: host_root.to_owned(),
-            shell: Shell::new("/bin/sh"),
-        };
+        let config = config(host_root);
         let (client, agent) = tokio::io::duplex(1 << 16);
         let agent = tokio::spawn(async move { ovrd::agent::session::serve(agent, &config).await });
 
@@ -288,19 +496,33 @@ mod tests {
             }
         });
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-        let io = Io {
+        let (mut stream, mut position) = start(client, &delivery, &exec, &mut stderr).await?;
+        let mut io = Io {
             stdin: stdin_rx,
             signals,
             stdout: &mut stdout,
             stderr: &mut stderr,
         };
-        let code = run(client, &snapshot, &exec, io).await?;
+        let end = relay(&mut stream, &mut io, &mut position, Mode::Drive).await?;
+        drop(stream);
         agent.await.map_err(|_| Error::Disconnected)?;
+        let End::Exit(code) = end else {
+            return Err(Error::Disconnected);
+        };
         Ok(Run {
             code,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
+    }
+
+    fn config(host_root: &Path) -> Config {
+        Config {
+            root: host_root.to_owned(),
+            runs: host_root.join(".runs"),
+            shell: Shell::new("/bin/sh"),
+            keeper: None,
+        }
     }
 
     fn repo() -> Result<tempfile::TempDir, Error> {
@@ -340,7 +562,7 @@ mod tests {
         .await?;
         assert_eq!(first.code, 3);
         assert!(
-            first.stdout.ends_with(&format!("{name}/src\nv1\n")),
+            first.stdout.contains(&format!("/{name}-")) && first.stdout.ends_with("/src\nv1\n"),
             "{}",
             first.stdout
         );
@@ -422,8 +644,8 @@ mod tests {
 
         let err = ovr(repo.path(), "", &blocked, "true", b"").await.err();
         assert!(matches!(err, Some(Error::Remote(_))), "{err:?}");
-        let snapshot = Snapshot::take(repo.path(), "box").await?;
-        assert_eq!(snapshot.base, None);
+        let snapshot = Snapshot::take(repo.path()).await?;
+        assert_eq!(snapshot.deliver_to("box", "me").await?.base, None);
         Ok(())
     }
 
@@ -441,7 +663,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupts_reach_the_command_and_a_second_abandons_the_run() -> Result<(), Error> {
+    async fn interrupts_reach_the_command_and_a_second_stops_the_run() -> Result<(), Error> {
         let repo = repo()?;
         let host = tempfile::tempdir()?;
         let interrupt = |count| {
@@ -464,7 +686,7 @@ mod tests {
         let run = ovr_with(repo.path(), "", host.path(), &script, b"", interrupt(2)).await?;
         assert_eq!(run.code, INTERRUPTED);
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        assert!(!marker.exists(), "an abandoned run kills its command");
+        assert!(!marker.exists(), "a stopped run kills its command");
         Ok(())
     }
 }

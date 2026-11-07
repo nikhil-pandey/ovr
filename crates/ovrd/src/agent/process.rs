@@ -158,6 +158,17 @@ impl Process {
         self.input.as_ref()
     }
 
+    /// The command's process group on Unix, which outlives this handle; `None` elsewhere.
+    #[must_use]
+    pub fn id(&self) -> Option<u32> {
+        match &self.control {
+            #[cfg(unix)]
+            Control::Pipe { group, .. } | Control::Pty { group, .. } => *group,
+            #[cfg(windows)]
+            _ => None,
+        }
+    }
+
     /// Ends the command's stdin. A terminal has no end of input, so this only applies to pipes.
     pub fn close_input(&mut self) {
         if matches!(self.control, Control::Pipe { .. }) {

@@ -6,16 +6,16 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-/// A host paired with this laptop.
+/// A host paired with this initiator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairedHost {
     pub name: String,
     pub fingerprint: String,
 }
 
-/// The laptop this host dials, as recorded by `ovrd connect ADDR CODE`.
+/// The initiator this host dials, as recorded by `ovrd connect ADDR CODE`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Laptop {
+pub struct Initiator {
     pub addr: String,
     pub fingerprint: String,
 }
@@ -24,8 +24,8 @@ fn hosts_path(dir: &Path) -> PathBuf {
     dir.join("hosts.json")
 }
 
-fn laptop_path(dir: &Path) -> PathBuf {
-    dir.join("laptop.json")
+fn initiator_path(dir: &Path) -> PathBuf {
+    dir.join("initiator.json")
 }
 
 /// # Errors
@@ -51,15 +51,15 @@ pub fn add_host(dir: &Path, host: PairedHost) -> io::Result<()> {
 /// # Errors
 ///
 /// Returns an error when the file exists but cannot be read or parsed.
-pub fn laptop(dir: &Path) -> io::Result<Option<Laptop>> {
-    read(&laptop_path(dir))
+pub fn initiator(dir: &Path) -> io::Result<Option<Initiator>> {
+    read(&initiator_path(dir))
 }
 
 /// # Errors
 ///
 /// Returns an error when the record cannot be written.
-pub fn set_laptop(dir: &Path, laptop: &Laptop) -> io::Result<()> {
-    write(&laptop_path(dir), laptop)
+pub fn set_initiator(dir: &Path, initiator: &Initiator) -> io::Result<()> {
+    write(&initiator_path(dir), initiator)
 }
 
 fn read<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {

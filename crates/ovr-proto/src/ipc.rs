@@ -38,7 +38,15 @@ fn endpoint() -> io::Result<PathBuf> {
 ///
 /// Returns an error when no `ovrd` is listening.
 pub async fn connect() -> io::Result<ClientStream> {
-    let endpoint = endpoint()?;
+    connect_to(&endpoint()?).await
+}
+
+/// Connects to the endpoint at `endpoint`: a socket path on Unix, a pipe name on Windows.
+///
+/// # Errors
+///
+/// Returns an error when nothing is listening there.
+pub async fn connect_to(endpoint: &Path) -> io::Result<ClientStream> {
     #[cfg(unix)]
     {
         tokio::net::UnixStream::connect(endpoint).await
@@ -49,7 +57,7 @@ pub async fn connect() -> io::Result<ClientStream> {
         const ERROR_PIPE_BUSY: i32 = 231;
         let mut attempts = 0;
         loop {
-            match tokio::net::windows::named_pipe::ClientOptions::new().open(&endpoint) {
+            match tokio::net::windows::named_pipe::ClientOptions::new().open(endpoint) {
                 Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempts < 50 => {
                     attempts += 1;
                     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -105,7 +113,7 @@ fn spawn(program: &Path) -> io::Result<()> {
     command.spawn().map(drop)
 }
 
-/// The server side of the endpoint. Only one `ovrd` per user may hold it; callers serialise with a lock file.
+/// The server side of an endpoint. Only one process may hold it; callers serialise with a lock file.
 pub struct Listener {
     #[cfg(unix)]
     inner: tokio::net::UnixListener,
@@ -118,13 +126,21 @@ pub struct Listener {
 }
 
 impl Listener {
-    /// Binds the endpoint, replacing a stale socket left by an `ovrd` that did not exit cleanly.
+    /// Binds `ovrd`'s endpoint, replacing a stale socket left by an `ovrd` that did not exit cleanly.
     ///
     /// # Errors
     ///
     /// Returns an error when the endpoint cannot be created.
     pub fn bind() -> io::Result<Self> {
-        let path = endpoint()?;
+        Self::bind_at(endpoint()?)
+    }
+
+    /// Binds the endpoint at `path`, replacing a stale socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the endpoint cannot be created.
+    pub fn bind_at(path: PathBuf) -> io::Result<Self> {
         #[cfg(unix)]
         {
             match std::fs::remove_file(&path) {

@@ -1,4 +1,4 @@
-//! `ovrd` on the laptop: answers `ovr` over the local socket and owns the connections to hosts.
+//! `ovrd` on the initiator: answers `ovr` over the local socket and owns the connections to hosts.
 
 mod dialin;
 mod ssh;
@@ -24,7 +24,7 @@ use crate::{Error, state};
 /// TCP port dial-in hosts connect to.
 pub const PORT: u16 = 7420;
 
-/// How long a run waits for a paired host that is offline, e.g. reconnecting after the laptop woke up.
+/// How long a run waits for a paired host that is offline, e.g. reconnecting after the initiator woke up.
 const ONLINE_WAIT: Duration = Duration::from_secs(15);
 
 /// How long a second `ovrd` waits for the first to exit before giving up.
@@ -119,7 +119,10 @@ async fn handle(server: Arc<Server>, stream: ipc::ServerStream, restart: Arc<Not
     let response = match request.op {
         Op::Open { host } => match server.open(&host).await {
             Ok((mut channel, lease)) => {
-                if respond(&mut stream, &Response::Opened).await.is_ok() {
+                let opened = Response::Opened {
+                    initiator: server.identity.fingerprint.clone(),
+                };
+                if respond(&mut stream, &opened).await.is_ok() {
                     // From here on the socket carries the agent session verbatim.
                     let mut stream = frame::resume(stream);
                     let _ = tokio::io::copy_bidirectional(&mut stream, &mut channel).await;
@@ -137,6 +140,9 @@ async fn handle(server: Arc<Server>, stream: ipc::ServerStream, restart: Arc<Not
         Op::Hosts => server.hosts().unwrap_or_else(|err| Response::Failed {
             message: err.to_string(),
         }),
+        Op::Connected => Response::Connected {
+            hosts: server.connected(),
+        },
         Op::Pair => server.pair().unwrap_or_else(|err| Response::Failed {
             message: err.to_string(),
         }),
@@ -186,6 +192,13 @@ impl Server {
             })
             .collect();
         Ok(Response::Hosts { hosts })
+    }
+
+    /// Hosts with an open connection: dialed-in hosts that are online, then SSH hosts in use.
+    fn connected(&self) -> Vec<String> {
+        let mut hosts = self.dialed.names();
+        hosts.extend(self.ssh.connected());
+        hosts
     }
 
     fn pair(&self) -> Result<Response, Error> {
@@ -258,6 +271,17 @@ impl Registry {
             .get(name)
             .map(|dialed| dialed.mux.clone())
             .filter(|mux| !mux.is_closed())
+    }
+
+    fn names(&self) -> Vec<String> {
+        let hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut names: Vec<String> = hosts
+            .iter()
+            .filter(|(_, dialed)| !dialed.mux.is_closed())
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
     }
 
     fn platform(&self, name: &str) -> Option<Platform> {

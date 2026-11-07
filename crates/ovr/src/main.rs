@@ -1,10 +1,22 @@
-use clap::Parser;
+use clap::error::{ContextKind, ContextValue, ErrorKind};
+use clap::{CommandFactory, Parser};
 
 fn main() {
     let cli = match ovr::Cli::try_parse() {
         Ok(cli) => cli,
-        Err(err) => {
+        Err(mut err) => {
             let code = if err.use_stderr() { ovr::FAILURE } else { 0 };
+            let subcommand = std::env::args()
+                .nth(1)
+                .is_some_and(|arg| ovr::Cli::command().find_subcommand(arg).is_some());
+            if err.kind() == ErrorKind::UnknownArgument && !subcommand {
+                err.insert(
+                    ContextKind::Suggested,
+                    ContextValue::StyledStrs(vec![
+                        "put `--` before the remote command: `ovr HOST -- CMD...`".into(),
+                    ]),
+                );
+            }
             let _ = err.print();
             std::process::exit(code);
         }

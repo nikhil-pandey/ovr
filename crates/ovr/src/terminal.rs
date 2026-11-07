@@ -1,4 +1,4 @@
-//! The local terminal: raw mode, stdin, resize, and Ctrl-C, turned into input and [`Signal`]s.
+//! The local terminal: raw mode, stdin, resize, Ctrl-C, and hangup, turned into input and [`Signal`]s.
 
 use std::io::{IsTerminal, Read};
 
@@ -37,18 +37,28 @@ pub fn size() -> (u16, u16) {
     crossterm::terminal::size().unwrap_or((80, 24))
 }
 
-/// Starts forwarding local input and signals. With `tty`, puts the terminal in raw mode so that keys reach the
-/// remote terminal unchanged; Ctrl-C is then read as a key and sent as an interrupt signal.
+/// Starts forwarding local signals and, with `input`, stdin. With `tty`, puts the terminal in raw mode so that keys
+/// reach the remote terminal unchanged; Ctrl-C is then read as a key and sent as an interrupt signal. Hangup and
+/// termination become [`Signal::Detach`], so the terminal is restored and the run left running.
 ///
 /// # Errors
 ///
 /// Returns an error when raw mode cannot be enabled.
 pub fn start(
     tty: bool,
+    input: bool,
 ) -> std::io::Result<(Terminal, mpsc::Receiver<Bytes>, mpsc::Receiver<Signal>)> {
     let (signals_tx, signals) = mpsc::channel(16);
     let (stdin_tx, stdin) = mpsc::channel(4);
-    let terminal = if tty {
+    tokio::spawn(forward_detach(signals_tx.clone()));
+    let terminal = if !input {
+        tokio::spawn(forward_interrupts(signals_tx));
+        Terminal {
+            raw: false,
+            #[cfg(windows)]
+            _console: None,
+        }
+    } else if tty {
         #[cfg(windows)]
         let console = console::Modes::enable_vt();
         crossterm::terminal::enable_raw_mode()?;
@@ -127,6 +137,32 @@ async fn forward_interrupts(tx: mpsc::Sender<Signal>) {
         if tx.send(Signal::Interrupt).await.is_err() {
             return;
         }
+    }
+}
+
+#[cfg(unix)]
+async fn forward_detach(tx: mpsc::Sender<Signal>) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut hangup), Ok(mut terminate)) = (
+        signal(SignalKind::hangup()),
+        signal(SignalKind::terminate()),
+    ) else {
+        return;
+    };
+    tokio::select! {
+        _ = hangup.recv() => {}
+        _ = terminate.recv() => {}
+    }
+    let _ = tx.send(Signal::Detach).await;
+}
+
+#[cfg(windows)]
+async fn forward_detach(tx: mpsc::Sender<Signal>) {
+    let Ok(mut close) = tokio::signal::windows::ctrl_close() else {
+        return;
+    };
+    if close.recv().await.is_some() {
+        let _ = tx.send(Signal::Detach).await;
     }
 }
 

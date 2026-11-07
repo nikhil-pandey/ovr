@@ -80,14 +80,14 @@ pub struct Proof(Vec<u8>);
 impl Proof {
     /// The host's proof: it knows the code and saw these fingerprints.
     #[must_use]
-    pub fn host(laptop: &str, host: &str, hostname: &str) -> Self {
-        Self::of(&["ovr pair v1", laptop, host, hostname])
+    pub fn host(initiator: &str, host: &str, hostname: &str) -> Self {
+        Self::of(&["ovr pair v1", initiator, host, hostname])
     }
 
-    /// The laptop's proof in reply.
+    /// The initiator's proof in reply.
     #[must_use]
-    pub fn laptop(laptop: &str, host: &str) -> Self {
-        Self::of(&["ovr pair ok v1", laptop, host])
+    pub fn initiator(initiator: &str, host: &str) -> Self {
+        Self::of(&["ovr pair ok v1", initiator, host])
     }
 
     /// Length-prefixed parts, so that no two different part lists produce the same message.
@@ -168,11 +168,11 @@ mod tests {
 
     #[test]
     fn proofs_bind_the_code_and_both_identities() {
-        let mac = Proof::host("laptop", "host", "winbox").sign("7KQXM4RT");
-        assert!(Proof::host("laptop", "host", "winbox").verify("7KQXM4RT", &mac));
-        assert!(!Proof::host("laptop", "host", "winbox").verify("7KQXM4RU", &mac));
+        let mac = Proof::host("initiator", "host", "winbox").sign("7KQXM4RT");
+        assert!(Proof::host("initiator", "host", "winbox").verify("7KQXM4RT", &mac));
+        assert!(!Proof::host("initiator", "host", "winbox").verify("7KQXM4RU", &mac));
         assert!(!Proof::host("mitm", "host", "winbox").verify("7KQXM4RT", &mac));
-        assert!(!Proof::laptop("laptop", "host").verify("7KQXM4RT", &mac));
-        assert!(!Proof::host("laptop", "host", "winbox").verify("7KQXM4RT", "zz"));
+        assert!(!Proof::initiator("initiator", "host").verify("7KQXM4RT", &mac));
+        assert!(!Proof::host("initiator", "host", "winbox").verify("7KQXM4RT", "zz"));
     }
 }

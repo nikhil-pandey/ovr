@@ -1,4 +1,4 @@
-//! `ovrd connect` on a dial-in host: pair once, then keep a connection to the laptop open and serve runs over it.
+//! `ovrd connect` on a dial-in host: pair once, then keep a connection to the initiator open and serve runs over it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,18 +13,18 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use crate::server::PORT;
-use crate::state::{self, Laptop};
+use crate::state::{self, Initiator};
 use crate::tls::{self, Identity};
 use crate::{Error, agent, autostart, mux, pairing};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
-/// Pairs with the laptop at `addr` using `code`, then serves it from now on.
+/// Pairs with the initiator at `addr` using `code`, then serves it from now on.
 ///
 /// # Errors
 ///
-/// Returns an error when the laptop is unreachable or rejects the code.
+/// Returns an error when the initiator is unreachable or rejects the code.
 pub async fn pair(addr: &str, code: &str) -> Result<(), Error> {
     let code = pairing::normalize(code).ok_or_else(|| {
         Error::Invalid(format!(
@@ -38,10 +38,10 @@ pub async fn pair(addr: &str, code: &str) -> Result<(), Error> {
     };
     let dir = ovr_proto::paths::data_dir()?;
     let identity = Identity::load_or_create(&dir)?;
-    let (mut stream, laptop) = dial(&identity, &addr).await?;
+    let (mut stream, initiator) = dial(&identity, &addr).await?;
 
     let hostname = agent::hostname();
-    let mac = pairing::Proof::host(&laptop, &identity.fingerprint, &hostname).sign(&code);
+    let mac = pairing::Proof::host(&initiator, &identity.fingerprint, &hostname).sign(&code);
     let pair = Pair {
         hostname: hostname.clone(),
         mac,
@@ -52,16 +52,16 @@ pub async fn pair(addr: &str, code: &str) -> Result<(), Error> {
         return Err(Error::Pairing(reply.parse::<Failure>()?.message));
     }
     let PairOk { mac } = reply.expect(FrameKind::PairOk)?;
-    if !pairing::Proof::laptop(&laptop, &identity.fingerprint).verify(&code, &mac) {
+    if !pairing::Proof::initiator(&initiator, &identity.fingerprint).verify(&code, &mac) {
         return Err(Error::Pairing(format!(
             "{addr} did not prove it issued the code; something may be intercepting the connection"
         )));
     }
-    state::set_laptop(
+    state::set_initiator(
         &dir,
-        &Laptop {
+        &Initiator {
             addr: addr.clone(),
-            fingerprint: laptop,
+            fingerprint: initiator,
         },
     )?;
     println!("paired with {addr}; serving as {hostname}");
@@ -78,7 +78,7 @@ pub async fn pair(addr: &str, code: &str) -> Result<(), Error> {
     }
 }
 
-/// Serves the paired laptop forever, reconnecting with backoff.
+/// Serves the paired initiator forever, reconnecting with backoff.
 ///
 /// # Errors
 ///
@@ -93,18 +93,18 @@ pub async fn serve() -> Result<(), Error> {
     if lock.try_lock().is_err() {
         return Err(Error::Invalid("ovrd connect is already running".to_owned()));
     }
-    let laptop = state::laptop(&dir)?.ok_or_else(|| {
+    let initiator = state::initiator(&dir)?.ok_or_else(|| {
         Error::Invalid(
             "not paired; run the `ovrd connect ADDR CODE` command `ovrd pair` prints".to_owned(),
         )
     })?;
     let identity = Identity::load_or_create(&dir)?;
     let config = Arc::new(agent::Config::detect()?);
-    tracing::info!(addr = laptop.addr, "serving");
+    tracing::info!(addr = initiator.addr, "serving");
 
     let mut backoff = Duration::from_secs(1);
     loop {
-        match attach(&identity, &laptop).await {
+        match attach(&identity, &initiator).await {
             Ok(stream) => {
                 tracing::info!("connected");
                 backoff = Duration::from_secs(1);
@@ -112,7 +112,7 @@ pub async fn serve() -> Result<(), Error> {
                 tracing::info!("disconnected");
             }
             Err(err) => {
-                tracing::info!(%err, "cannot reach the laptop; retrying in {}s", backoff.as_secs());
+                tracing::info!(%err, "cannot reach the initiator; retrying in {}s", backoff.as_secs());
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
@@ -120,16 +120,16 @@ pub async fn serve() -> Result<(), Error> {
     }
 }
 
-/// Connects to the pinned laptop and announces this host.
+/// Connects to the pinned initiator and announces this host.
 async fn attach(
     identity: &Identity,
-    laptop: &Laptop,
+    initiator: &Initiator,
 ) -> Result<Resumed<TlsStream<TcpStream>>, Error> {
-    let (mut stream, fingerprint) = dial(identity, &laptop.addr).await?;
-    if fingerprint != laptop.fingerprint {
+    let (mut stream, fingerprint) = dial(identity, &initiator.addr).await?;
+    if fingerprint != initiator.fingerprint {
         return Err(Error::Pairing(format!(
-            "{} presented a different identity than when paired; pair again if the laptop was reset",
-            laptop.addr
+            "{} presented a different identity than when paired; pair again if the initiator was reset",
+            initiator.addr
         )));
     }
     stream
@@ -146,7 +146,7 @@ async fn attach(
     }
 }
 
-/// Opens TLS to `addr`, returning the stream and the laptop's fingerprint for the caller to check.
+/// Opens TLS to `addr`, returning the stream and the initiator's fingerprint for the caller to check.
 async fn dial(
     identity: &Identity,
     addr: &str,
@@ -163,6 +163,6 @@ async fn dial(
     .map_err(|_| Error::Host(format!("timed out connecting to {addr}")))?
     .map_err(|err| Error::Host(format!("cannot connect to {addr}: {err}")))?;
     let fingerprint = tls::peer_fingerprint(stream.get_ref().1.peer_certificates())
-        .ok_or_else(|| Error::Invalid("the laptop presented no certificate".to_owned()))?;
+        .ok_or_else(|| Error::Invalid("the initiator presented no certificate".to_owned()))?;
     Ok((frame::framed(stream), fingerprint))
 }

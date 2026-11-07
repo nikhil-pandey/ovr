@@ -6,7 +6,7 @@ source of truth for behaviour; read it before changing anything user-visible.
 ## Layout
 
 - `crates/ovr`: the CLI. Snapshots the tree and hands the run to the local `ovrd`.
-- `crates/ovrd`: the server. Laptop-side host connections, and the agent that runs on hosts.
+- `crates/ovrd`: the server. Initiator-side host connections, and the agent that runs on hosts.
 - `crates/ovr-proto`: what both binaries share: the wire format, running `git`, where files live, and finding and
   starting the local `ovrd`.
 

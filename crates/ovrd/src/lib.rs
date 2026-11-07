@@ -1,4 +1,4 @@
-//! `ovrd`: the laptop server and the host agent for `ovr`.
+//! `ovrd`: the initiator server and the host agent for `ovr`.
 
 pub mod agent;
 mod autostart;
@@ -29,7 +29,7 @@ pub struct Cli {
 pub enum Command {
     /// Print a one-shot command for a host that must dial in.
     Pair,
-    /// On a host: pair with the laptop at ADDR, then keep serving it. Without arguments, serve a paired laptop.
+    /// On a host: pair with the initiator at ADDR, then keep serving it. Without arguments, serve a paired initiator.
     Connect {
         /// Address printed by `ovrd pair`.
         #[arg(requires = "code")]
@@ -44,6 +44,9 @@ pub enum Command {
     /// Serve runs over stdin and stdout; started by `ovrd` over SSH.
     #[command(hide = true)]
     Agent,
+    /// Keep the run in DIR: own its command and log, and serve attached clients; started by the agent.
+    #[command(hide = true)]
+    Keep { dir: std::path::PathBuf },
 }
 
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
@@ -93,6 +96,7 @@ pub async fn run(cli: Cli) -> Result<(), Error> {
         }) => host::pair(&addr, &code).await,
         Some(Command::Connect { .. }) => host::serve().await,
         Some(Command::Agent) => Ok(agent::serve_stdio().await?),
+        Some(Command::Keep { dir }) => agent::keeper::main(dir).await,
     }
 }
 

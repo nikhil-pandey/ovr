@@ -2,12 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 
-/// `HELLO`: first frame of a run. `base` is the snapshot the client believes the host already has.
+/// `HELLO`: first frame of a new run. `base` is the snapshot the client believes the host already has.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
-    pub repo: String,
+    /// The host's checkout for this initiator and local repository: `<repo>-<key>`.
+    pub checkout: String,
+    /// Orders the snapshots of one local repository; a checkout never goes back to a lower one.
+    pub seq: u64,
     pub base: Option<String>,
     pub snapshot: String,
+    /// The initiator starting the run, whose runs `ovr ps` lists.
+    pub initiator: String,
 }
 
 /// `WELCOME`: the agent's answer to [`Hello`].
@@ -32,6 +37,61 @@ pub struct Exec {
     pub tty: bool,
     pub cols: u16,
     pub rows: u16,
+}
+
+/// `ATTACH`: first frame of a stream that resumes run `run`, with output from the given offsets onwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attach {
+    pub run: u64,
+    pub out: u64,
+    pub err: u64,
+}
+
+/// `ATTACHED`: the run's output follows from these offsets, which are later than requested when the log no longer
+/// holds the requested ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attached {
+    pub run: u64,
+    pub tty: bool,
+    pub out: u64,
+    pub err: u64,
+}
+
+/// `RUNS`: first frame of a stream that lists `initiator`'s runs; answered by [`RunList`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Runs {
+    pub initiator: String,
+}
+
+/// `RUN_LIST`: runs on a host, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunList {
+    pub runs: Vec<RunInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunInfo {
+    pub run: u64,
+    pub checkout: String,
+    pub argv: Vec<String>,
+    /// Seconds since the Unix epoch.
+    pub started: u64,
+    pub state: RunState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunState {
+    Running,
+    Exited {
+        code: i32,
+    },
+    /// The command could not be started.
+    Failed {
+        message: String,
+    },
+    /// The keeper died without recording how the command ended.
+    Lost,
 }
 
 /// `RESIZE`: the client's terminal changed size.
@@ -70,10 +130,12 @@ pub struct Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Op {
-    /// Open a run on `host`. After [`Response::Opened`] the socket carries the agent session verbatim.
+    /// Open a stream to `host`'s agent. After [`Response::Opened`] the socket carries it verbatim.
     Open { host: String },
     /// List paired hosts.
     Hosts,
+    /// List hosts with an open connection: dialed-in hosts that are online and SSH hosts in use.
+    Connected,
     /// Issue a pairing code.
     Pair,
 }
@@ -82,9 +144,15 @@ pub enum Op {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Response {
-    Opened,
+    /// `initiator` identifies this initiator to hosts.
+    Opened {
+        initiator: String,
+    },
     Hosts {
         hosts: Vec<HostStatus>,
+    },
+    Connected {
+        hosts: Vec<String>,
     },
     Pair {
         addr: String,
@@ -136,7 +204,7 @@ pub struct Pair {
     pub mac: String,
 }
 
-/// `PAIR_OK`: the laptop proves it knows the code too.
+/// `PAIR_OK`: the initiator proves it knows the code too.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairOk {
     pub mac: String,

@@ -66,3 +66,38 @@ fn daemon_help() -> String {
     );
     format!("is ovrd installed next to ovr? {log} has details")
 }
+
+/// Opens a stream to `host`'s agent, returning it with this initiator's identity.
+///
+/// # Errors
+///
+/// Returns an error when `ovrd` or the host cannot be reached.
+pub async fn open(host: &str) -> Result<(Resumed<ClientStream>, String), Error> {
+    let op = Op::Open {
+        host: host.to_owned(),
+    };
+    match request(op).await? {
+        (stream, Response::Opened { initiator }) => Ok((stream, initiator)),
+        (_, other) => Err(unexpected(other)),
+    }
+}
+
+/// Hosts with an open connection.
+///
+/// # Errors
+///
+/// Returns an error when `ovrd` cannot be reached.
+pub async fn connected() -> Result<Vec<String>, Error> {
+    match request(Op::Connected).await? {
+        (_, Response::Connected { hosts }) => Ok(hosts),
+        (_, other) => Err(unexpected(other)),
+    }
+}
+
+/// The error for a response other than the one asked for: `ovrd`'s failure, or a confused `ovrd`.
+pub fn unexpected(response: Response) -> Error {
+    match response {
+        Response::Failed { message } => Error::Host(message),
+        other => Error::Host(format!("unexpected response from ovrd: {other:?}")),
+    }
+}

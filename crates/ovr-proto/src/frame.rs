@@ -28,6 +28,9 @@ pub enum FrameKind {
     Interrupt = 4,
     Pack = 5,
     In = 6,
+    Attach = 7,
+    Kill = 8,
+    Runs = 9,
 
     // Agent to client.
     Welcome = 16,
@@ -37,12 +40,14 @@ pub enum FrameKind {
     Exit = 20,
     Error = 21,
     Consumed = 22,
+    Attached = 23,
+    RunList = 24,
 
     // `ovr` to the local `ovrd`.
     Request = 32,
     Response = 33,
 
-    // Host to laptop `ovrd`, before multiplexing starts.
+    // Host to initiator `ovrd`, before multiplexing starts.
     Banner = 48,
     Accept = 49,
     Pair = 50,
@@ -54,8 +59,9 @@ impl TryFrom<u8> for FrameKind {
 
     fn try_from(byte: u8) -> Result<Self, Error> {
         use FrameKind::{
-            Accept, Banner, Consumed, Err, Error as Fail, Exec, Exit, Hello, In, Interrupt, Out,
-            Pack, Pair, PairOk, Request, Resize, Response, Synced, Welcome,
+            Accept, Attach, Attached, Banner, Consumed, Err, Error as Fail, Exec, Exit, Hello, In,
+            Interrupt, Kill, Out, Pack, Pair, PairOk, Request, Resize, Response, RunList, Runs,
+            Synced, Welcome,
         };
         Ok(match byte {
             1 => Hello,
@@ -64,6 +70,9 @@ impl TryFrom<u8> for FrameKind {
             4 => Interrupt,
             5 => Pack,
             6 => In,
+            7 => Attach,
+            8 => Kill,
+            9 => Runs,
             16 => Welcome,
             17 => Synced,
             18 => Out,
@@ -71,6 +80,8 @@ impl TryFrom<u8> for FrameKind {
             20 => Exit,
             21 => Fail,
             22 => Consumed,
+            23 => Attached,
+            24 => RunList,
             32 => Request,
             33 => Response,
             48 => Banner,
@@ -293,12 +304,12 @@ mod tests {
 
     #[tokio::test]
     async fn resume_keeps_bytes_sent_behind_a_handshake() -> Result<(), Error> {
-        let (laptop, host) = tokio::io::duplex(1024);
-        let mut laptop = framed(laptop);
-        laptop.send(Frame::empty(FrameKind::Accept)).await?;
-        let mut laptop = resume(laptop);
-        laptop.write_all(b"multiplexed").await?;
-        laptop.shutdown().await?;
+        let (initiator, host) = tokio::io::duplex(1024);
+        let mut initiator = framed(initiator);
+        initiator.send(Frame::empty(FrameKind::Accept)).await?;
+        let mut initiator = resume(initiator);
+        initiator.write_all(b"multiplexed").await?;
+        initiator.shutdown().await?;
 
         let mut host = framed(host);
         let accept = host.next().await.transpose()?;
