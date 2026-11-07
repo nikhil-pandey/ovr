@@ -1,7 +1,10 @@
-//! The agent: `ovrd` on a host, serving runs from the laptop over a multiplexed connection.
+//! The agent: `ovrd` on a host, serving runs from the initiator over a multiplexed connection.
 
 pub mod checkout;
+pub mod keeper;
+mod log;
 pub mod process;
+pub mod runs;
 pub mod session;
 
 use std::io;
@@ -18,15 +21,19 @@ use tokio_util::codec::FramedWrite;
 use crate::mux::Incoming;
 pub use process::Shell;
 
-/// Where checkouts live and how commands start.
+/// Where checkouts and runs live and how commands start.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub root: PathBuf,
+    pub runs: PathBuf,
     pub shell: Shell,
+    /// The `ovrd` that keeps runs, as `ovrd keep`; `None` keeps them in this process, which only tests want, since
+    /// runs then end with it.
+    pub keeper: Option<PathBuf>,
 }
 
 impl Config {
-    /// `~/ovr` on Unix or `C:\ovr` on Windows, and the user's shell.
+    /// `~/ovr` on Unix or `C:\ovr` on Windows, the runs directory, the user's shell, and this `ovrd` as keeper.
     ///
     /// # Errors
     ///
@@ -41,12 +48,14 @@ impl Config {
         };
         Ok(Self {
             root,
+            runs: ovr_proto::paths::runs_dir()?,
             shell: Shell::detect(),
+            keeper: Some(std::env::current_exe()?),
         })
     }
 }
 
-/// What this host tells the laptop when it connects.
+/// What this host tells the initiator when it connects.
 #[must_use]
 pub fn banner() -> Banner {
     Banner {
@@ -67,8 +76,7 @@ pub fn hostname() -> String {
         .to_ascii_lowercase()
 }
 
-/// Serves runs over `stream` until the laptop closes it, then ends the runs still in progress, killing their
-/// commands, before returning.
+/// Serves streams over `stream` until the initiator closes it. Runs carry on with their keepers.
 pub async fn serve<S>(stream: S, config: Arc<Config>)
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,

@@ -93,7 +93,8 @@ mod platform {
             dir.join(format!("{NAME}.service")),
             format!(
                 "[Unit]\nDescription=ovr host agent\nAfter=network-online.target\n\n\
-                 [Service]\nExecStart=\"{}\" connect --service\nRestart=always\nRestartSec=5\n\n\
+                 [Service]\nExecStart=\"{}\" connect --service\nRestart=always\nRestartSec=5\n\
+                 KillMode=process\n\n\
                  [Install]\nWantedBy=default.target\n",
                 exe.display()
             ),

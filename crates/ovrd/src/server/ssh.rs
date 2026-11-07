@@ -16,7 +16,7 @@ use tokio::process::{Child, Command};
 use crate::mux::{Channel, Mux};
 use crate::{Error, target};
 
-/// An agent connection is closed after this long without runs.
+/// An agent connection is closed after this long without streams; runs carry on without it.
 const IDLE: Duration = Duration::from_mins(10);
 
 /// Covers slow logins, e.g. through a jump host or with a second factor already cached.
@@ -99,6 +99,24 @@ impl Pool {
         connection.usage.active.fetch_add(1, Ordering::SeqCst);
         let lease = Lease(Arc::clone(&connection.usage));
         Ok((connection.mux.open().await?, lease))
+    }
+}
+
+impl Pool {
+    /// Destinations with an open connection, in order.
+    pub fn connected(&self) -> Vec<String> {
+        let hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut names: Vec<String> = hosts
+            .iter()
+            .filter(|(_, slot)| {
+                // A slot being connected right now is not open yet.
+                slot.try_lock()
+                    .is_ok_and(|slot| slot.as_ref().is_some_and(|c| !c.mux.is_closed()))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
     }
 }
 
@@ -285,7 +303,7 @@ async fn binary_for(target: &str) -> Result<PathBuf, Error> {
     Ok(binary)
 }
 
-/// `curl URL | tar -xz ovrd`, with the tools every supported laptop ships.
+/// `curl URL | tar -xz ovrd`, with the tools every supported initiator ships.
 async fn download(url: &str, dir: &Path) -> Result<(), Error> {
     let failed = |what: &str| Error::Host(format!("cannot download {url}: {what}"));
     let mut curl = Command::new("curl")

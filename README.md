@@ -3,11 +3,11 @@
 Run your builds over there.
 
 ```sh
-ovr bigbox cargo test
-ovr winbox dotnet build
+ovr bigbox -- cargo test
+ovr winbox -- dotnet build
 ```
 
-`ovr HOST CMD...` runs `CMD` on another machine against your local, uncommitted working tree and streams the output
+`ovr HOST -- CMD...` runs `CMD` on another machine against your local, uncommitted working tree and streams the output
 back. No configuration.
 
 Status: early development. See [docs/DESIGN.md](docs/DESIGN.md).
