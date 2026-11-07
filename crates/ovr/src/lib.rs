@@ -1,9 +1,9 @@
 //! `ovr`: run a command on another machine against the local working tree.
 
-pub mod daemon;
-pub mod session;
-pub mod snapshot;
-pub mod terminal;
+mod daemon;
+mod session;
+mod snapshot;
+mod terminal;
 
 use std::io;
 

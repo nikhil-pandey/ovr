@@ -1,5 +1,6 @@
 //! The agent half of a run; see the client half in `ovr`'s `session` module for the sequence.
 
+use std::collections::VecDeque;
 use std::path::Path;
 
 use ovr_proto::FrameKind;
@@ -14,6 +15,10 @@ use super::process::{Event, Process};
 use crate::Error;
 
 type Frames = mpsc::Receiver<Result<Frame, ovr_proto::Error>>;
+
+/// Input a command has not consumed yet that is held here while frames keep being read, so that interrupts and a
+/// vanished client are still noticed. Beyond this, frames stop being read and the client is pushed back.
+const INPUT_BACKLOG: usize = 1024 * 1024;
 
 /// Serves one run on `stream`, reporting failures to the client as `ERROR`.
 pub async fn serve<S>(stream: S, config: &Config)
@@ -57,8 +62,16 @@ async fn run<W: AsyncWrite + Unpin>(
     let exec: Exec = next(frames).await?.expect(FrameKind::Exec)?;
 
     let _lock = checkout.lock().await?;
-    checkout.apply(&hello.snapshot).await?;
+    let warning = checkout.apply(&hello.snapshot).await?;
     frame::write(writer, FrameKind::Synced, &[]).await?;
+    if let Some(warning) = warning {
+        frame::write(
+            writer,
+            FrameKind::Err,
+            format!("ovr: {warning}\n").as_bytes(),
+        )
+        .await?;
+    }
     let cwd = checkout.cwd(&exec.cwd)?;
     let code = execute(writer, frames, config, &exec, &cwd).await?;
     checkout.collect_garbage();
@@ -104,27 +117,30 @@ async fn execute<W: AsyncWrite + Unpin>(
             exec.argv.first().map_or("shell", |p| p)
         ))
     })?;
-    // Input waiting for the command to accept it; frames are not read meanwhile, which pushes back on the client.
-    let mut pending: Option<Vec<u8>> = None;
+    let mut backlog = Backlog::default();
     loop {
+        if backlog.eof && backlog.chunks.is_empty() {
+            process.close_input();
+        }
         let input = process.input().cloned();
         tokio::select! {
             event = process.next() => match event {
                 Some(Event::Stdout(data)) => frame::write(writer, FrameKind::Out, &data).await?,
                 Some(Event::Stderr(data)) => frame::write(writer, FrameKind::Err, &data).await?,
                 Some(Event::Exit(code)) => return Ok(code),
+                Some(Event::Lost(err)) => return Err(Error::Invalid(format!("lost track of the command: {err}"))),
                 None => return Err(Error::Invalid("the command ended without a status".to_owned())),
             },
-            permit = reserve(input.as_ref()), if pending.is_some() => {
-                if let (Some(permit), Some(data)) = (permit, pending.take()) {
-                    permit.send(data);
-                }
-            }
-            frame = next(frames), if pending.is_none() => {
+            permit = reserve(input.as_ref()), if !backlog.chunks.is_empty() => match permit {
+                Some(permit) => permit.send(backlog.pop()),
+                // The command closed its input; whatever is left can never be delivered.
+                None => backlog = Backlog { eof: backlog.eof, ..Backlog::default() },
+            },
+            frame = next(frames), if backlog.bytes < INPUT_BACKLOG => {
                 let frame = frame?;
                 match frame.kind {
-                    FrameKind::In if frame.payload.is_empty() => process.close_input(),
-                    FrameKind::In => pending = Some(frame.payload),
+                    FrameKind::In if frame.payload.is_empty() => backlog.eof = true,
+                    FrameKind::In => backlog.push(frame.payload),
                     FrameKind::Resize => {
                         let Resize { cols, rows } = frame.parse()?;
                         process.resize(cols, rows);
@@ -134,6 +150,26 @@ async fn execute<W: AsyncWrite + Unpin>(
                 }
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct Backlog {
+    chunks: VecDeque<Vec<u8>>,
+    bytes: usize,
+    eof: bool,
+}
+
+impl Backlog {
+    fn push(&mut self, data: Vec<u8>) {
+        self.bytes += data.len();
+        self.chunks.push_back(data);
+    }
+
+    fn pop(&mut self) -> Vec<u8> {
+        let data = self.chunks.pop_front().unwrap_or_default();
+        self.bytes -= data.len();
+        data
     }
 }
 

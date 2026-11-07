@@ -200,7 +200,7 @@ allowed on the critical path. Every decision below exists to hit that.
  t0  ovr: snapshot: add -A, write-tree, commit-tree                    │
  t1  HELLO{repo, base, snapshot} ──────────────────────────────────────►┼─► agent: WELCOME{ok | need_full}
  t1  PACK frames (speculative, vs base) ──────────────────────────────►┼─► agent: index-pack as frames arrive
- t2  EXEC{argv, cwd, tty, cols, rows} ────────────────────────────────►┼─► agent: lock, read-tree, SYNCED, spawn
+ t2  EXEC{argv, cwd, tty, cols, rows} ────────────────────────────────►┼─► agent: lock, reset, SYNCED, spawn
      ◄── OUT/ERR frames ... ◄── EXIT{code} ────────────────────────────┘
 ```
 
@@ -220,16 +220,16 @@ allowed on the critical path. Every decision below exists to hit that.
 ### How the remote applies it
 
 1. `git index-pack --stdin --fix-thin` streams the pack straight into `.git/objects/pack/`.
-2. `git read-tree --reset -u <previous> <snapshot>` is a two-tree update: it touches only paths that differ
-   between the two snapshots, so a one-file edit rewrites one file and its mtime, and everything else keeps its
-   timestamps. Cargo, Bazel, and MSBuild see exactly the changed inputs. Deleted files are removed; `.gitignore`d
-   outputs are never touched because they are not in either tree. Edits made on the host to tracked files are
-   overwritten: the laptop is the source of truth.
-3. `refs/ovr/head` is updated to the snapshot; the previous one becomes unreachable. After `EXIT` is sent, the
+2. `git reset --hard <snapshot>` makes the snapshot `HEAD`. Git rewrites only files whose index entry or stat data
+   differ, so a one-file edit rewrites one file and its mtime, and everything else keeps its timestamps. Cargo,
+   Bazel, and MSBuild see exactly the changed inputs. Deleted files are removed; `.gitignore`d outputs are never
+   touched because they are not in either tree. Tracked files the host changed, for example a build rewriting a
+   lockfile, are restored even when the snapshot itself is unchanged: the laptop is the source of truth.
+3. Reflogs are off in the checkout, so the previous snapshot becomes unreachable at once. After `EXIT` is sent, the
    agent runs `git gc --auto` in the background so pack accumulation never lands on a run's critical path.
 
-The remote never runs `git clean`. The two-tree update already removes files that left the snapshot, and anything
-the build creates that is not ignored stays, exactly as it would locally.
+The remote never runs `git clean`. The reset already removes files that left the snapshot, and anything the build
+creates that is not tracked stays, exactly as it would locally.
 
 ### The wire
 
@@ -243,13 +243,18 @@ the build creates that is not ignored stays, exactly as it would locally.
 - PTY output is read in large chunks and forwarded as-is; no line buffering, no re-encoding. Build output
   throughput is bounded by the transport, which comfortably exceeds any terminal.
 - Backpressure is the stream's: the agent stops reading the PTY when the client is slow, so `yes | head` behaves.
+  After the command exits, output drains until the terminal or pipes have been idle for a second, so a slow client
+  gets everything while a leftover build server holding them open does not hang the run.
+- Input the command has not read yet is held by the agent up to 1 MiB while it keeps reading frames, so Ctrl-C and
+  a vanished client are noticed even when the command ignores its input.
 
 ### Checkout location
 
 The checkout lives at `~/ovr/<repo>` on Unix and `C:\ovr\<repo>` on Windows, where `<repo>` is the basename of
 the local repository root. The path is stable and short, so incremental state (`target/`, Bazel's output base,
-`obj/`) and path-keyed caches such as sccache stay valid across runs. Submodules and Git LFS content are fetched by
-the remote from `origin` with the remote user's credentials.
+`obj/`) and path-keyed caches such as sccache stay valid across runs. Submodules are fetched by the host from their
+URLs with the host user's credentials; the checkout has no `origin`, so relative submodule URLs do not resolve, and
+a failed update is shown as a warning before the command runs. Git LFS content is not sent.
 
 ## Agent
 

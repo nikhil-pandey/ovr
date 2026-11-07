@@ -3,9 +3,9 @@
 pub mod agent;
 mod autostart;
 mod host;
-pub mod mux;
+mod mux;
 mod pairing;
-pub mod server;
+mod server;
 mod state;
 mod target;
 mod tls;

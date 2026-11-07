@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -13,9 +13,10 @@ use ovr_proto::frame::CHUNK;
 use ovr_proto::msg::Exec;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
-/// How long output may keep draining after the command exits, for descendants still holding the terminal or pipes.
+/// Once the command exits, output keeps draining until nothing has arrived for this long. Descendants such as build
+/// servers may hold the terminal or pipes open indefinitely; a slow client, by contrast, never cuts output short.
 const DRAIN: Duration = Duration::from_secs(1);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -24,6 +25,8 @@ pub enum Event {
     Stderr(Vec<u8>),
     /// Always the last event, after all output.
     Exit(i32),
+    /// The command's status could not be collected; also the last event.
+    Lost(String),
 }
 
 /// How commands are started on this host.
@@ -95,7 +98,7 @@ pub struct Process {
     events: mpsc::Receiver<Event>,
     input: Option<mpsc::Sender<Vec<u8>>>,
     control: Control,
-    exited: Arc<AtomicBool>,
+    exited: watch::Receiver<bool>,
 }
 
 enum Control {
@@ -162,29 +165,37 @@ impl Process {
                 }
             });
         }
-        let stdout = child
-            .stdout
-            .take()
-            .map(|pipe| tokio::spawn(forward(pipe, events_tx.clone(), Event::Stdout)));
-        let stderr = child
-            .stderr
-            .take()
-            .map(|pipe| tokio::spawn(forward(pipe, events_tx.clone(), Event::Stderr)));
+        let (done, exited) = watch::channel(false);
+        let stdout = child.stdout.take().map(|pipe| {
+            tokio::spawn(forward(
+                pipe,
+                events_tx.clone(),
+                Event::Stdout,
+                exited.clone(),
+            ))
+        });
+        let stderr = child.stderr.take().map(|pipe| {
+            tokio::spawn(forward(
+                pipe,
+                events_tx.clone(),
+                Event::Stderr,
+                exited.clone(),
+            ))
+        });
 
         #[cfg(unix)]
         let pid = child.id();
-        let exited = Arc::new(AtomicBool::new(false));
-        let done = Arc::clone(&exited);
         tokio::spawn(async move {
-            let code = child.wait().await.map_or(1, exit_code);
-            done.store(true, Ordering::SeqCst);
-            let drained = async {
-                for task in [stdout, stderr].into_iter().flatten() {
-                    let _ = task.await;
-                }
+            let status = child.wait().await;
+            done.send_replace(true);
+            for task in [stdout, stderr].into_iter().flatten() {
+                let _ = task.await;
+            }
+            let last = match status {
+                Ok(status) => Event::Exit(exit_code(status)),
+                Err(err) => Event::Lost(err.to_string()),
             };
-            let _ = tokio::time::timeout(DRAIN, drained).await;
-            let _ = events_tx.send(Event::Exit(code)).await;
+            let _ = events_tx.send(last).await;
         });
 
         Ok(Self {
@@ -248,10 +259,17 @@ impl Process {
         });
         let (eof_tx, eof_rx) = oneshot::channel::<()>();
         let output = events_tx.clone();
+        let activity = Arc::new(Activity::default());
+        let reading = Arc::clone(&activity);
         std::thread::spawn(move || {
             let mut buf = vec![0; CHUNK];
             loop {
-                match reader.read(&mut buf) {
+                reading.waiting.store(true, Ordering::SeqCst);
+                let read = reader.read(&mut buf);
+                reading.waiting.store(false, Ordering::SeqCst);
+                reading.reads.fetch_add(1, Ordering::SeqCst);
+                match read {
+                    // EIO is how a Unix terminal reports that every process holding it has gone.
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         if output
@@ -266,15 +284,15 @@ impl Process {
             drop(eof_tx);
         });
 
-        let exited = Arc::new(AtomicBool::new(false));
-        let done = Arc::clone(&exited);
+        let (done, exited) = watch::channel(false);
         let closing = Arc::clone(&master);
         tokio::spawn(async move {
             let status = tokio::task::spawn_blocking(move || child.wait()).await;
-            done.store(true, Ordering::SeqCst);
-            let code = match status {
-                Ok(Ok(status)) => pty_exit_code(&status),
-                _ => 1,
+            done.send_replace(true);
+            let last = match status {
+                Ok(Ok(status)) => Event::Exit(pty_exit_code(&status)),
+                Ok(Err(err)) => Event::Lost(err.to_string()),
+                Err(err) => Event::Lost(err.to_string()),
             };
             // Closing the terminal ends the output stream once it is drained; ConPTY needs this to report EOF.
             let master = closing
@@ -282,8 +300,8 @@ impl Process {
                 .unwrap_or_else(PoisonError::into_inner)
                 .take();
             let _ = tokio::task::spawn_blocking(move || drop(master)).await;
-            let _ = tokio::time::timeout(DRAIN, eof_rx).await;
-            let _ = events_tx.send(Event::Exit(code)).await;
+            activity.drain(eof_rx).await;
+            let _ = events_tx.send(last).await;
         });
 
         Ok(Self {
@@ -356,7 +374,7 @@ impl Drop for Process {
     /// An abandoned run takes its whole process tree with it. Descendants of a command that exited normally, such as
     /// build servers, are left alone.
     fn drop(&mut self) {
-        if self.exited.load(Ordering::SeqCst) {
+        if *self.exited.borrow() {
             return;
         }
         match &mut self.control {
@@ -382,15 +400,55 @@ async fn forward<R: AsyncRead + Unpin>(
     mut pipe: R,
     events: mpsc::Sender<Event>,
     wrap: fn(Vec<u8>) -> Event,
+    mut exited: watch::Receiver<bool>,
 ) {
     let mut buf = vec![0; CHUNK];
     loop {
-        match pipe.read(&mut buf).await {
-            Ok(0) | Err(_) => return,
+        let read = tokio::select! {
+            read = pipe.read(&mut buf) => read,
+            () = async {
+                let _ = exited.wait_for(|exited| *exited).await;
+                tokio::time::sleep(DRAIN).await;
+            } => return,
+        };
+        match read {
+            Ok(0) => return,
+            Err(err) => {
+                tracing::warn!(%err, "reading command output failed");
+                return;
+            }
             Ok(n) => {
                 if events.send(wrap(buf[..n].to_vec())).await.is_err() {
                     return;
                 }
+            }
+        }
+    }
+}
+
+/// What the blocking terminal reader is doing, so draining can tell an idle terminal from a slow client.
+#[derive(Default)]
+struct Activity {
+    waiting: AtomicBool,
+    reads: AtomicU64,
+}
+
+impl Activity {
+    /// Waits for the terminal's end of output, or until one read has waited [`DRAIN`] without data.
+    async fn drain(&self, mut eof: oneshot::Receiver<()>) {
+        loop {
+            let (waiting, reads) = (
+                self.waiting.load(Ordering::SeqCst),
+                self.reads.load(Ordering::SeqCst),
+            );
+            if tokio::time::timeout(DRAIN, &mut eof).await.is_ok() {
+                return;
+            }
+            if waiting
+                && self.waiting.load(Ordering::SeqCst)
+                && self.reads.load(Ordering::SeqCst) == reads
+            {
+                return;
             }
         }
     }

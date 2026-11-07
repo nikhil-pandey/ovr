@@ -9,9 +9,6 @@ use tokio::process::{Child, ChildStdin, Command};
 
 use crate::Error;
 
-/// Ref holding the snapshot currently checked out.
-const HEAD: &str = "refs/ovr/head";
-
 pub struct Checkout {
     dir: PathBuf,
 }
@@ -35,6 +32,8 @@ impl Checkout {
         if !dir.join(".git").is_dir() {
             tokio::fs::create_dir_all(&dir).await?;
             git(&dir, &["init", "-q"]).await?;
+            // Without reflogs, superseded snapshots become garbage as soon as the next one is checked out.
+            git(&dir, &["config", "core.logAllRefUpdates", "false"]).await?;
             if cfg!(windows) {
                 git(&dir, &["config", "core.longpaths", "true"]).await?;
             }
@@ -93,50 +92,33 @@ impl Checkout {
         .await?
     }
 
-    /// Updates the working tree to `snapshot`, touching only the paths that differ from the previous snapshot.
-    /// Local changes on the host are overwritten: the laptop is the source of truth.
+    /// Checks out `snapshot` as `HEAD`. Only files whose content differs are rewritten, so unchanged files keep
+    /// their timestamps; tracked files changed on the host are restored: the laptop is the source of truth.
+    ///
+    /// Returns a warning for the client when submodules could not be updated.
     ///
     /// # Errors
     ///
     /// Returns an error when `snapshot` is missing or Git fails.
-    pub async fn apply(&self, snapshot: &str) -> Result<(), Error> {
+    pub async fn apply(&self, snapshot: &str) -> Result<Option<String>, Error> {
         if !self.has_commit(snapshot).await {
             return Err(Error::Invalid(format!(
                 "snapshot {snapshot} did not arrive"
             )));
         }
-        let previous = git(
+        git(&self.dir, &["reset", "--hard", "-q", snapshot]).await?;
+        if !self.dir.join(".gitmodules").is_file() {
+            return Ok(None);
+        }
+        // Submodules come from their remotes with the host's credentials.
+        let updated = git(
             &self.dir,
-            &["rev-parse", "-q", "--verify", &format!("{HEAD}^{{commit}}")],
+            &["submodule", "update", "--init", "--recursive", "-q"],
         )
-        .await
-        .ok()
-        .map(|previous| previous.trim().to_owned());
-        match previous.as_deref() {
-            Some(previous) if previous == snapshot => {}
-            Some(previous) => git(
-                &self.dir,
-                &["read-tree", "--reset", "-u", previous, snapshot],
-            )
-            .await
-            .map(drop)?,
-            None => git(&self.dir, &["read-tree", "--reset", "-u", snapshot])
-                .await
-                .map(drop)?,
-        }
-        git(&self.dir, &["update-ref", HEAD, snapshot]).await?;
-        if self.dir.join(".gitmodules").is_file() {
-            // Submodules come from their remotes with the host's credentials; a failure is the build's to report.
-            if let Err(err) = git(
-                &self.dir,
-                &["submodule", "update", "--init", "--recursive", "-q"],
-            )
-            .await
-            {
-                tracing::warn!(%err, "submodule update failed");
-            }
-        }
-        Ok(())
+        .await;
+        Ok(updated
+            .err()
+            .map(|err| format!("submodules were not updated: {err}")))
     }
 
     /// Resolves the client's working directory, given relative to the repository root.

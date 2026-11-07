@@ -69,7 +69,13 @@ fn forward_stdin(tx: &mpsc::Sender<Input>) {
     let mut buf = vec![0; 16 * 1024];
     loop {
         match stdin.read(&mut buf) {
-            Ok(0) | Err(_) => {
+            Ok(0) => {
+                let _ = tx.blocking_send(Input::Eof);
+                return;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => {
+                eprintln!("ovr: reading stdin failed: {err}");
                 let _ = tx.blocking_send(Input::Eof);
                 return;
             }

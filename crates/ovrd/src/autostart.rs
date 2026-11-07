@@ -86,6 +86,7 @@ mod platform {
     pub fn install(exe: &Path) -> io::Result<()> {
         let config = std::env::var_os("XDG_CONFIG_HOME")
             .map(std::path::PathBuf::from)
+            .filter(|dir| dir.is_absolute())
             .map_or_else(
                 || ovr_proto::home_dir().map(|home| home.join(".config")),
                 Ok,

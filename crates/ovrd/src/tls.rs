@@ -26,7 +26,8 @@ pub struct Identity {
 }
 
 impl Identity {
-    /// Loads the identity from `dir`, creating it on first use.
+    /// Loads the identity from `dir`, creating it on first use. An identity that exists but cannot be read is an
+    /// error rather than a reason to replace it, which would silently invalidate every pairing.
     ///
     /// # Errors
     ///
@@ -35,7 +36,18 @@ impl Identity {
         let (cert_path, key_path) = (dir.join("identity.der"), dir.join("identity.key"));
         let (cert, key) = match (std::fs::read(&cert_path), std::fs::read(&key_path)) {
             (Ok(cert), Ok(key)) => (cert, key),
-            _ => generate(&cert_path, &key_path)?,
+            (Err(cert), Err(key))
+                if cert.kind() == io::ErrorKind::NotFound
+                    && key.kind() == io::ErrorKind::NotFound =>
+            {
+                generate(&cert_path, &key_path)?
+            }
+            (Err(err), _) | (_, Err(err)) => {
+                return Err(io::Error::new(
+                    err.kind(),
+                    format!("cannot load the identity in {}: {err}", dir.display()),
+                ));
+            }
         };
         Ok(Self {
             fingerprint: fingerprint(&cert),

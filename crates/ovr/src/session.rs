@@ -310,6 +310,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restores_tracked_files_the_host_changed() -> Result<(), Error> {
+        let repo = repo()?;
+        let host = tempfile::tempdir()?;
+        ovr(
+            repo.path(),
+            "",
+            host.path(),
+            "echo edited > src/main.rs; rm src/gone.rs",
+            b"",
+        )
+        .await?;
+
+        let run = ovr(
+            repo.path(),
+            "",
+            host.path(),
+            "cat src/main.rs src/gone.rs; git cat-file -t HEAD",
+            b"",
+        )
+        .await?;
+        assert_eq!((run.code, run.stdout.as_str()), (0, "v1\nbye\ncommit\n"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn resends_everything_when_the_host_lost_its_checkout() -> Result<(), Error> {
         let repo = repo()?;
         let host = tempfile::tempdir()?;
