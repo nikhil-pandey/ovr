@@ -165,7 +165,22 @@ where
             if !synced {
                 delivery.forget().await;
             }
-            Err(err)
+            Err(reason(&mut stream.frames, err).await)
+        }
+    }
+}
+
+/// A host that fails stops reading and closes the stream right after saying why, so a write that failed meanwhile
+/// is reported as the host's reason when it gave one.
+async fn reason<S: AsyncRead>(frames: &mut Reader<S>, err: Error) -> Error {
+    if !matches!(err, Error::Protocol(ovr_proto::Error::Io(_))) {
+        return err;
+    }
+    loop {
+        match next(frames).await {
+            Ok(_) => {}
+            Err(remote @ Error::Remote(_)) => return remote,
+            Err(_) => return err,
         }
     }
 }
