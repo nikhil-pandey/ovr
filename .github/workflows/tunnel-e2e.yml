@@ -1,12 +1,23 @@
 name: Tunnel e2e
 
 # An initiator on one runner opens a Cloudflare quick tunnel; hosts on Linux, macOS, and Windows runners dial in
-# through it, and the initiator syncs real repositories to each host and builds them there.
+# through it, and the initiator syncs real repositories to all three at once and builds or runs them there. The
+# job summary reports each runner's specs and every step's time; `.github/e2e/e2e.py` does the work.
 #
-# Quick tunnel addresses are random, so the jobs meet through this run's artifacts: each host uploads a public key,
-# the initiator answers with `ovrd connect` arguments encrypted to it, and uploads `finished` at the end.
+# Quick tunnel addresses are random, so the jobs meet through this run's artifacts: each host uploads its specs and a
+# public key, the initiator answers with `ovrd connect` arguments encrypted to each key, and uploads `finished` at
+# the end.
 on:
   workflow_dispatch:
+    inputs:
+      tier:
+        description: "standard: four repositories, built on each host. large: adds llvm-project, chromium, and a generated repository, synced and checked on each host."
+        type: choice
+        options: [standard, large]
+        default: standard
+      synthetic-gib:
+        description: Size of the generated repository in the large tier, in GiB
+        default: "10"
   schedule:
     - cron: "17 4 * * *"
 
@@ -21,8 +32,12 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   GH_TOKEN: ${{ github.token }}
+  PYTHONUNBUFFERED: "1"
+  TIER: ${{ inputs.tier || 'standard' }}
   # renovate: datasource=github-releases depName=cloudflare/cloudflared
   CLOUDFLARED_VERSION: 2026.10.7
+  # renovate: datasource=pypi depName=uv
+  UV_VERSION: 0.13.7
 
 defaults:
   run:
@@ -31,9 +46,15 @@ defaults:
 jobs:
   initiator:
     runs-on: ubuntu-26.04
-    timeout-minutes: 120
+    timeout-minutes: 330
+    env:
+      RUNS_ON: ubuntu-26.04
+      REPOS: /mnt/e2e
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -42,76 +63,47 @@ jobs:
           cargo build --release --locked -p ovr -p ovrd
           echo "$GITHUB_WORKSPACE/target/release" >>"$GITHUB_PATH"
       - run: .github/e2e/install-cloudflared.sh
-      - name: Clone the repositories to build
-        run: |
-          for repo in BurntSushi/ripgrep rust-lang/cargo tokio-rs/tokio bazelbuild/examples; do
-            git clone --quiet --depth 1 "https://github.com/$repo" "$RUNNER_TEMP/repos/${repo#*/}" &
-          done
-          wait
-          du -sh "$RUNNER_TEMP"/repos/*
+      # The repositories go on the runner's larger scratch disk.
+      - run: sudo mkdir -p "$REPOS" && sudo chown "$USER" "$REPOS"
+      - run: uv run .github/e2e/e2e.py specs --role initiator --disk "$REPOS" --out specs/initiator/specs.json
+      - name: Prepare the repositories
+        run: uv run .github/e2e/e2e.py prepare --tier "$TIER" --synthetic-gib "${{ inputs.synthetic-gib || '10' }}" --dir "$REPOS"
       - name: Pair the hosts
-        run: |
-          # Every key first: a pairing code expires ten minutes after it is issued.
-          for os in linux macos windows; do .github/e2e/await.sh "key-$os" "keys/$os" 1800; done
-          mkdir pairs
-          for os in linux macos windows; do
-            read -r addr code < <(ovrd pair cloudflare | sed -n 's/^ *ovrd connect //p')
-            [[ -n $code ]] || { echo "ovrd pair printed no connect command" >&2; exit 1; }
-            printf '%s %s\n' "$addr" "$code" |
-              openssl pkeyutl -encrypt -pubin -inkey "keys/$os/key.pub" -pkeyopt rsa_padding_mode:oaep -out "pairs/$os"
-          done
+        run: uv run .github/e2e/e2e.py pair
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pairs
           path: pairs
           retention-days: 1
       - name: Wait for the hosts to dial in
-        run: |
-          deadline=$((SECONDS + 600))
-          until ovr hosts >hosts.txt &&
-            grep -q ' online   linux/' hosts.txt && grep -q ' online   macos/' hosts.txt && grep -q ' online   windows/' hosts.txt; do
-            ((SECONDS < deadline)) || { cat hosts.txt; exit 1; }
-            sleep 5
-          done
-          cat hosts.txt
-      - name: Sync and build on every host
-        run: |
-          declare -A pids
-          mkdir logs
-          for os in linux macos windows; do
-            host=$(awk -v os="$os/" '$2 == "online" && index($3, os) == 1 { print $1 }' hosts.txt)
-            .github/e2e/builds.sh "$host" "$RUNNER_TEMP/repos" "results-$os.md" >"logs/$os.log" 2>&1 &
-            pids[$os]=$!
-          done
-          status=0
-          for os in linux macos windows; do
-            code=0
-            wait "${pids[$os]}" || code=$?
-            ((code == 0)) || status=1
-            {
-              echo "## $os host"
-              printf '| Step | Time | Exit |\n|---|---|---|\n'
-              cat "results-$os.md"
-            } >>"$GITHUB_STEP_SUMMARY"
-            echo "::notice::$os host: $(wc -l <"results-$os.md") steps, exit $code"
-          done
-          for os in linux macos windows; do
-            echo "=== $os ==="
-            cat "logs/$os.log"
-          done
-          exit $status
+        run: uv run .github/e2e/e2e.py hosts
+      - name: Sync and run on every host
+        run: uv run .github/e2e/e2e.py bench
+      - if: always()
+        name: Report
+        run: uv run .github/e2e/e2e.py report
       - if: always()
         name: Close the tunnel
         run: |
           mkdir -p finished && echo finished >finished/finished
           ovrd tunnel close cloudflare || true
-          cat ~/.local/state/ovr/*.log || true
+          mkdir -p logs && cp ~/.local/state/ovr/*.log logs/ 2>/dev/null || true
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: finished
           path: finished
           retention-days: 1
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: report
+          path: |
+            report.md
+            *.json
+            specs
+            logs
+          if-no-files-found: ignore
 
   host:
     name: host (${{ matrix.name }})
@@ -123,9 +115,14 @@ jobs:
           - { name: macos, os: macos-26 }
           - { name: windows, os: windows-2025-vs2026 }
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 150
+    timeout-minutes: 350
+    env:
+      RUNS_ON: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -134,26 +131,27 @@ jobs:
           cargo build --release --locked -p ovrd
           echo "$GITHUB_WORKSPACE/target/release" >>"$GITHUB_PATH"
       - run: .github/e2e/install-cloudflared.sh
-      - name: Make a key the initiator can encrypt to
+      # Checkouts go to the larger scratch disk on Linux; deep trees need long paths on Windows.
+      - if: runner.os == 'Linux'
+        run: sudo mkdir -p /mnt/ovr && sudo chown "$USER" /mnt/ovr && ln -s /mnt/ovr ~/ovr
+      - if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+      - name: Publish specs and a key the initiator can encrypt to
         run: |
           mkdir -p "$RUNNER_TEMP/key" key
           openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/key/key.pem"
           openssl pkey -in "$RUNNER_TEMP/key/key.pem" -pubout -out key/key.pub
+          uv run .github/e2e/e2e.py specs --role "${{ matrix.name }} host" --out key/specs.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: key-${{ matrix.name }}
           path: key
           retention-days: 1
-      - name: Serve the initiator until it is done
-        run: |
-          .github/e2e/await.sh pairs pairs 1800
-          read -r addr code < <(openssl pkeyutl -decrypt -inkey "$RUNNER_TEMP/key/key.pem" \
-            -pkeyopt rsa_padding_mode:oaep -in "pairs/${{ matrix.name }}")
-          [[ -n $code ]] || { echo "no pairing for ${{ matrix.name }}" >&2; exit 1; }
-          ovrd connect "$addr" "$code" --foreground >host.log 2>&1 &
-          pid=$!
-          status=0
-          .github/e2e/await.sh finished finished 6000 "$pid" || status=$?
-          kill "$pid" 2>/dev/null || true
-          cat host.log
-          exit $status
+      - name: Serve the initiator until it has finished
+        run: uv run .github/e2e/e2e.py serve --os "${{ matrix.name }}" --key "$RUNNER_TEMP/key/key.pem"
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: host-log-${{ matrix.name }}
+          path: ovrd.log
+          if-no-files-found: ignore
