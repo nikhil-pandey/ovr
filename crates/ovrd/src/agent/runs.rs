@@ -161,11 +161,8 @@ impl Run {
             return Ok(RunState::Running);
         }
         #[cfg(unix)]
-        if let Some(group) = pid.and_then(|pid| pid.trim().parse::<i32>().ok()) {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(group),
-                nix::sys::signal::Signal::SIGKILL,
-            );
+        if let Some(group) = pid.and_then(|pid| pid.trim().parse().ok()) {
+            super::process::kill_group(group);
         }
         self.end(&Ended::Lost)?;
         Ok(RunState::Lost)
@@ -306,4 +303,64 @@ fn read<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     write_private(path, &serde_json::to_vec(value).map_err(io::Error::other)?)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+    use super::*;
+
+    fn meta(initiator: &str) -> Meta {
+        Meta {
+            initiator: initiator.to_owned(),
+            checkout: "repo-1".to_owned(),
+            dir: PathBuf::from("/"),
+            cwd: PathBuf::from("/"),
+            exec: Exec {
+                argv: vec!["sleep".to_owned(), "30".to_owned()],
+                cwd: String::new(),
+                tty: false,
+                cols: 80,
+                rows: 24,
+            },
+            started: now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn runs_without_a_keeper_are_lost_and_their_commands_killed() -> Result<(), Error> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::new(dir.path().to_owned());
+        let run = store.create(&meta("me")).await?;
+        store.create(&meta("someone else")).await?;
+        assert_eq!(
+            run.state()?,
+            RunState::Running,
+            "a keeper may still be starting"
+        );
+
+        let mut command = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()?;
+        run.started(Some(command.id()))?;
+        let keeper = git::lock(run.lock_path()).await?;
+        assert_eq!(run.state()?, RunState::Running, "the keeper holds the run");
+
+        drop(keeper);
+        assert_eq!(run.state()?, RunState::Lost);
+        assert_eq!(command.wait()?.signal(), Some(9), "what was left is killed");
+        assert_eq!(run.ended()?, Some(Ended::Lost));
+
+        let listed = store.list("me")?;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|info| (info.run, &info.state))
+                .collect::<Vec<_>>(),
+            [(run.id, &RunState::Lost)]
+        );
+        Ok(())
+    }
 }

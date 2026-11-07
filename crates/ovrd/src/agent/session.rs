@@ -194,7 +194,11 @@ where
 {
     let up = async {
         loop {
-            kept_writer.send(next(frames).await?).await?;
+            let frame = next(frames).await?;
+            if kept_writer.send(frame).await.is_err() {
+                // The keeper is done; its last frames, or its end, finish the relay.
+                return std::future::pending().await;
+            }
         }
     };
     let down = async {

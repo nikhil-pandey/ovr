@@ -218,11 +218,8 @@ impl Drop for Process {
         match &self.control {
             #[cfg(unix)]
             Control::Pipe { group, .. } | Control::Pty { group, .. } => {
-                if let Some(group) = group.and_then(|pid| i32::try_from(pid).ok()) {
-                    let _ = nix::sys::signal::killpg(
-                        nix::unistd::Pid::from_raw(group),
-                        nix::sys::signal::Signal::SIGKILL,
-                    );
+                if let Some(group) = *group {
+                    kill_group(group);
                 }
             }
             // The job also kills its processes when its last handle closes, should the waiting task go first.
@@ -640,6 +637,29 @@ impl Activity {
                 return;
             }
         }
+    }
+}
+
+/// Kills process group `group`. Signalling a group is not atomic: a member that dies first can wake its parent,
+/// which then forks before its own signal arrives. So the group is stopped first, which wakes nobody, then killed,
+/// and signalled again briefly, off this thread, until it is gone.
+#[cfg(unix)]
+pub fn kill_group(group: u32) {
+    use nix::sys::signal::{Signal, killpg};
+    let Ok(group) = i32::try_from(group) else {
+        return;
+    };
+    let group = nix::unistd::Pid::from_raw(group);
+    let _ = killpg(group, Signal::SIGSTOP);
+    if killpg(group, Signal::SIGKILL).is_ok() {
+        std::thread::spawn(move || {
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(5));
+                if killpg(group, Signal::SIGKILL).is_err() {
+                    return;
+                }
+            }
+        });
     }
 }
 
