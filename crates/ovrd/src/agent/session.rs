@@ -3,6 +3,8 @@
 //! A stream starts a run (`HELLO`), resumes one (`ATTACH`), or lists runs (`RUNS`). Once a run has started, the
 //! agent only relays frames between the client and the run's keeper, so the stream's end never ends the run.
 
+use std::time::Instant;
+
 use futures::{SinkExt, StreamExt};
 use ovr_proto::frame::{self, Reader, Writer};
 use ovr_proto::msg::{Attach, Attached, Exec, Failure, Hello, RunList, Runs, Welcome};
@@ -98,11 +100,20 @@ async fn start<S: AsyncRead + AsyncWrite>(
         // The speculative pack is useless without its base; skip it and its EXEC.
         while next(frames).await?.kind != FrameKind::Exec {}
     }
-    receive_pack(frames, &checkout).await?;
+    let received = Instant::now();
+    let bytes = receive_pack(frames, &checkout).await?;
     let exec: Exec = next(frames).await?.expect(FrameKind::Exec)?;
 
+    let applying = Instant::now();
     let warning = checkout.apply(&hello.snapshot, hello.seq).await?;
     writer.send(Frame::empty(FrameKind::Synced)).await?;
+    tracing::info!(
+        checkout = hello.checkout,
+        bytes,
+        receive_ms = (applying - received).as_millis(),
+        apply_ms = applying.elapsed().as_millis(),
+        "synced"
+    );
     if let Some(warning) = warning {
         writer
             .send(Frame::new(FrameKind::Err, format!("ovr: {warning}\n")))
@@ -121,12 +132,13 @@ async fn start<S: AsyncRead + AsyncWrite>(
     Ok(run)
 }
 
-/// Indexes pack frames as they arrive, until the empty end-of-pack frame.
+/// Indexes pack frames as they arrive, until the empty end-of-pack frame, and returns the pack's size.
 async fn receive_pack<S: AsyncRead>(
     frames: &mut Reader<S>,
     checkout: &Checkout,
-) -> Result<(), Error> {
+) -> Result<u64, Error> {
     let mut indexer = None;
+    let mut bytes = 0;
     loop {
         let frame = next(frames).await?;
         if frame.kind != FrameKind::Pack {
@@ -135,6 +147,7 @@ async fn receive_pack<S: AsyncRead>(
         if frame.payload.is_empty() {
             break;
         }
+        bytes += frame.payload.len() as u64;
         let indexer = match &mut indexer {
             Some(indexer) => indexer,
             None => indexer.insert(checkout.index_pack()?),
@@ -144,10 +157,10 @@ async fn receive_pack<S: AsyncRead>(
             break;
         }
     }
-    match indexer {
-        Some(indexer) => indexer.finish().await,
-        None => Ok(()),
+    if let Some(indexer) = indexer {
+        indexer.finish().await?;
     }
+    Ok(bytes)
 }
 
 /// Relays between the client and the run's keeper or, once the run has ended, replays its log from disk.
