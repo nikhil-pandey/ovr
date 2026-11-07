@@ -45,24 +45,28 @@ class Repo:
     tier: str
     workdir: str = ""  # where commands run, relative to the repository root
     build: list[str] = field(default_factory=list)
+    build_gib: float = 0  # roughly what building leaves on the host's disk
     status: bool = False  # also time `git status` on the host, for large trees
 
 
 REPOS = [
-    Repo("ripgrep", "https://github.com/BurntSushi/ripgrep", "standard", build=["cargo", "build"]),
-    Repo("cargo", "https://github.com/rust-lang/cargo", "standard", build=["cargo", "build"]),
-    Repo("tokio", "https://github.com/tokio-rs/tokio", "standard", build=["cargo", "build"]),
+    Repo("ripgrep", "https://github.com/BurntSushi/ripgrep", "standard", build=["cargo", "build"], build_gib=1),
+    Repo("cargo", "https://github.com/rust-lang/cargo", "standard", build=["cargo", "build"], build_gib=4),
+    Repo("tokio", "https://github.com/tokio-rs/tokio", "standard", build=["cargo", "build"], build_gib=1),
     Repo(
         "examples",
         "https://github.com/bazelbuild/examples",
         "standard",
         workdir="cpp-tutorial/stage3",
         build=["bazel", "build", "//main:hello-world"],
+        build_gib=1,
     ),
     Repo("llvm-project", "https://github.com/llvm/llvm-project", "large", status=True),
     Repo("chromium", "https://github.com/chromium/chromium", "large", status=True),
     Repo("synthetic", None, "large", status=True),
 ]
+# Left free on every host, for the runner itself and for estimates that fall short.
+RESERVE = 8 * GIB
 STEPS = ["first sync", "sync, nothing changed", "sync, one file added", "git status on host", "build", "build again"]
 
 
@@ -470,6 +474,21 @@ async def measure_pack(root: Path) -> tuple[int, float]:
     return size, time.monotonic() - start
 
 
+def drop_gitlinks(root: Path) -> int:
+    """Commits the tree without submodules, which the host would otherwise clone from their own remotes, so that a
+    sync measures ovr rather than those servers. Returns how many there were."""
+    listing = run(["git", "ls-tree", "-r", "-z", "HEAD"], cwd=root)
+    links = [entry.split("\t", 1)[1] for entry in listing.split("\0") if entry.startswith("160000 commit ")]
+    if not links:
+        return 0
+    paths = [*links, ".gitmodules"] if (root / ".gitmodules").exists() else links
+    for at in range(0, len(paths), 1000):
+        run(["git", "rm", "-rq", "--cached", "--ignore-unmatch", "--", *paths[at : at + 1000]], cwd=root)
+    identity = ["-c", "user.name=e2e", "-c", "user.email=e2e@localhost"]
+    run(["git", *identity, "commit", "-qm", "e2e: drop submodules"], cwd=root)
+    return len(links)
+
+
 def cmd_prepare(args: argparse.Namespace) -> None:
     base = Path(args.dir)
     base.mkdir(parents=True, exist_ok=True)
@@ -479,8 +498,11 @@ def cmd_prepare(args: argparse.Namespace) -> None:
         root = base / repo.name
         say("initiator", f"preparing [bold]{repo.name}[/]")
         start = time.monotonic()
+        dropped = 0
         if repo.url:
             await arun(["git", "clone", "--quiet", "--depth", "1", repo.url, str(root)])
+            if dropped := await asyncio.to_thread(drop_gitlinks, root):
+                say("initiator", f"dropped {dropped:,} submodules from [bold]{repo.name}[/]")
         else:
             await asyncio.to_thread(make_synthetic, root, int(args.synthetic_gib * GIB))
         setup = time.monotonic() - start
@@ -497,6 +519,7 @@ def cmd_prepare(args: argparse.Namespace) -> None:
             "files": files,
             "pack_bytes": pack,
             "pack_seconds": pack_seconds,
+            "submodules_dropped": dropped,
         }
 
     async def main() -> list[dict]:
@@ -527,8 +550,11 @@ def cmd_hosts(args: argparse.Namespace) -> None:
         time.sleep(5)
 
 
-async def ovr(os_name: str, host: str, repo: dict, step: str, argv: list[str], logs: Path) -> tuple[int, float, str]:
-    """Runs `ovr HOST -- argv` in the repository, streaming its output; returns its exit code, time, and output."""
+async def ovr(
+    os_name: str, host: str, repo: dict, step: str, argv: list[str], logs: Path, timeout: float
+) -> tuple[int | str, float, str]:
+    """Runs `ovr HOST -- argv` in the repository, streaming its output; returns its exit code, or `timeout` when it
+    was killed for taking longer than `timeout` seconds, its time, and its output."""
     cwd = Path(repo["path"]) / repo["workdir"]
     prefix = f"{repo['name']}: {step}"
     say(os_name, f"[bold]{escape(prefix)}[/]: $ ovr {host} -- {escape(' '.join(argv))}")
@@ -546,36 +572,51 @@ async def ovr(os_name: str, host: str, repo: dict, step: str, argv: list[str], l
     )
     assert child.stdout is not None
     lines = []
-    with log.open("w") as out:
-        while line := await child.stdout.readline():
-            text = line.decode(errors="replace").rstrip("\r\n")
-            out.write(text + "\n")
-            lines.append(text)
-            raw(os_name, prefix, text)
-    code = await child.wait()
+
+    async def relay() -> int:
+        assert child.stdout is not None
+        with log.open("w") as out:
+            while line := await child.stdout.readline():
+                text = line.decode(errors="replace").rstrip("\r\n")
+                out.write(text + "\n")
+                lines.append(text)
+                raw(os_name, prefix, text)
+        return await child.wait()
+
+    code: int | str
+    try:
+        code = await asyncio.wait_for(relay(), timeout)
+    except TimeoutError:
+        child.kill()
+        await child.wait()
+        code = "timeout"
     elapsed = time.monotonic() - start
     style = "green" if code == 0 else "red"
     say(os_name, f"[bold]{escape(prefix)}[/]: [{style}]exit {code} after {duration(elapsed)}[/]")
     return code, elapsed, "\n".join(lines)
 
 
-async def bench_host(os_name: str, host: str, repos: list[dict], free: int, logs: Path) -> list[dict]:
-    results = []
+async def bench_host(
+    os_name: str, host: str, repos: list[dict], free: int, logs: Path, results: list[dict], save, timeout: float
+) -> None:
+    free -= RESERVE
     for repo in repos:
         row = {"os": os_name, "host": host, "repo": repo["name"], "steps": {}, "ok": True}
         results.append(row)
-        # The host keeps the pack and the checkout, plus some slack for git's own files.
-        need = int(repo["pack_bytes"] * 1.1 + repo["tree_bytes"] + GIB)
+        # The host keeps the pack, the checkout and its index with filesystem overhead, and what a build leaves.
+        need = int(repo["pack_bytes"] * 1.1 + repo["tree_bytes"] * 1.2 + repo["files"] * 512 + repo["build_gib"] * GIB)
         if need > free:
-            row["skipped"] = f"needs ~{gib(need)}, {gib(free)} free"
+            row["skipped"] = f"needs ~{gib(need)}, {gib(max(free, 0))} to spare"
             say(os_name, f"skipping [bold]{repo['name']}[/]: {row['skipped']}")
+            save()
             continue
         free -= need
 
         async def step(name: str, argv: list[str], repo: dict = repo, row: dict = row) -> tuple[int, str]:
-            code, elapsed, output = await ovr(os_name, host, repo, name, argv, logs)
+            code, elapsed, output = await ovr(os_name, host, repo, name, argv, logs, timeout)
             row["steps"][name] = {"seconds": elapsed, "code": code}
             row["ok"] &= code == 0
+            save()
             return code, output
 
         await step("first sync", ["git", "--version"])
@@ -588,12 +629,12 @@ async def bench_host(os_name: str, host: str, repos: list[dict], free: int, logs
         if code == 0 and want not in output:
             row["ok"] = False
             row["steps"]["sync, one file added"]["code"] = "content differs"
+            save()
         if repo["status"]:
             await step("git status on host", ["git", "status", "--short", "--untracked-files=no"])
         if repo["build"]:
             await step("build", repo["build"])
             await step("build again", repo["build"])
-    return results
 
 
 async def follow_file(who: str, prefix: str, path: Path) -> None:
@@ -627,19 +668,28 @@ def cmd_bench(args: argparse.Namespace) -> None:
         for os_name in OSES
     }
 
-    async def main() -> list[dict]:
+    out = Path(args.out)
+    results: list[dict] = []
+
+    def save() -> None:
+        """Records every result so far, so a run cut short still has a report."""
+        out.write_text(json.dumps(sorted(results, key=lambda row: OSES.index(row["os"])), indent=2))
+
+    async def main() -> None:
         daemon_log = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "ovr/ovrd.log"
         tail = asyncio.create_task(follow_file("initiator", "ovrd", daemon_log))
         try:
-            per_host = await asyncio.gather(
-                *(bench_host(os_name, hosts[os_name], repos, free[os_name], logs) for os_name in OSES)
+            await asyncio.gather(
+                *(
+                    bench_host(os_name, hosts[os_name], repos, free[os_name], logs, results, save, args.step_timeout)
+                    for os_name in OSES
+                )
             )
         finally:
             tail.cancel()
-        return [row for rows in per_host for row in rows]
 
-    results = asyncio.run(main())
-    Path(args.out).write_text(json.dumps(results, indent=2))
+    asyncio.run(main())
+    save()
     failed = [f"{row['os']}/{row['repo']}" for row in results if not row["ok"]]
     if failed:
         raise SystemExit(f"failed: {', '.join(failed)}")
@@ -670,22 +720,26 @@ def cmd_report(args: argparse.Namespace) -> None:
         ),
     ]
 
-    md += ["", "## Runners", "", "| | " + " | ".join(specs) + " |", "|---|" + "---|" * len(specs)]
-    rows = [
-        ("Label", lambda s: s["label"]),
-        ("Image", lambda s: s["image"]),
-        ("OS", lambda s: f"{s['os']} ({s['arch']})"),
-        ("CPU", lambda s: s["cpu"]),
-        ("Cores", lambda s: f"{s['cores_logical']} logical, {s['cores_physical']} physical"),
-        ("Memory", lambda s: gib(s["memory_bytes"])),
-        ("Disk free", lambda s: f"{gib(s['disk_free_bytes'])} of {gib(s['disk_total_bytes'])} at `{s['disk_path']}`"),
-        ("git", lambda s: s["tools"]["git"]),
-        ("cargo", lambda s: s["tools"]["cargo"]),
-        ("bazel", lambda s: s["tools"]["bazel"]),
-        ("cloudflared", lambda s: s["tools"]["cloudflared"]),
-    ]
-    for label, get in rows:
-        md.append(f"| {label} | " + " | ".join(str(get(s)) for s in specs.values()) + " |")
+    if specs:
+        md += ["", "## Runners", "", "| | " + " | ".join(specs) + " |", "|---|" + "---|" * len(specs)]
+        rows = [
+            ("Label", lambda s: s["label"]),
+            ("Image", lambda s: s["image"]),
+            ("OS", lambda s: f"{s['os']} ({s['arch']})"),
+            ("CPU", lambda s: s["cpu"]),
+            ("Cores", lambda s: f"{s['cores_logical']} logical, {s['cores_physical']} physical"),
+            ("Memory", lambda s: gib(s["memory_bytes"])),
+            (
+                "Disk free",
+                lambda s: f"{gib(s['disk_free_bytes'])} of {gib(s['disk_total_bytes'])} at `{s['disk_path']}`",
+            ),
+            ("git", lambda s: s["tools"]["git"]),
+            ("cargo", lambda s: s["tools"]["cargo"]),
+            ("bazel", lambda s: s["tools"]["bazel"]),
+            ("cloudflared", lambda s: s["tools"]["cloudflared"]),
+        ]
+        for label, get in rows:
+            md.append(f"| {label} | " + " | ".join(str(get(s)) for s in specs.values()) + " |")
 
     md += [
         "",
@@ -699,6 +753,16 @@ def cmd_report(args: argparse.Namespace) -> None:
             f"| {repo['name']} | {gib(repo['tree_bytes'])} | {repo['files']:,} | {gib(repo['pack_bytes'])} | "
             f"{duration(repo['pack_seconds'])} |"
         )
+    if dropped := [
+        f"{repo['name']} ({repo['submodules_dropped']:,})" for repo in repos if repo.get("submodules_dropped")
+    ]:
+        md += [
+            "",
+            (
+                f"Submodules were dropped from {', '.join(dropped)}: hosts would clone them from their own remotes, "
+                "which measures those servers rather than ovr."
+            ),
+        ]
 
     steps = [name for name in STEPS if any(name in row.get("steps", {}) for row in results)]
     for os_name in OSES:
@@ -770,7 +834,9 @@ def main() -> None:
 
     p = sub.add_parser("specs", help="record this runner's specs")
     p.add_argument("--role", required=True)
-    p.add_argument("--disk", default=str(checkout_root()), help="where to measure free disk")
+    p.add_argument(
+        "--disk", default=os.environ.get("OVR_DISK") or str(checkout_root()), help="where to measure free disk"
+    )
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_specs)
 
@@ -806,6 +872,7 @@ def main() -> None:
     p.add_argument("--specs", default="specs")
     p.add_argument("--logs", default="logs")
     p.add_argument("--out", default="results.json")
+    p.add_argument("--step-timeout", type=float, default=3600, help="seconds before a step is killed")
     p.set_defaults(func=cmd_bench)
 
     p = sub.add_parser("report", help="initiator: write the report and the job summary")
