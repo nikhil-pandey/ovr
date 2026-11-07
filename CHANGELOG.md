@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/nikhil-pandey/ovr/compare/v0.2.0...v0.2.1) - 2026-11-07
+
+### Added
+
+- tunnels, host address moves, foreground connect, and dial-in heartbeats ([#6](https://github.com/nikhil-pandey/ovr/pull/6))
+
 ## [0.2.0](https://github.com/nikhil-pandey/ovr/compare/v0.1.0...v0.2.0) - 2026-11-07
 
 ### Added
