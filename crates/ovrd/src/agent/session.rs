@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
 
 use super::Config;
-use super::checkout::Checkout;
+use super::checkout::{self, Checkout};
 use super::keeper;
 use super::log::{Progress, Stream, Tail};
 use super::runs::{self, Meta, Run, Store};
@@ -60,7 +60,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite>(
     let store = Store::new(config.runs.clone());
     match first.kind {
         FrameKind::Hello => {
-            let run = start(writer, frames, config, &store, first.parse()?).await?;
+            let (run, _claim) = start(writer, frames, config, &store, first.parse()?).await?;
             let attach = Attach {
                 run: run.id,
                 out: 0,
@@ -70,7 +70,10 @@ async fn dispatch<S: AsyncRead + AsyncWrite>(
         }
         FrameKind::Attach => {
             let attach: Attach = first.parse()?;
-            attach_to(writer, frames, &store.open(attach.run)?, attach).await
+            let run = store.open(attach.run)?;
+            let meta = run.meta()?;
+            let _claim = checkout::claim(&config.root, &meta.initiator, &meta.checkout).await?;
+            attach_to(writer, frames, &run, attach).await
         }
         FrameKind::Runs => {
             let Runs { initiator } = first.parse()?;
@@ -96,14 +99,14 @@ async fn dispatch<S: AsyncRead + AsyncWrite>(
     }
 }
 
-/// Syncs the checkout, records the run, and starts its keeper.
+/// Syncs the checkout, records the run, and starts its keeper; the checkout stays claimed until the claim is dropped.
 async fn start<S: AsyncRead + AsyncWrite>(
     writer: &mut Writer<S>,
     frames: &mut Reader<S>,
     config: &Config,
     store: &Store,
     hello: Hello,
-) -> Result<Run, Error> {
+) -> Result<(Run, Option<std::fs::File>), Error> {
     let checkout = Checkout::open(&config.root, &hello.initiator, &hello.checkout).await?;
     let welcome = match &hello.base {
         Some(base) if !checkout.has_commit(base).await => Welcome::NeedFull,
@@ -145,7 +148,7 @@ async fn start<S: AsyncRead + AsyncWrite>(
     };
     let run = store.create(&meta).await?;
     keeper::start(config, &run).await?;
-    Ok(run)
+    Ok((run, checkout.into_claim()))
 }
 
 /// Indexes pack frames as they arrive, until the empty end-of-pack frame, and returns the pack's size.

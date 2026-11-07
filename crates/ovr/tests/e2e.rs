@@ -467,6 +467,12 @@ fn cleans_hosts_and_this_machine_but_not_what_is_running() -> Result {
     assert!(!stale.exists());
 
     assert_eq!(world.run(&["kill", "box", &run])?.status.code(), Some(0));
+    // The keeper lets go of the run once it has told everyone attached how it ended.
+    let lock = std::fs::File::options()
+        .write(true)
+        .open(world.run_dir(&run).join("lock"))?;
+    wait_for("the keeper to exit", || lock.try_lock().is_ok())?;
+    drop(lock);
     let idle = text(&world.run(&["clean", "box"])?.stdout);
     assert!(
         idle.starts_with("box: removed 1 checkout, 1 run, 0 agents; freed ")

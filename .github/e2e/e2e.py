@@ -611,21 +611,39 @@ async def ovr(
     return code, elapsed, "\n".join(lines)
 
 
-async def bench_host(
-    os_name: str, host: str, repos: list[dict], free: int, logs: Path, results: list[dict], save, timeout: float
-) -> None:
+def plan(repos: list[dict], free: int) -> dict[str, str]:
+    """Why each repository that does not fit on a host with `free` bytes is skipped."""
     free -= RESERVE
+    skipped = {}
     for repo in repos:
-        row = {"os": os_name, "host": host, "repo": repo["name"], "steps": {}, "ok": True}
-        results.append(row)
         # The host keeps the pack, the checkout and its index with filesystem overhead, and what a build leaves.
         need = int(repo["pack_bytes"] * 1.1 + repo["tree_bytes"] * 1.2 + repo["files"] * 512 + repo["build_gib"] * GIB)
         if need > free:
-            row["skipped"] = f"needs ~{gib(need)}, {gib(max(free, 0))} to spare"
+            skipped[repo["name"]] = f"needs ~{gib(need)}, {gib(max(free, 0))} to spare"
+        else:
+            free -= need
+    return skipped
+
+
+async def bench_host(
+    os_name: str,
+    host: str,
+    repos: list[dict],
+    skipped: dict[str, str],
+    unchanged: dict[str, asyncio.Barrier],
+    logs: Path,
+    results: list[dict],
+    save,
+    timeout: float,
+) -> None:
+    for repo in repos:
+        row = {"os": os_name, "host": host, "repo": repo["name"], "steps": {}, "ok": True}
+        results.append(row)
+        if repo["name"] in skipped:
+            row["skipped"] = skipped[repo["name"]]
             say(os_name, f"skipping [bold]{repo['name']}[/]: {row['skipped']}")
             save()
             continue
-        free -= need
 
         async def step(name: str, argv: list[str], repo: dict = repo, row: dict = row) -> tuple[int, str]:
             code, elapsed, output = await ovr(os_name, host, repo, name, argv, logs, timeout)
@@ -636,6 +654,8 @@ async def bench_host(
 
         await step("first sync", ["git", "--version"])
         await step("sync, nothing changed", ["git", "--version"])
+        # Every host shares the working tree, so none adds its file until all have synced it unchanged.
+        await unchanged[repo["name"]].wait()
         # A new untracked file, checked by hash, proves the working tree arrives, not just what is committed.
         marker = Path(repo["path"]) / repo["workdir"] / f"ovr-e2e-{os_name}.txt"
         marker.write_text(secrets.token_hex(32))
@@ -678,8 +698,8 @@ def cmd_bench(args: argparse.Namespace) -> None:
     repos = json.loads(Path(args.repos).read_text())
     logs = Path(args.logs)
     logs.mkdir(parents=True, exist_ok=True)
-    free = {
-        os_name: json.loads((Path(args.specs) / os_name / "specs.json").read_text())["disk_free_bytes"]
+    skipped = {
+        os_name: plan(repos, json.loads((Path(args.specs) / os_name / "specs.json").read_text())["disk_free_bytes"])
         for os_name in OSES
     }
 
@@ -693,10 +713,24 @@ def cmd_bench(args: argparse.Namespace) -> None:
     async def main() -> None:
         daemon_log = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "ovr/ovrd.log"
         tail = asyncio.create_task(follow_file("initiator", "ovrd", daemon_log))
+        unchanged = {
+            repo["name"]: asyncio.Barrier(max(1, sum(repo["name"] not in skipped[os_name] for os_name in OSES)))
+            for repo in repos
+        }
         try:
             await asyncio.gather(
                 *(
-                    bench_host(os_name, hosts[os_name], repos, free[os_name], logs, results, save, args.step_timeout)
+                    bench_host(
+                        os_name,
+                        hosts[os_name],
+                        repos,
+                        skipped[os_name],
+                        unchanged,
+                        logs,
+                        results,
+                        save,
+                        args.step_timeout,
+                    )
                     for os_name in OSES
                 )
             )

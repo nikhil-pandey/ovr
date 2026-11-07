@@ -1,6 +1,7 @@
 //! Removing what runs leave behind on a host: checkouts, finished runs, and uploaded agents of other versions.
 //!
-//! A checkout is first moved into `<root>/.trash` and then deleted, so one that cannot be removed whole, for example
+//! Checkouts claimed by a sync or an attached client are left, with their runs, as are runs still running or whose
+//! keeper is still serving them. A checkout is first moved into `<root>/.trash` and then deleted, so one that cannot be removed whole, for example
 //! because a leftover build server on Windows holds a file open, is left as it was and reported as in use.
 
 use std::io;
@@ -36,8 +37,9 @@ pub fn clean(config: &Config, initiator: Option<&str>) -> Result<Cleaned, Error>
             .map(|(name, _)| name)
             .collect(),
     };
-    // Locked before looking for running runs: a sync records its run before letting go of its claim.
+    // Locked before looking at runs: a sync records its run before letting go of its claim.
     let mut claimed = Vec::new();
+    let mut in_use = Vec::new();
     for owner in owners {
         let locks = config.root.join(LOCKS).join(&owner);
         for (name, dir) in entries(&config.root.join(&owner))? {
@@ -52,7 +54,7 @@ pub fn clean(config: &Config, initiator: Option<&str>) -> Result<Cleaned, Error>
                 .open(locks.join(&name))?;
             match lock.try_lock() {
                 Ok(()) => claimed.push((format!("{owner}-{name}"), name, dir, lock)),
-                Err(std::fs::TryLockError::WouldBlock) => cleaned.kept.push(name),
+                Err(std::fs::TryLockError::WouldBlock) => in_use.push((dir, name)),
                 Err(std::fs::TryLockError::Error(err)) => return Err(err.into()),
             }
         }
@@ -64,7 +66,10 @@ pub fn clean(config: &Config, initiator: Option<&str>) -> Result<Cleaned, Error>
         if initiator.is_some_and(|initiator| initiator != meta.initiator) {
             continue;
         }
-        if run.state()? == RunState::Running {
+        // A finished run may still be serving its end to a client, or about to be attached to by the sync that
+        // started it.
+        let claimed = in_use.iter().any(|(dir, _)| meta.dir.starts_with(dir));
+        if claimed || run.kept()? || run.state()? == RunState::Running {
             busy.push(meta.dir);
             continue;
         }
@@ -72,6 +77,9 @@ pub fn clean(config: &Config, initiator: Option<&str>) -> Result<Cleaned, Error>
         cleaned.runs += 1;
     }
 
+    cleaned
+        .kept
+        .extend(in_use.into_iter().map(|(_, name)| name));
     for (trashed, name, dir, _lock) in claimed {
         let moved = trash.join(trashed);
         let removable = !busy.iter().any(|run| run.starts_with(&dir))
@@ -198,6 +206,11 @@ mod tests {
             .end(&Ended::Exited { code: 0 })?;
         // Recorded moments ago and not yet ended: still starting, so running.
         store.create(&meta("me", &running)).await?;
+        // Ended, but its keeper is still serving the end to a client.
+        let draining = synced(&config, "me", "draining").await?;
+        let drained = store.create(&meta("me", &draining)).await?;
+        drained.end(&Ended::Exited { code: 0 })?;
+        let keeper = ovr_proto::git::lock(drained.lock_path()).await?;
         store
             .create(&meta("you", &theirs))
             .await?
@@ -214,17 +227,26 @@ mod tests {
         mine.kept.sort();
         assert_eq!(
             (mine.checkouts, mine.runs, mine.agents, mine.kept),
-            (1, 1, 1, vec!["running".to_owned(), "syncing".to_owned()])
+            (
+                1,
+                1,
+                1,
+                vec![
+                    "draining".to_owned(),
+                    "running".to_owned(),
+                    "syncing".to_owned()
+                ]
+            )
         );
         assert!(mine.bytes > 0);
         assert!(!idle.exists() && running.exists() && theirs.exists());
         assert!(!old.exists() && current.exists());
 
-        drop(syncing);
+        drop((syncing, keeper));
         let everyone = clean(&config, None)?;
         assert_eq!(
             (everyone.checkouts, everyone.runs, everyone.kept),
-            (2, 1, vec!["running".to_owned()])
+            (3, 2, vec!["running".to_owned()])
         );
         assert!(running.exists() && !theirs.exists());
         Ok(())

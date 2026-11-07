@@ -10,13 +10,14 @@ use tokio::process::{ChildStdin, Command};
 
 use crate::Error;
 
-/// Where a sync's claim on a checkout lives, beside the owners' directories: `<root>/.locks/<owner>/<name>`.
+/// Where claims on checkouts live, beside the owners' directories: `<root>/.locks/<owner>/<name>`.
 pub const LOCKS: &str = ".locks";
 
 pub struct Checkout {
     dir: PathBuf,
-    /// Held shared while the checkout is synced, so cleaning leaves it alone.
-    _claim: Option<std::fs::File>,
+    /// Held shared while the checkout is synced or a client is attached to one of its runs, so cleaning leaves it
+    /// alone.
+    claim: Option<std::fs::File>,
 }
 
 impl Checkout {
@@ -27,19 +28,8 @@ impl Checkout {
     ///
     /// Returns an error for an invalid initiator or name, or when the repository cannot be created.
     pub async fn open(root: &Path, initiator: &str, name: &str) -> Result<Self, Error> {
-        let owner = owner(initiator)?;
-        let valid = !name.is_empty()
-            && name != "."
-            && name != ".."
-            && !name.contains(['/', '\\', ':', '\0'])
-            && !name.starts_with('-');
-        if !valid {
-            return Err(Error::Invalid(format!("invalid checkout name {name:?}")));
-        }
-        let locks = root.join(LOCKS).join(owner);
-        tokio::fs::create_dir_all(&locks).await?;
-        let claim = git::lock_shared(locks.join(name)).await?;
-        let dir = root.join(owner).join(name);
+        let claim = claim(root, initiator, name).await?;
+        let dir = root.join(owner(initiator)?).join(name);
         if !dir.join(".git").is_dir() {
             tokio::fs::create_dir_all(&dir).await?;
             git::run(&dir, &["init", "-q"]).await?;
@@ -51,14 +41,20 @@ impl Checkout {
         }
         Ok(Self {
             dir,
-            _claim: Some(claim),
+            claim: Some(claim),
         })
+    }
+
+    /// Hands the checkout's claim over to a caller that needs it for longer.
+    #[must_use]
+    pub fn into_claim(self) -> Option<std::fs::File> {
+        self.claim
     }
 
     /// The existing checkout in `dir`.
     #[must_use]
     pub fn at(dir: PathBuf) -> Self {
-        Self { dir, _claim: None }
+        Self { dir, claim: None }
     }
 
     #[must_use]
@@ -203,6 +199,27 @@ impl Indexer {
         drop(self.stdin);
         Ok(self.child.finish().await?)
     }
+}
+
+/// Claims `initiator`'s checkout `name` until the returned file is dropped, so that cleaning leaves it and its runs
+/// alone.
+///
+/// # Errors
+///
+/// Returns an error for an invalid initiator or name, or when the claim cannot be taken.
+pub async fn claim(root: &Path, initiator: &str, name: &str) -> Result<std::fs::File, Error> {
+    let owner = owner(initiator)?;
+    let valid = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\', ':', '\0'])
+        && !name.starts_with('-');
+    if !valid {
+        return Err(Error::Invalid(format!("invalid checkout name {name:?}")));
+    }
+    let locks = root.join(LOCKS).join(owner);
+    tokio::fs::create_dir_all(&locks).await?;
+    Ok(git::lock_shared(locks.join(name)).await?)
 }
 
 /// The directory holding `initiator`'s checkouts: a prefix of its fingerprint, short for Windows' path limits.

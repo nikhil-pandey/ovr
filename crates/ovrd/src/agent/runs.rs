@@ -124,6 +124,15 @@ impl Run {
         }
     }
 
+    /// Whether a keeper still holds the run, perhaps serving its last output after recording the end.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lock cannot be checked.
+    pub fn kept(&self) -> io::Result<bool> {
+        Ok(self.lock_unkept()?.is_none())
+    }
+
     /// The keeper's lock, when no keeper holds it.
     fn lock_unkept(&self) -> io::Result<Option<std::fs::File>> {
         let file = std::fs::File::options()

@@ -67,7 +67,9 @@ jobs:
       - run: sudo mkdir -p "$REPOS" && sudo chown "$USER" "$REPOS"
       - run: uv run .github/e2e/e2e.py specs --role initiator --disk "$REPOS" --out specs/initiator/specs.json
       - name: Prepare the repositories
-        run: uv run .github/e2e/e2e.py prepare --tier "$TIER" --synthetic-gib "${{ inputs.synthetic-gib || '10' }}" --dir "$REPOS"
+        env:
+          SYNTHETIC_GIB: ${{ inputs.synthetic-gib || '10' }}
+        run: uv run .github/e2e/e2e.py prepare --tier "$TIER" --synthetic-gib "$SYNTHETIC_GIB" --dir "$REPOS"
       - name: Pair the hosts
         run: uv run .github/e2e/e2e.py pair
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -372,10 +372,11 @@ a failed update is shown as a warning before the command runs. Git LFS content i
 Checkouts stay as a warm cache until removed; finished runs go after seven days. `ovr clean` removes them sooner and
 never touches what is in use:
 
-- A checkout being synced is claimed: the sync holds a shared lock on `<checkouts>/.locks/<owner>/<name>` until its
-  run is recorded. Cleaning takes that lock exclusively without waiting, so a checkout mid-sync is kept, and a sync
-  that starts meanwhile waits for the clean.
-- A checkout with a running run is kept, and so is the run.
+- A checkout being synced or watched is claimed: the stream holds a shared lock on
+  `<checkouts>/.locks/<owner>/<name>` from the start of a sync, and from an `ATTACH`, until it ends. Cleaning takes
+  that lock exclusively without waiting, so such a checkout is kept with its runs, and a sync that starts meanwhile
+  waits for the clean.
+- A run still running, or ended but with its keeper still serving the end to clients, is kept, with its checkout.
 - A checkout is moved into `<checkouts>/.trash` before it is deleted, so one that cannot be removed whole, such as on
   Windows while a leftover build server holds a file open, stays intact and is reported as in use. Whatever could not
   be deleted from the trash is retried by the next clean.
