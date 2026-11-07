@@ -1,6 +1,6 @@
 [package]
 name = "ovr-proto"
-description = "Wire protocol shared by ovr and ovrd"
+description = "Wire protocol and local IPC shared by ovr and ovrd"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,9 +8,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytes.workspace = true
+directories.workspace = true
+futures.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "process", "rt", "sync", "time"] }
+tokio-util = { workspace = true, features = ["codec"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

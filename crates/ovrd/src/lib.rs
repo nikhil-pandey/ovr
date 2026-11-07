@@ -1,4 +1,21 @@
+//! `ovrd`: the laptop server and the host agent for `ovr`.
+
+pub mod agent;
+mod autostart;
+mod host;
+mod mux;
+mod pairing;
+mod server;
+mod state;
+mod target;
+mod tls;
+
+use std::io;
+
 use clap::{Parser, Subcommand};
+use futures::{SinkExt, StreamExt};
+use ovr_proto::msg::{Op, Request, Response};
+use ovr_proto::{Frame, FrameKind, VERSION, frame, ipc};
 
 /// Server and host agent for `ovr`.
 #[derive(Debug, Parser)]
@@ -12,23 +29,52 @@ pub struct Cli {
 pub enum Command {
     /// Print a one-shot command for a host that must dial in.
     Pair,
-    /// Pair with the laptop at ADDR and keep serving it.
+    /// On a host: pair with the laptop at ADDR, then keep serving it. Without arguments, serve a paired laptop.
     Connect {
         /// Address printed by `ovrd pair`.
-        addr: String,
+        #[arg(requires = "code")]
+        addr: Option<String>,
         /// Pairing code printed by `ovrd pair`.
-        code: String,
+        #[arg(requires = "addr")]
+        code: Option<String>,
+        /// Started at login: log to a file and detach from the console.
+        #[arg(long, hide = true, conflicts_with = "addr")]
+        service: bool,
     },
-    /// Serve one run over stdin and stdout; started by `ovrd` over SSH.
+    /// Serve runs over stdin and stdout; started by `ovrd` over SSH.
     #[command(hide = true)]
     Agent,
 }
 
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum Error {
-    #[error("`{0}` is not implemented yet")]
-    #[diagnostic(code(ovrd::not_implemented))]
-    NotImplemented(&'static str),
+    #[error("{0}")]
+    #[diagnostic(code(ovrd::host))]
+    Host(String),
+
+    #[error("pairing failed: {0}")]
+    #[diagnostic(code(ovrd::pairing))]
+    Pairing(String),
+
+    #[error(transparent)]
+    #[diagnostic(code(ovrd::git))]
+    Git(#[from] ovr_proto::git::Error),
+
+    #[error("{0}")]
+    #[diagnostic(code(ovrd::invalid))]
+    Invalid(String),
+
+    #[error("the connection was closed")]
+    #[diagnostic(code(ovrd::disconnected))]
+    Disconnected,
+
+    #[error(transparent)]
+    #[diagnostic(code(ovrd::protocol))]
+    Protocol(#[from] ovr_proto::Error),
+
+    #[error(transparent)]
+    #[diagnostic(code(ovrd::io))]
+    Io(#[from] io::Error),
 }
 
 /// Runs the parsed command until it finishes.
@@ -36,12 +82,43 @@ pub enum Error {
 /// # Errors
 ///
 /// Returns an error when the server or agent fails.
-#[allow(clippy::unused_async)]
 pub async fn run(cli: Cli) -> Result<(), Error> {
     match cli.command {
-        None => Err(Error::NotImplemented("ovrd")),
-        Some(Command::Pair) => Err(Error::NotImplemented("ovrd pair")),
-        Some(Command::Connect { .. }) => Err(Error::NotImplemented("ovrd connect")),
-        Some(Command::Agent) => Err(Error::NotImplemented("ovrd agent")),
+        None => server::run().await,
+        Some(Command::Pair) => pair().await,
+        Some(Command::Connect {
+            addr: Some(addr),
+            code: Some(code),
+            ..
+        }) => host::pair(&addr, &code).await,
+        Some(Command::Connect { .. }) => host::serve().await,
+        Some(Command::Agent) => Ok(agent::serve_stdio().await?),
+    }
+}
+
+/// Asks the running server, started if needed, for a pairing code.
+async fn pair() -> Result<(), Error> {
+    let stream = ipc::connect_or_spawn(&std::env::current_exe()?).await?;
+    let mut stream = frame::framed(stream);
+    let request = Request {
+        version: VERSION.to_owned(),
+        op: Op::Pair,
+    };
+    stream
+        .send(Frame::json(FrameKind::Request, &request)?)
+        .await?;
+    let response: Response = stream
+        .next()
+        .await
+        .ok_or(Error::Disconnected)??
+        .expect(FrameKind::Response)?;
+    match response {
+        Response::Pair { addr, code } => {
+            println!("On the host, within 10 minutes, run:\n\n    ovrd connect {addr} {code}\n");
+            Ok(())
+        }
+        Response::Failed { message } => Err(Error::Host(message)),
+        Response::Restart => Err(Error::Host("ovrd was restarting; try again".to_owned())),
+        other => Err(Error::Host(format!("unexpected response: {other:?}"))),
     }
 }

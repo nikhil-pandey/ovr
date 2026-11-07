@@ -10,11 +10,20 @@ repository.workspace = true
 [dependencies]
 ovr-proto.workspace = true
 
+bytes.workspace = true
 clap = { workspace = true, features = ["derive"] }
 crossterm.workspace = true
+futures.workspace = true
 miette = { workspace = true, features = ["fancy"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt", "signal"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[dev-dependencies]
+ovrd.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

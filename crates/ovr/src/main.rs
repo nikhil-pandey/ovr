@@ -1,22 +1,28 @@
-use std::process::ExitCode;
-
 use clap::Parser;
 
-fn main() -> ExitCode {
+fn main() {
     let cli = match ovr::Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
             let code = if err.use_stderr() { ovr::FAILURE } else { 0 };
             let _ = err.print();
-            return ExitCode::from(code);
+            std::process::exit(code);
         }
     };
 
-    match ovr::run(&cli) {
-        Ok(code) => ExitCode::from(code),
-        Err(err) => {
+    let code = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(ovr::run(cli)).unwrap_or_else(|err| {
             eprintln!("{:?}", miette::Report::new(err));
-            ExitCode::from(ovr::FAILURE)
+            ovr::FAILURE
+        }),
+        Err(err) => {
+            eprintln!("ovr: {err}");
+            ovr::FAILURE
         }
-    }
+    };
+    // Exit without waiting for the stdin thread, which may be blocked in a read.
+    std::process::exit(code);
 }

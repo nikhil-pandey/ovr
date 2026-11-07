@@ -7,7 +7,8 @@ source of truth for behaviour; read it before changing anything user-visible.
 
 - `crates/ovr`: the CLI. Snapshots the tree and hands the run to the local `ovrd`.
 - `crates/ovrd`: the server. Laptop-side host connections, and the agent that runs on hosts.
-- `crates/ovr-proto`: the wire format shared by both.
+- `crates/ovr-proto`: what both binaries share: the wire format, running `git`, where files live, and finding and
+  starting the local `ovrd`.
 
 ## Principles
 
@@ -35,6 +36,10 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 bazel test //...
 ```
+
+The client tests in `crates/ovr/src/session.rs` run a real `ovrd` agent in-process against temporary repositories
+and need `git` on `PATH`. Platform-specific code (Windows Job Objects, ConPTY, named pipes) is only compiled on its
+platform; CI checks every released OS.
 
 ## Release
 
