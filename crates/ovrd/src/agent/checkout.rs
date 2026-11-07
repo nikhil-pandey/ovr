@@ -13,6 +13,9 @@ use crate::Error;
 /// Where claims on checkouts live, beside the owners' directories: `<root>/.locks/<owner>/<name>`.
 pub const LOCKS: &str = ".locks";
 
+/// In a checkout's Git directory: `<seq> <commit>` of the newest snapshot applied.
+const APPLIED: &str = "ovr-applied";
+
 pub struct Checkout {
     dir: PathBuf,
     /// Held shared while the checkout is synced or a client is attached to one of its runs, so cleaning leaves it
@@ -64,13 +67,14 @@ impl Checkout {
 
     /// Whether the object database has `commit` and therefore every object of that snapshot.
     pub async fn has_commit(&self, commit: &str) -> bool {
-        is_object_id(commit)
-            && git::run(
-                &self.dir,
-                &["cat-file", "-e", &format!("{commit}^{{commit}}")],
-            )
-            .await
-            .is_ok()
+        git::has_commit(&self.dir, commit).await
+    }
+
+    /// The newest snapshot applied here, if the checkout still has it: what a client lacking its base can send a
+    /// pack against instead.
+    pub async fn newest(&self) -> Option<String> {
+        let (_, commit) = applied(&self.dir.join(".git"))?;
+        self.has_commit(&commit).await.then_some(commit)
     }
 
     /// Starts `git index-pack` reading a pack from its stdin.
@@ -102,14 +106,7 @@ impl Checkout {
         }
         let git_dir = self.dir.join(".git");
         let _lock = git::lock(git_dir.join("ovr.lock")).await?;
-        let applied_path = git_dir.join("ovr-applied");
-        let applied = std::fs::read_to_string(&applied_path)
-            .ok()
-            .and_then(|text| {
-                let (seq, commit) = text.trim().split_once(' ')?;
-                Some((seq.parse::<u64>().ok()?, commit.to_owned()))
-            });
-        let (target, newest) = match applied {
+        let (target, newest) = match applied(&git_dir) {
             Some((newer, commit)) if newer > seq && self.has_commit(&commit).await => {
                 (commit, false)
             }
@@ -117,7 +114,7 @@ impl Checkout {
         };
         git::run(&self.dir, &["reset", "--hard", "-q", &target]).await?;
         if newest {
-            std::fs::write(&applied_path, format!("{seq} {snapshot}\n"))?;
+            std::fs::write(git_dir.join(APPLIED), format!("{seq} {snapshot}\n"))?;
         }
         if !self.dir.join(".gitmodules").is_file() {
             return Ok(None);
@@ -234,6 +231,9 @@ pub fn owner(initiator: &str) -> Result<&str, Error> {
     Ok(&initiator[..initiator.len().min(16)])
 }
 
-fn is_object_id(id: &str) -> bool {
-    matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit())
+/// The newest snapshot applied to the checkout whose Git directory is `git_dir`, and its number.
+fn applied(git_dir: &Path) -> Option<(u64, String)> {
+    let text = std::fs::read_to_string(git_dir.join(APPLIED)).ok()?;
+    let (seq, commit) = text.trim().split_once(' ')?;
+    Some((seq.parse().ok()?, commit.to_owned()))
 }

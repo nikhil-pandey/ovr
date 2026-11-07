@@ -149,7 +149,6 @@ where
     E: AsyncWrite + Unpin,
 {
     let mut stream = Stream::new(stream);
-    let mut synced = false;
     let started = async {
         let mut phase = Instant::now();
         sync(&mut stream, delivery, exec).await?;
@@ -159,7 +158,6 @@ where
                 FrameKind::Synced => {
                     tracing::debug!(elapsed = ?phase.elapsed(), "received SYNCED");
                     phase = Instant::now();
-                    synced = true;
                     delivery.synced().await?;
                     tracing::debug!(elapsed = ?phase.elapsed(), "recorded the acknowledged base");
                     phase = Instant::now();
@@ -180,12 +178,8 @@ where
     .await;
     match started {
         Ok(position) => Ok((stream, position)),
-        Err(err) => {
-            if !synced {
-                delivery.forget().await;
-            }
-            Err(reason(&mut stream.frames, err).await)
-        }
+        // The base stays: the host may have applied the snapshot anyway, and the next run's HELLO finds out.
+        Err(err) => Err(reason(&mut stream.frames, err).await),
     }
 }
 
@@ -280,9 +274,10 @@ pub async fn kill<S: AsyncRead + AsyncWrite>(stream: S, run: u64) -> Result<(), 
     }
 }
 
-/// Sends `HELLO`, a speculative thin pack, and `EXEC` without waiting, then repeats the pack in full if the host
-/// lacks the base. Everything after `HELLO` is sent while listening to the host, since a host that fails mid-sync
-/// says why and stops reading: waiting for it to read would hang.
+/// Sends `HELLO`, a speculative thin pack, and `EXEC` without waiting, then, if the host lacks the base, a pack
+/// against the snapshot it has instead, or a full one when this repository no longer has that. Everything after
+/// `HELLO` is sent while listening to the host, since a host that fails mid-sync says why and stops reading:
+/// waiting for it to read would hang.
 async fn sync<S: AsyncRead + AsyncWrite>(
     stream: &mut Stream<S>,
     delivery: &Delivery<'_>,
@@ -298,17 +293,21 @@ async fn sync<S: AsyncRead + AsyncWrite>(
         Some(welcome) => welcome,
         None => next(&mut stream.frames).await?.expect(FrameKind::Welcome)?,
     };
-    if welcome == Welcome::NeedFull {
-        tracing::debug!("the host needs the full snapshot");
+    if let Welcome::Rebase { have } = &welcome {
+        let base = match have {
+            Some(have) if delivery.has(have).await => Some(have.clone()),
+            _ => None,
+        };
+        tracing::debug!(?have, ?base, "the host lacks the base");
         let mut welcome = Some(welcome);
-        send_pack(stream, delivery, None, &mut welcome).await?;
+        send_pack(stream, delivery, base.as_deref(), &mut welcome).await?;
         send_heeding(stream, Frame::json(FrameKind::Exec, exec)?, &mut welcome).await?;
     }
     Ok(())
 }
 
 /// Streams a pack followed by the empty end-of-pack frame. A pack sent before the host's `WELCOME` is cut short
-/// once that says the host needs a full one.
+/// once that says the host lacks its base.
 async fn send_pack<S: AsyncRead + AsyncWrite>(
     stream: &mut Stream<S>,
     delivery: &Delivery<'_>,
@@ -322,7 +321,7 @@ async fn send_pack<S: AsyncRead + AsyncWrite>(
     if let Some(mut pack) = delivery.pack(base).await? {
         let mut buf = BytesMut::with_capacity(CHUNK);
         let complete = loop {
-            if speculative && *welcome == Some(Welcome::NeedFull) {
+            if speculative && matches!(welcome, Some(Welcome::Rebase { .. })) {
                 break false;
             }
             buf.reserve(CHUNK);
@@ -802,18 +801,108 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reports_remote_failures_without_recording_the_sync() -> Result<(), Error> {
+    async fn a_failed_sync_keeps_the_confirmed_base() -> Result<(), Error> {
         let repo = repo()?;
         let host = tempfile::tempdir()?;
+        ovr(repo.path(), "", host.path(), "true", b"").await?;
+        let confirmed = Snapshot::take(repo.path()).await?.commit;
         // A file where the checkout root should be.
         let blocked = host.path().join("blocker");
         std::fs::write(&blocked, "")?;
 
+        std::fs::write(repo.path().join("src/main.rs"), "v2\n")?;
         let err = ovr(repo.path(), "", &blocked, "true", b"").await.err();
         assert!(matches!(err, Some(Error::Remote(_))), "{err:?}");
         let snapshot = Snapshot::take(repo.path()).await?;
-        assert_eq!(snapshot.deliver_to("box", "me").await?.base, None);
+        let base = snapshot.deliver_to("box", "me").await?.base;
+        assert_eq!(base, Some(confirmed));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_host_missing_the_base_gets_a_pack_against_what_it_has() -> Result<(), Error> {
+        let repo = repo()?;
+        std::fs::write(repo.path().join("noise"), noise(1 << 20))?;
+        let host = tempfile::tempdir()?;
+        ovr(repo.path(), "", host.path(), "true", b"").await?;
+        let checkout = std::fs::read_dir(host.path().join("me"))?
+            .next()
+            .ok_or_else(|| Error::Host("no checkout".to_owned()))??
+            .path();
+        let full = packed(&checkout)?;
+
+        // A base the host never received, as when it collected the base after a lost SYNCED.
+        let main = repo.path().join("src/main.rs");
+        std::fs::write(&main, "elsewhere\n")?;
+        let unknown = Snapshot::take(repo.path()).await?.commit;
+        let host_ref = git(repo.path(), &["for-each-ref", "--format=%(refname)"]).await?;
+        let lose_base = ["update-ref", host_ref.as_str(), unknown.as_str()];
+
+        // The host already has this very snapshot: nothing is sent.
+        std::fs::write(&main, "v1\n")?;
+        git(repo.path(), &lose_base).await?;
+        let run = ovr(repo.path(), "", host.path(), "cat src/main.rs", b"").await?;
+        assert_eq!(run.stdout, "v1\n");
+        assert_eq!(packed(&checkout)?, full);
+
+        std::fs::write(&main, "v2\n")?;
+        git(repo.path(), &lose_base).await?;
+        let run = ovr(repo.path(), "", host.path(), "cat src/main.rs", b"").await?;
+        assert_eq!(run.stdout, "v2\n");
+        let thin = packed(&checkout)? - full;
+        assert!(
+            thin * 10 < full,
+            "{thin} bytes against what the host has, {full} in full"
+        );
+
+        // What the host has is gone from this repository: everything is sent again.
+        let tree = git(&checkout, &["rev-parse", "HEAD^{tree}"]).await?;
+        let pruned = git(&checkout, &["commit-tree", "-m", "pruned", &tree]).await?;
+        std::fs::write(checkout.join(".git/ovr-applied"), format!("0 {pruned}"))?;
+        std::fs::write(&main, "v3\n")?;
+        git(repo.path(), &lose_base).await?;
+        let before = packed(&checkout)?;
+        let run = ovr(repo.path(), "", host.path(), "cat src/main.rs", b"").await?;
+        assert_eq!(run.stdout, "v3\n");
+        assert!(packed(&checkout)? - before >= full, "a full pack is sent");
+        Ok(())
+    }
+
+    /// Bytes of packs in `checkout`.
+    fn packed(checkout: &Path) -> Result<u64, Error> {
+        let mut bytes = 0;
+        for entry in std::fs::read_dir(checkout.join(".git/objects/pack"))? {
+            let entry = entry?;
+            if entry.path().extension().is_some_and(|ext| ext == "pack") {
+                bytes += entry.metadata()?.len();
+            }
+        }
+        Ok(bytes)
+    }
+
+    async fn git(dir: &Path, args: &[&str]) -> Result<String, Error> {
+        let identity = [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        ]
+        .map(|key| (key, std::ffi::OsStr::new("ovr")));
+        let out = ovr_proto::git::run_env(dir, args, &identity).await?;
+        Ok(out.trim().to_owned())
+    }
+
+    /// Incompressible bytes, so a pack carrying them outgrows every buffer and cannot shrink.
+    fn noise(len: usize) -> Vec<u8> {
+        let mut state = 1u64;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                (state >> 56) as u8
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -1011,17 +1100,7 @@ mod tests {
     #[tokio::test]
     async fn a_host_that_fails_mid_pack_is_heard_instead_of_waited_on() -> Result<(), Error> {
         let repo = repo()?;
-        // Incompressible, so the pack outgrows every buffer between the two ends.
-        let mut state = 1u64;
-        let noise: Vec<u8> = (0..2 << 20)
-            .map(|_| {
-                state = state
-                    .wrapping_mul(6_364_136_223_846_793_005)
-                    .wrapping_add(1);
-                (state >> 56) as u8
-            })
-            .collect();
-        std::fs::write(repo.path().join("noise"), noise)?;
+        std::fs::write(repo.path().join("noise"), noise(2 << 20))?;
         let snapshot = Snapshot::take(repo.path()).await?;
         let delivery = snapshot.deliver_to("box", "me").await?;
 

@@ -109,13 +109,15 @@ async fn start<S: AsyncRead + AsyncWrite>(
 ) -> Result<(Run, Option<std::fs::File>), Error> {
     let checkout = Checkout::open(&config.root, &hello.initiator, &hello.checkout).await?;
     let welcome = match &hello.base {
-        Some(base) if !checkout.has_commit(base).await => Welcome::NeedFull,
+        Some(base) if !checkout.has_commit(base).await => Welcome::Rebase {
+            have: checkout.newest().await,
+        },
         _ => Welcome::Ok,
     };
     writer
         .send(Frame::json(FrameKind::Welcome, &welcome)?)
         .await?;
-    if welcome == Welcome::NeedFull {
+    if welcome != Welcome::Ok {
         // The speculative pack is useless without its base; skip it and its EXEC.
         while next(frames).await?.kind != FrameKind::Exec {}
     }

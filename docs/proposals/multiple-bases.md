@@ -1,6 +1,7 @@
 # Proposal: several delta bases per host
 
-Status: proposal; measure the benefit before implementation. Builds on [base recovery](base-recovery.md).
+Status: proposal; measure the benefit before implementation. Builds on
+[base recovery](../DESIGN.md#how-a-run-is-sequenced).
 
 ## Problem
 
@@ -33,7 +34,7 @@ branch-switching workload before accepting the additional retained state and pro
 ### Wire
 
 `HELLO.base: Option<String>` becomes `HELLO.bases: Vec<String>`, containing at most four distinct IDs.
-`PROTOCOL_VERSION` is bumped. If implemented alongside base recovery, both wire changes can share that bump.
+`PROTOCOL_VERSION` is bumped.
 
 ### Host
 
@@ -43,7 +44,7 @@ branch-switching workload before accepting the additional retained state and pro
 - Retained refs protect their objects from normal garbage collection. Eviction must also preserve any bases
   being used by an admitted transfer until its pack is indexed or the transfer ends.
 - The base check passes only when every listed base is present; otherwise the agent answers as in
-  [base recovery](base-recovery.md), naming its newest applied snapshot.
+  [base recovery](../DESIGN.md#how-a-run-is-sequenced), naming its newest applied snapshot.
 
 The two retained sets need not match: acknowledgements can be lost or observed in a different order. A mismatch
 causes recovery or a full send, rather than accepting a speculative pack whose bases are missing. Checkout

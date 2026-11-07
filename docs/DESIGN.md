@@ -294,18 +294,26 @@ orders them.
 ```
  t0  ovr: connect to ovrd socket; ovrd: open/reuse host stream ────────┐  (overlaps the snapshot)
  t0  ovr: snapshot: add -A, write-tree, commit-tree                    │
- t1  HELLO{checkout, seq, base, snapshot} ─────────────────────────────►┼─► agent: WELCOME{ok | need_full}
+ t1  HELLO{checkout, seq, base, snapshot} ─────────────────────────────►┼─► agent: WELCOME{ok | rebase{have}}
  t1  PACK frames (speculative, vs base) ──────────────────────────────►┼─► agent: index-pack as frames arrive
  t2  EXEC{argv, cwd, tty, cols, rows} ────────────────────────────────►┼─► agent: apply, SYNCED, start keeper, ATTACHED{run}
      ◄── OUT/ERR frames ... ◄── EXIT{code} ────────────────────────────┘
 ```
 
-- **Speculative send.** `ovr` records, per host, the last snapshot it delivered as a ref,
+- **Speculative send.** `ovr` records, per host, the last snapshot the host confirmed with `SYNCED` as a ref,
   `refs/ovr/hosts/<host>/<checkout>`, so your local `git gc` cannot prune the delta base out from under the next
   run (losing it would silently degrade to a full-tree send). It assumes the host still has it and streams the thin
   pack immediately after `HELLO` without waiting for the reply. The agent answers `WELCOME` as soon as it reads
-  `HELLO`; on `need_full` (checkout deleted, first contact) it discards the speculative pack and the client sends
-  one with no base. The common case pays zero extra round trips; the rare case pays one.
+  `HELLO`. Without a base (first contact) the pack is already full and the answer is `ok`.
+- **Base recovery.** When the host lacks the base, as after a lost `SYNCED` or a deleted checkout, it answers
+  `rebase{have}`, naming the newest snapshot the checkout applied (recorded in its `.git/ovr-applied`) if it still
+  has it, and discards the speculative pack and its `EXEC`. The client then sends a thin pack against `have`, once
+  it has checked that `have` is an object ID of a commit it still has; nothing at all when `have` is this run's
+  snapshot; and otherwise, as when the checkout is gone or `git gc` pruned `have` locally, a full pack. Then it
+  sends `EXEC` again. The common case pays zero extra round trips; a stale base pays one, and usually a small pack.
+- **A failed sync keeps the base.** An error before `SYNCED` leaves the host's ref alone: the host may have applied
+  the snapshot before the reply was lost, and a concurrent run may just have recorded a newer base. The next
+  run's `HELLO` lets the host tell.
 - **Pipelined.** `EXEC` follows the pack on the same stream, so the agent starts the command the moment checkout
   finishes without another exchange.
 - **Connections outlive runs.** SSH agents stay up for ten minutes; dial-in connections stay up indefinitely. A
@@ -320,7 +328,7 @@ orders them.
   it differs from the base, so an unchanged tree runs no `git update-ref`.
 - **Timed.** The client emits `debug` events for the wall-clock time from starting the run to `ATTACHED` and for
   each phase: opening the host stream, waiting for the snapshot lock, building the snapshot, looking up the base,
-  producing and sending each pack (with its bytes, and whether it was full or cut short by `need_full`), receiving
+  producing and sending each pack (with its bytes, and whether it was full or cut short by `rebase`), receiving
   `SYNCED`, recording the base, and receiving `ATTACHED`. Events carry the host, plus the checkout and snapshot
   sequence during sync, and the run number once attached, to match the host's log.
   Phases overlap, so they do not add up to the total, and time until `SYNCED` includes the host's work. The CLI
@@ -400,7 +408,8 @@ never touches what is in use:
 - Agents uploaded over SSH for other versions are removed from `~/.cache/ovr/bin`, and on the initiator, agents
   downloaded for other versions.
 - For each host cleaned, `ovr` forgets the snapshots it recorded for that host in the current repository, so the next
-  run sends everything without guessing first. Other repositories find out from the host's `WELCOME`.
+  run sends everything without guessing first, including when some checkouts were kept because they were in use.
+  Other repositories find out from the host's `WELCOME`.
 
 Each target prints what it removed, the bytes freed, and each checkout it kept. Identity, pairings, tunnels, and logs
 are never removed.

@@ -16,14 +16,14 @@ pub struct Hello {
 }
 
 /// `WELCOME`: the agent's answer to [`Hello`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Welcome {
     /// The base is present; the speculative thin pack will be applied.
     Ok,
     /// The base is missing. The agent discards everything up to the first `EXEC`; the client follows it with a
-    /// full pack and a second `EXEC`.
-    NeedFull,
+    /// pack against `have`, the newest snapshot the checkout applied, or a full pack, and a second `EXEC`.
+    Rebase { have: Option<String> },
 }
 
 /// `EXEC`: what to run once the snapshot is checked out.

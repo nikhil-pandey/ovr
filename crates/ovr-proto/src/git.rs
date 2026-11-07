@@ -59,6 +59,16 @@ where
     }
 }
 
+/// Whether the repository in `dir` has commit `id`, and therefore every object of that snapshot. Anything but a
+/// full object ID is never looked up.
+pub async fn has_commit(dir: &Path, id: &str) -> bool {
+    let object_id = matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit());
+    object_id
+        && run(dir, ["cat-file", "-e", &format!("{id}^{{commit}}")])
+            .await
+            .is_ok()
+}
+
 /// A running `git` whose stdin and stdout the caller streams.
 pub struct Child {
     child: tokio::process::Child,

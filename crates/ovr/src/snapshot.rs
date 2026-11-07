@@ -229,9 +229,9 @@ impl Delivery<'_> {
         Ok(())
     }
 
-    /// Forgets the host's base after a failed sync, so the next run sends the full snapshot.
-    pub async fn forget(&self) {
-        let _ = git::run(&self.snapshot.root, ["update-ref", "-d", &self.host_ref]).await;
+    /// Whether `commit`, which a host offered as a base, is a snapshot this repository still has to pack against.
+    pub async fn has(&self, commit: &str) -> bool {
+        git::has_commit(&self.snapshot.root, commit).await
     }
 }
 
@@ -364,9 +364,6 @@ mod tests {
         assert_eq!(to_box.base.as_deref(), Some(first.commit.as_str()));
         assert_eq!(second.deliver_to("other", "me").await?.base, None);
         assert_eq!(second.deliver_to("user@box", "you").await?.base, None);
-
-        to_box.forget().await;
-        assert_eq!(second.deliver_to("user@box", "me").await?.base, None);
         Ok(())
     }
 
