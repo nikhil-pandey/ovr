@@ -442,8 +442,12 @@ async fn next<S: AsyncRead>(frames: &mut Reader<S>) -> Result<Frame, Error> {
 #[cfg(all(test, unix))]
 mod tests {
     use std::path::Path;
+    use std::time::Duration;
 
+    use ovr_proto::msg::RunState;
     use ovrd::agent::{Config, Shell};
+    use tokio::io::DuplexStream;
+    use tokio::task::JoinHandle;
 
     use super::*;
     use crate::snapshot::Snapshot;
@@ -473,17 +477,18 @@ mod tests {
         signals: mpsc::Receiver<Signal>,
     ) -> Result<Run, Error> {
         let snapshot = Snapshot::take(&repo.join(cwd)).await?;
+        run_snapshot(&snapshot, host_root, script, stdin, signals).await
+    }
+
+    async fn run_snapshot(
+        snapshot: &Snapshot,
+        host_root: &Path,
+        script: &str,
+        stdin: &[u8],
+        signals: mpsc::Receiver<Signal>,
+    ) -> Result<Run, Error> {
         let delivery = snapshot.deliver_to("box", "me").await?;
-        let exec = Exec {
-            argv: vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
-            cwd: snapshot.prefix.clone(),
-            tty: false,
-            cols: 80,
-            rows: 24,
-        };
-        let config = config(host_root);
-        let (client, agent) = tokio::io::duplex(1 << 16);
-        let agent = tokio::spawn(async move { ovrd::agent::session::serve(agent, &config).await });
+        let (client, agent) = agent(host_root);
 
         let (stdin_tx, stdin_rx) = mpsc::channel(4);
         let stdin = Bytes::copy_from_slice(stdin);
@@ -496,6 +501,7 @@ mod tests {
             }
         });
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let exec = exec(snapshot, script);
         let (mut stream, mut position) = start(client, &delivery, &exec, &mut stderr).await?;
         let mut io = Io {
             stdin: stdin_rx,
@@ -514,6 +520,65 @@ mod tests {
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
+    }
+
+    /// A stream to an agent serving `host_root` in this process, keepers included.
+    fn agent(host_root: &Path) -> (DuplexStream, JoinHandle<()>) {
+        let config = config(host_root);
+        let (client, agent) = tokio::io::duplex(1 << 16);
+        let agent = tokio::spawn(async move { ovrd::agent::session::serve(agent, &config).await });
+        (client, agent)
+    }
+
+    fn exec(snapshot: &Snapshot, script: &str) -> Exec {
+        Exec {
+            argv: vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+            cwd: snapshot.prefix.clone(),
+            tty: false,
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    /// Starts `script` without relaying it.
+    async fn begin(
+        repo: &Path,
+        host_root: &Path,
+        script: &str,
+    ) -> Result<(Stream<DuplexStream>, Position, JoinHandle<()>), Error> {
+        let snapshot = Snapshot::take(repo).await?;
+        let delivery = snapshot.deliver_to("box", "me").await?;
+        let (client, agent) = agent(host_root);
+        let exec = exec(&snapshot, script);
+        let (stream, position) = start(client, &delivery, &exec, &mut tokio::io::sink()).await?;
+        Ok((stream, position, agent))
+    }
+
+    /// Relays a run without input until it ends or the stream breaks, returning that and the output.
+    async fn follow(
+        stream: &mut Stream<DuplexStream>,
+        position: &mut Position,
+        mode: Mode,
+    ) -> (Result<End, Error>, String) {
+        let mut stdout = Vec::new();
+        let mut io = Io {
+            stdin: mpsc::channel(1).1,
+            signals: mpsc::channel(1).1,
+            stdout: &mut stdout,
+            stderr: tokio::io::sink(),
+        };
+        let end = relay(stream, &mut io, position, mode).await;
+        (end, String::from_utf8_lossy(&stdout).into_owned())
+    }
+
+    async fn wait_for(path: &Path) -> Result<(), Error> {
+        for _ in 0..400 {
+            if path.exists() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(Error::Host(format!("{} never appeared", path.display())))
     }
 
     fn config(host_root: &Path) -> Config {
@@ -687,6 +752,157 @@ mod tests {
         assert_eq!(run.code, INTERRUPTED);
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         assert!(!marker.exists(), "a stopped run kills its command");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_broken_stream_resumes_exactly_where_it_left_off() -> Result<(), Error> {
+        let repo = repo()?;
+        let host = tempfile::tempdir()?;
+        let go = host.path().join("go");
+        let script = format!(
+            "echo one; while [ ! -f {} ]; do sleep 0.05; done; echo two; exit 4",
+            go.display()
+        );
+        let (mut stream, mut position, first_agent) =
+            begin(repo.path(), host.path(), &script).await?;
+
+        let (stdout, mut seen) = tokio::io::duplex(64);
+        let mut io = Io {
+            stdin: mpsc::channel(1).1,
+            signals: mpsc::channel(1).1,
+            stdout,
+            stderr: tokio::io::sink(),
+        };
+        let break_after_first_line = async {
+            let mut first = [0; 4];
+            seen.read_exact(&mut first).await?;
+            first_agent.abort();
+            Ok::<_, Error>(first)
+        };
+        let (broken, first) = tokio::join!(
+            relay(&mut stream, &mut io, &mut position, Mode::Drive),
+            break_after_first_line
+        );
+        assert!(matches!(broken, Err(Error::Disconnected)), "{broken:?}");
+        assert_eq!(&first?, b"one\n");
+        assert_eq!(position.out, 4);
+
+        std::fs::write(&go, "")?;
+        let (mut stream, attached) = attach(agent(host.path()).0, position.resume()).await?;
+        assert_eq!(position.resumed(attached), 0, "nothing was dropped");
+        let (end, rest) = follow(&mut stream, &mut position, Mode::Drive).await;
+        assert_eq!((end?, rest.as_str()), (End::Exit(4), "two\n"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runs_share_the_checkout_side_by_side() -> Result<(), Error> {
+        let repo = repo()?;
+        let host = tempfile::tempdir()?;
+        let marker = host.path().join("marker");
+        let script = format!(
+            "while [ ! -f {} ]; do sleep 0.05; done; echo released",
+            marker.display()
+        );
+        let (mut waiting, mut position, _agent) = begin(repo.path(), host.path(), &script).await?;
+
+        let script = format!("touch {}; cat src/main.rs", marker.display());
+        let other = tokio::time::timeout(
+            Duration::from_secs(20),
+            ovr(repo.path(), "", host.path(), &script, b""),
+        )
+        .await
+        .map_err(|_| Error::Host("the second run waited for the first".to_owned()))??;
+        assert_eq!((other.code, other.stdout.as_str()), (0, "v1\n"));
+        let (end, out) = follow(&mut waiting, &mut position, Mode::Drive).await;
+        assert_eq!((end?, out.as_str()), (End::Exit(0), "released\n"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_late_snapshot_never_rolls_the_checkout_back() -> Result<(), Error> {
+        let repo = repo()?;
+        let host = tempfile::tempdir()?;
+        let main = repo.path().join("src/main.rs");
+        let first = Snapshot::take(repo.path()).await?;
+        std::fs::write(&main, "v2\n")?;
+        let second = Snapshot::take(repo.path()).await?;
+        std::fs::write(&main, "v1\n")?;
+        let third = Snapshot::take(repo.path()).await?;
+        assert_eq!(third.commit, first.commit, "same tree, later snapshot");
+
+        // The same tree arriving late must not lower the bar for the snapshot taken between them.
+        for late in [&third, &first, &second] {
+            let none = mpsc::channel(1).1;
+            let run = run_snapshot(late, host.path(), "cat src/main.rs", b"", none).await?;
+            assert_eq!(run.stdout, "v1\n");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runs_are_killed_listed_and_replayed_from_other_streams() -> Result<(), Error> {
+        let repo = repo()?;
+        let host = tempfile::tempdir()?;
+        let started = host.path().join("started");
+        let script = format!("echo hi; touch {}; sleep 30", started.display());
+        let (stream, position, _agent) = begin(repo.path(), host.path(), &script).await?;
+        drop(stream);
+        wait_for(&started).await?;
+
+        kill(agent(host.path()).0, position.run).await?;
+        let runs = list(agent(host.path()).0, "me").await?;
+        let states: Vec<_> = runs.iter().map(|info| (info.run, &info.state)).collect();
+        assert_eq!(
+            states,
+            [(position.run, &RunState::Exited { code: 128 + 9 })]
+        );
+        assert_eq!(list(agent(host.path()).0, "someone else").await?, []);
+
+        let from_start = Attach {
+            run: position.run,
+            out: 0,
+            err: 0,
+        };
+        let (mut stream, attached) = attach(agent(host.path()).0, from_start).await?;
+        let mut replayed = Position::new(attached);
+        let (end, out) = follow(&mut stream, &mut replayed, Mode::Watch).await;
+        assert_eq!((end?, out.as_str()), (End::Exit(128 + 9), "hi\n"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_end_of_input_reaches_the_command_while_others_watch() -> Result<(), Error> {
+        let repo = repo()?;
+        let host = tempfile::tempdir()?;
+        let (mut driver, mut position, _agent) =
+            begin(repo.path(), host.path(), "cat; echo eof").await?;
+        let (_watcher, _) = attach(agent(host.path()).0, position.resume()).await?;
+
+        let (stdin_tx, stdin) = mpsc::channel(1);
+        stdin_tx
+            .send(Bytes::from_static(b"data\n"))
+            .await
+            .map_err(|_| Error::Disconnected)?;
+        drop(stdin_tx);
+        let mut stdout = Vec::new();
+        let mut io = Io {
+            stdin,
+            signals: mpsc::channel(1).1,
+            stdout: &mut stdout,
+            stderr: tokio::io::sink(),
+        };
+        let end = tokio::time::timeout(
+            Duration::from_secs(20),
+            relay(&mut driver, &mut io, &mut position, Mode::Drive),
+        )
+        .await
+        .map_err(|_| Error::Host("the command never saw the end of its input".to_owned()))??;
+        assert_eq!(
+            (end, stdout.as_slice()),
+            (End::Exit(0), &b"data\neof\n"[..])
+        );
         Ok(())
     }
 }

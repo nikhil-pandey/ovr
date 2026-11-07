@@ -161,8 +161,8 @@ async fn keep(run: Run, shell: Shell) -> Result<(), Error> {
         }
     };
     run.started(process.id())?;
-    let mut out = log::Writer::create(&run.dir, Stream::Out)?;
-    let mut err = log::Writer::create(&run.dir, Stream::Err)?;
+    let mut out = log::Writer::create(&run.dir, Stream::Out, log::SEGMENT)?;
+    let mut err = log::Writer::create(&run.dir, Stream::Err, log::SEGMENT)?;
     let (progress_tx, progress) = watch::channel(Progress::default());
     let kept = Arc::new(Kept {
         run: run.clone(),

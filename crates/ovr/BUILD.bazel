@@ -40,3 +40,23 @@ rust_test(
     rustc_env_files = [":cargo_env"],
     deps = all_crate_deps(normal_dev = True) + ["//crates/ovrd:lib"],
 )
+
+rust_test(
+    name = "e2e",
+    size = "medium",
+    srcs = ["tests/e2e.rs"],
+    aliases = aliases(),
+    data = [
+        ":ovr",
+        "//crates/ovrd",
+    ],
+    rustc_env = {
+        "CARGO_BIN_EXE_ovr": "$(rootpath :ovr)",
+        "OVRD": "$(rootpath //crates/ovrd)",
+    },
+    rustc_env_files = [":cargo_env"],
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + ["//crates/ovr-proto"],
+)

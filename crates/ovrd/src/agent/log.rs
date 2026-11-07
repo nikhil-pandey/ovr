@@ -11,7 +11,7 @@ use ovr_proto::frame::CHUNK;
 use tokio::sync::watch;
 
 /// A new segment starts once the current one holds this much, so a stream keeps between this and twice this.
-const SEGMENT: u64 = 32 * 1024 * 1024;
+pub const SEGMENT: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stream {
@@ -62,22 +62,24 @@ impl Progress {
 pub struct Writer {
     dir: PathBuf,
     stream: Stream,
+    segment_len: u64,
     start: u64,
     len: u64,
     file: File,
 }
 
 impl Writer {
-    /// Starts an empty stream in `dir`.
+    /// Starts an empty stream in `dir` whose segments hold `segment_len` bytes, normally [`SEGMENT`].
     ///
     /// # Errors
     ///
     /// Returns an error when the first segment cannot be created.
-    pub fn create(dir: &Path, stream: Stream) -> io::Result<Self> {
+    pub fn create(dir: &Path, stream: Stream, segment_len: u64) -> io::Result<Self> {
         let file = File::create(segment(dir, stream, 0))?;
         Ok(Self {
             dir: dir.to_owned(),
             stream,
+            segment_len,
             start: 0,
             len: 0,
             file,
@@ -93,7 +95,7 @@ impl Writer {
     ///
     /// Returns an error when the data cannot be written; offsets stay consistent, but the data is lost.
     pub fn append(&mut self, data: &[u8]) -> io::Result<()> {
-        if self.len - self.start >= SEGMENT {
+        if self.len - self.start >= self.segment_len {
             let file = File::create(segment(&self.dir, self.stream, self.len))?;
             let dropped = segments(&self.dir, self.stream)?
                 .into_iter()
@@ -226,4 +228,46 @@ fn length(dir: &Path, stream: Stream) -> io::Result<u64> {
         return Ok(0);
     };
     Ok(start + std::fs::metadata(segment(dir, stream, start))?.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn read_to_end(tail: &mut Tail) -> io::Result<Vec<u8>> {
+        let mut read = Vec::new();
+        while let Some(chunk) = tail.next().await? {
+            read.extend_from_slice(&chunk);
+        }
+        Ok(read)
+    }
+
+    #[tokio::test]
+    async fn readers_follow_rotation_and_late_readers_start_at_what_is_kept() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (progress_tx, progress) = watch::channel(Progress::default());
+        let mut writer = Writer::create(dir.path(), Stream::Out, 4)?;
+        let mut early = Tail::open(dir.path(), Stream::Out, 0, progress.clone())?;
+
+        let mut followed = Vec::new();
+        for chunk in [b"abcd", b"efgh", b"ijkl", b"mnop"] {
+            writer.append(chunk)?;
+            progress_tx.send_modify(|progress| progress.out = writer.len());
+            while early.pos() < writer.len() {
+                followed.extend_from_slice(&early.next().await?.unwrap_or_default());
+            }
+        }
+        assert_eq!(followed, b"abcdefghijklmnop");
+        assert_eq!(segments(dir.path(), Stream::Out)?, [8, 12]);
+
+        progress_tx.send_modify(|progress| progress.ended = true);
+        assert_eq!(read_to_end(&mut early).await?, b"");
+        let mut late = Tail::open(dir.path(), Stream::Out, 0, progress)?;
+        assert_eq!(late.pos(), 8);
+        assert_eq!(read_to_end(&mut late).await?, b"ijklmnop");
+
+        let finished = Progress::finished(dir.path())?;
+        assert_eq!((finished.out, finished.err), (16, 0));
+        Ok(())
+    }
 }

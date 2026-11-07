@@ -38,8 +38,10 @@ bazel test //...
 ```
 
 The client tests in `crates/ovr/src/session.rs` run a real `ovrd` agent in-process against temporary repositories
-and need `git` on `PATH`. Platform-specific code (Windows Job Objects, ConPTY, named pipes) is only compiled on its
-platform; CI checks every released OS.
+and need `git` on `PATH`. `crates/ovr/tests/e2e.rs` runs the real `ovr` and `ovrd` binaries on Unix, with a stand-in
+`ssh` that serves a second home directory as the host, so runs are kept by real `ovrd keep` processes; under Cargo
+it builds `ovrd` itself, under Bazel it gets both binaries as data. Platform-specific code (Windows Job Objects,
+ConPTY, named pipes) is only compiled on its platform; CI checks every released OS.
 
 ## Release
 
