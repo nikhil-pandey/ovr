@@ -295,7 +295,8 @@ mod tests {
         ));
         assert!(!same_mtime(host, 1_700_000_000_000_000_000));
         assert!(same_mtime(-1_550, -1_600), "before the epoch");
-        for ns in [0, 1, -1, host, -host] {
+        // Multiples of 100 ns, which is as fine as Windows' clock goes.
+        for ns in [0, 100, -100, host - 89, 89 - host] {
             assert_eq!(mtime_ns(system_time(ns)), ns);
         }
     }
