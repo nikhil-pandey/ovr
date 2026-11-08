@@ -8,6 +8,7 @@ ovr arm64 -- bazel test //services/...
 ovr winbox -- dotnet build -c Release
 ovr bigbox                       # interactive shell in the synced checkout
 ovr -d bigbox -- cargo bench     # start in the background; attach, follow, or kill it later
+ovr get bigbox target/doc out/   # copy files back; unchanged ones are skipped
 ```
 
 `ovr HOST -- CMD...` runs `CMD` on `HOST` against your **local, uncommitted** working tree, streams the output
@@ -57,7 +58,6 @@ Constraints that shape the design:
 - Cross-OS builds; pick a host whose OS matches.
 - Host selection, pools, load balancing. You name the host.
 - Two-way sync or remote editing. Use your editor's remote mode for that.
-- Copying build outputs back. Run the thing remotely, or `scp` what you need.
 - Provisioning machines, SSH keys, networks, or tunnel accounts. Tunnels use a provider CLI you already have.
 - Keeping CI jobs alive. A runner serves for as long as its job runs, no longer, unless the job asks the action to
   hold it for a while.
@@ -86,6 +86,7 @@ ovr ps [HOST]               list runs: running, and finished in the last 7 days
 ovr attach HOST RUN         reconnect a terminal to a run, as if it had been started here
 ovr logs HOST RUN           print a run's output, following it until the run ends
 ovr kill HOST RUN           kill a run's whole process tree
+ovr get HOST SRC... DEST    copy files and trees from HOST to DEST on this machine; see Copying files back
 ovr clean [HOST...|--all]   remove checkouts and finished runs not in use: this machine's, or yours on HOSTs
 
 ovrd                        the initiator server; started automatically by ovr, or by launchd/systemd --user
@@ -124,6 +125,8 @@ ovrd connect ADDR github:FP in a GitHub Actions job: serve the initiator with fi
 - `ovr clean HOST...` removes this initiator's checkouts and finished runs from each host, and agents of other
   versions. Without `HOST` it cleans this machine: every initiator's checkouts and runs, and downloaded agents of
   other versions. `--all` does both, for every host with an open connection. See [Cleaning up](#cleaning-up).
+- `ovr get` exits `0` when everything was fetched, `1` when something could not be, and `125` when `ovr` itself
+  fails. See [Copying files back](#copying-files-back).
 - `ADDR` is `host:port`, or a tunnel: `cloudflare:HOSTNAME` or `devtunnel:ID`. `PROVIDER` is `cloudflare` or
   `devtunnel`. `ovrd connect ADDR CODE --foreground` pairs and serves without installing anything at login, for CI
   runners and other short-lived hosts.
@@ -510,9 +513,10 @@ creates that is not tracked stays, exactly as it would locally.
 
 - Frames are `len:u32le, kind:u8, payload`, where `len` covers the kind and payload, read and written with
   `tokio-util`'s length-delimited codec. Control messages (`HELLO`, `ENTER`, `WELCOME`, `EXEC`, `SYNCED`, `RESIZE`,
-  `CONSUMED`, `EXIT`, `ATTACH`, `ATTACHED`, `KILL`, `RUNS`, `RUN_LIST`, `CLEAN`, `CLEANED`, and `BANNER`/`ACCEPT`/`PAIR` on connection
-  setup) are small JSON.
-  Data frames (`PACK`, `OUT`, `ERR`, `IN`) carry raw bytes, up to 64 KiB each, and are what the stream is made of.
+  `CONSUMED`, `EXIT`, `ATTACH`, `ATTACHED`, `KILL`, `RUNS`, `RUN_LIST`, `CLEAN`, `CLEANED`, `GET`, `HAVE`, `ENTRY`,
+  `NOTE`, `DONE`, and `BANNER`/`ACCEPT`/`PAIR` on connection setup) are small JSON.
+  Data frames (`PACK`, `OUT`, `ERR`, `IN`, `DATA`) carry raw bytes, up to 64 KiB each, and are what the stream is
+  made of.
 - One connection to a host carries many runs as independent [yamux](https://github.com/libp2p/rust-yamux) streams
   with per-stream flow control, so a slow terminal on one run never stalls another. On a dial-in connection the
   host opens the first stream for heartbeats, before any run.
@@ -563,6 +567,66 @@ never touches what is in use:
 
 Each target prints what it removed, the bytes freed, and each checkout it kept. Identity, pairings, tunnels, and logs
 are never removed.
+
+## Copying files back
+
+`ovr get HOST SRC... DEST` brings test reports, crash dumps, generated trees, and host-side logs back from any host,
+including dialed-in ones without SSH. It has a stream of its own, so nothing passes through a keeper's log or shows
+in `ovr ps`, and it never syncs: run what writes the files first.
+
+- **Like `cp -R`, but stable.** Each `SRC` lands as `DEST/<name of SRC>`, and `DEST` is created if missing. Only a
+  single file is renamed: with one `SRC` that turns out to be a file, and a `DEST` that is not a directory and does
+  not end in a separator, it is copied *as* `DEST`. A directory never is, unlike with `cp`, so the same command lands
+  it in the same place whether `DEST` exists yet or not, and resumes. A nameless `SRC` such as `.` or `~` lands its
+  contents in `DEST`. Two sources with the same name, ignoring case on Windows and macOS, or one named `.git`, are
+  refused before connecting; a file that several globs match is always sent, and the last source wins.
+- **Where `SRC` is.** Any path the host user can read. A relative one starts from this repository's checkout, in the
+  same directory as here; outside a repository, or before the first sync, from the base directory, which the host
+  then names first, as `-n` does. `~` is the host user's home, expanded by the agent. A source that cannot be read is
+  reported with the path it was looked for at, and the rest carry on.
+- **Globs.** `*`, `?`, `[...]`, `{a,b}`, and `**` are matched by the agent. Matches keep their path below the glob's
+  literal prefix, so `bazel-testlogs/**/test.xml` into `logs/` yields `logs/<package>/<target>/test.xml`. Both `/`
+  and `\` separate components and never escape; Windows hosts match without regard to case.
+- **What is fetched.** Everything named, `.gitignore`d or not, except `.git` directories. A named `SRC` and a glob's
+  prefix follow symlinks, as `cp -RH` does, since Bazel's `bazel-*` are symlinks; inside a tree symlinks are copied
+  as symlinks. FIFOs, sockets, and devices are skipped with a note.
+- **Output.** A progress line on a terminal, then `fetched 37 files (412 unchanged) to out/, 18.2 MiB sent as 2.1 MiB
+  in 0.9 s`. Ctrl-C (exit `130`) or a lost connection stops the copy; files already written are whole, and the same
+  command resumes.
+
+```
+ ovr ──► GET{initiator, checkout?, cwd, sources} HAVE[...] ... HAVE[] ──► agent: walk the sources
+     ◄── ENTRY ◄── DATA ... DATA[] ◄── NOTE ◄── ... ◄── DONE{unchanged}       ──► CONSUMED{bytes} ...
+```
+
+- **Only what changed.** While connecting, `ovr` lists what is already where each source lands, and sends it as
+  `HAVE` batches right behind `GET`, with no round trip between. The agent skips every file listed with the same size
+  and modification time, rsync's quick check; the client stamps each file it writes with the host's time, and NTFS's
+  100 ns still matches. Filesystems that keep only seconds, such as FAT, fetch their files again every time rather
+  than risk skipping a change made within a second. Everything else is an `ENTRY` with a `/`-separated
+  path relative to its source, followed for a file by its content in `DATA` frames and an empty `DATA`. `NOTE`
+  reports what was not sent, and during a file means it is discarded.
+- **Compression.** All `DATA` is one zstd stream at level 3, flushed after each file, so similar small files compress
+  together and compressed ones cost almost nothing. Walking, reading, and compressing run on one blocking thread a few
+  frames ahead of the network. `get` takes none of the locks a sync takes.
+- **Pacing.** Everything a host sends shares the queues of its one connection, so a bulk transfer would delay every
+  run's frames behind it. The agent therefore sends `DATA` only while unacknowledged bytes stay below twice the
+  link's bandwidth-delay product, from the best recent delivery rate and the lowest round trip, with a 256 KiB floor;
+  the client acknowledges with `CONSUMED` as it writes. That fills the link and keeps at most about one round trip of
+  `get`'s data queued in front of anything else.
+
+### Writing safely
+
+A host is not necessarily trustworthy, so every entry is untrusted input:
+
+- **Plain names only.** No empty, `.`, or `..` component and nothing absolute; on a Windows initiator also nothing
+  Windows forbids or treats as a device. Names Git would take for `.git` are never written.
+- **Never through a symlink.** Every directory below `DEST` is checked with `lstat` and created by `ovr`, so a host
+  cannot send `link -> ~` and then `link/.bashrc`, nor make `DEST` itself a symlink. A `DEST` you name may be one.
+- **Whole files.** Each file is written under a private temporary name beside its destination, stamped, and renamed
+  into place. Existing files and symlinks are replaced, and a file keeps the permissions it had here; a directory in
+  the way of a file, or the reverse, fails that entry, and nothing local is deleted. Windows initiators skip symlinks
+  with a note.
 
 ## Agent
 
@@ -661,6 +725,9 @@ caches such as sccache or bazel-remote are a per-host concern and work unchanged
   injection surface.
 - Checkouts live under one root per host, one directory per initiator, and can be deleted at any time; the next run
   recreates them.
+- A host can write to the initiator's disk only through `ovr get`, only below the `DEST` you name, and only as
+  [Writing safely](#writing-safely) allows. On the host, `get` reads what its user can, which any command sent there
+  can already do.
 - Run directories, logs included, and keeper sockets are private to the host user. `ovr ps` shows only the
   current initiator's runs, but that is a convenience, not a boundary: every run belongs to the host user.
 
@@ -700,7 +767,8 @@ before `ovrd` runs.
 
 - Rust. Two binaries from one workspace: `ovr` (CLI) and `ovrd` (server, agent, dial-in client).
 - Crates: `clap`, `miette`, `tokio` + `tokio-util` (framing), `yamux` (multiplexing), `serde_json`, `rustls` +
-  `rcgen` + `ring`, `process-wrap` (process groups, Job Objects), `portable-pty`, `crossterm`, `directories`, `nix`
+  `rcgen` + `ring`, `zstd` and `globset` (`ovr get`), `process-wrap` (process groups, Job Objects), `portable-pty`,
+  `crossterm`, `directories`, `nix`
   (signals), `windows-sys` (ConPTY Job Objects, console control). File locks are `std::fs::File::lock`, unlocked
   explicitly before the file is closed: a process another thread is spawning shares the open file until it execs, so
   closing alone could leave the lock held for that long.
@@ -719,8 +787,9 @@ before `ovrd` runs.
    `--foreground` for `ovrd connect`, and heartbeats on dial-in connections.
 6. **Trusted workloads.** `ovrd trust` with GitHub Actions OIDC, `ovrd connect ADDR github:FP` in the background,
    and the GitHub action.
-7. **Later, only if needed.** `ovrd` on an always-on VM shared by several people's machines, copying outputs back, a
-   remembered default host.
+7. **Copying files back.** `ovr get` with the quick check, one zstd stream, pacing, and safe writes.
+8. **Later, only if needed.** `ovrd` on an always-on VM shared by several people's machines, sending only the new end
+   of grown logs, bringing back changes to tracked files, a remembered default host.
 
 ## Prior art
 

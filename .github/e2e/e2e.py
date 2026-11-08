@@ -672,8 +672,9 @@ def cmd_hosts(args: argparse.Namespace) -> None:
 
 
 def cmd_check(args: argparse.Namespace) -> None:
-    """Checks on every host at once that syncs arrive, that exit codes come back, that `-n` does not sync, and that
-    runs outside a repository start in the base directory: a trusted job's workspace, a paired host's home."""
+    """Checks on every host at once that syncs arrive, that exit codes come back, that `-n` does not sync, that
+    `ovr get` copies files back, and that runs outside a repository start in the base directory: a trusted job's
+    workspace, a paired host's home."""
     hosts = json.loads(Path(args.hosts).read_text())
     root, logs = Path(args.dir), Path(args.logs)
     root.mkdir(parents=True, exist_ok=True)
@@ -706,6 +707,15 @@ def cmd_check(args: argparse.Namespace) -> None:
         synced = run(["git", "hash-object", marker.name], cwd=root)
         marker.write_text(secrets.token_hex(32))
         await step("without syncing", ["git", "hash-object", marker.name], 0, synced, flags=("-n",))
+        # Files come back as the host has them: the marker as last synced, not as edited since.
+        fetched = Path(tempfile.mkdtemp()) / "fetched"
+        say(host, f"[bold]check: copy back[/]: $ ovr get {hosts[host]} {marker.name} {fetched}")
+        try:
+            await arun(["ovr", "get", hosts[host], marker.name, str(fetched)], cwd=root)
+            if run(["git", "hash-object", str(fetched)]) != synced:
+                failed.append(f"{host} copy back: content differs")
+        except SystemExit as err:
+            failed.append(f"{host} copy back: {err}")
         script = ".github/e2e/e2e.py"
         if host.endswith("-trusted"):
             want = run(["git", "hash-object", script])

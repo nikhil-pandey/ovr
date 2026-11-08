@@ -229,7 +229,7 @@ async fn warn<E: AsyncWrite + Unpin>(stderr: &mut E, warning: &[u8]) -> Result<(
 
 /// A host that fails stops reading and closes the stream right after saying why, so a write that failed meanwhile
 /// is reported as the host's reason when it gave one.
-async fn reason<S: AsyncRead>(frames: &mut Reader<S>, err: Error) -> Error {
+pub(crate) async fn reason<S: AsyncRead>(frames: &mut Reader<S>, err: Error) -> Error {
     if !matches!(err, Error::Protocol(ovr_proto::Error::Io(_))) {
         return err;
     }
@@ -574,7 +574,7 @@ async fn write<W: AsyncWrite + Unpin>(out: &mut W, data: &[u8]) -> Result<(), Er
 
 /// The next frame from the host, turning `ERROR` frames into errors and a broken stream into
 /// [`Error::Disconnected`].
-async fn next<S: AsyncRead>(frames: &mut Reader<S>) -> Result<Frame, Error> {
+pub(crate) async fn next<S: AsyncRead>(frames: &mut Reader<S>) -> Result<Frame, Error> {
     let frame = match frames.next().await {
         Some(Ok(frame)) => frame,
         None | Some(Err(ovr_proto::Error::Io(_))) => return Err(Error::Disconnected),

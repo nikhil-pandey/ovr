@@ -1,6 +1,7 @@
 //! `ovr`: run a command on another machine against the local working tree.
 
 mod daemon;
+mod fetch;
 mod session;
 mod snapshot;
 mod terminal;
@@ -20,12 +21,33 @@ use crate::snapshot::{Repository, Snapshot};
 /// Exit code for failures in `ovr` itself, following `docker run`.
 pub const FAILURE: i32 = 125;
 
+const GET_HELP: &str = "\
+Examples:
+  ovr get bigbox target/nextest/ci/junit.xml .       one file into the current directory
+  ovr get bigbox target/doc out/                      a tree: out/doc/...
+  ovr get bigbox target/release/app ./app-linux       one file, renamed
+  ovr get bigbox 'bazel-testlogs/**/test.xml' logs/   every match, keeping its path below bazel-testlogs/
+  ovr get bigbox '~/.cargo/config.toml' .             ~ is the host user's home; quote it, and globs
+  ovr get winbox 'C:\\ProgramData\\Foo\\crash.dmp' .     anywhere the host user can read
+
+Each SRC lands as DEST/<name of SRC>, so the same command always lands it in the same place. A single
+file can be renamed instead: with one SRC that is a file, and a DEST that is not a directory and does
+not end in /, SRC is copied as DEST. Relative SRCs start from this repository's checkout on HOST,
+in the same directory as here; outside a repository, or before the first sync, from the host's base
+directory: its home, or a trusted CI job's workspace. get never syncs: run what writes the files first.
+
+Files whose size and modification time match the copy in DEST are skipped, so the same command again
+fetches only what changed, and resumes one that was cut short. .gitignore does not apply.
+
+Exits 0 when everything was fetched, 1 when something could not be, and 125 when ovr itself fails.";
+
 const EXAMPLES: &str = "\
 Examples:
   ovr bigbox -- cargo test          sync this working tree to bigbox, run there, exit with its code
   ovr bigbox                        a login shell in the synced checkout
   ovr -d bigbox -- cargo build      in the background; prints the run number for logs, attach, and kill
   ovr -n bigbox -- cat Cargo.lock   without syncing: in the checkout as bigbox has it
+  ovr get bigbox target/doc out/    copy files back: out/doc/..., skipping what is unchanged
   ovr ps                            runs on every connected host
 
 Commands run in the same directory relative to the repository root as here. Outside a Git repository
@@ -67,6 +89,17 @@ pub enum Command {
     Logs { host: String, run: u64 },
     /// Kill a run's whole process tree.
     Kill { host: String, run: u64 },
+    /// Copy files and trees from HOST to DEST on this machine, skipping files already there.
+    #[command(after_help = GET_HELP)]
+    Get {
+        /// SSH destination or dialed-in host name.
+        host: String,
+        /// Files, trees, or quoted globs on HOST. Relative ones start from this repository's checkout there.
+        #[arg(required = true, value_name = "SRC")]
+        sources: Vec<String>,
+        /// Where they go on this machine.
+        dest: String,
+    },
     /// Remove checkouts and finished runs, keeping those in use, and agents of other versions.
     Clean {
         /// Remove this initiator's from these hosts; otherwise everyone's from this machine.
@@ -115,6 +148,10 @@ pub enum Error {
     #[diagnostic(code(ovr::host))]
     Host(String),
 
+    #[error("{message}")]
+    #[diagnostic(code(ovr::usage), help("{help}"))]
+    Usage { message: String, help: String },
+
     #[error("remote: {0}")]
     #[diagnostic(code(ovr::remote))]
     Remote(String),
@@ -122,6 +159,15 @@ pub enum Error {
     #[error("connection to the host was lost")]
     #[diagnostic(code(ovr::disconnected))]
     Disconnected,
+
+    #[error("the connection to the host was lost")]
+    #[diagnostic(
+        code(ovr::disconnected),
+        help(
+            "run the same command again: the files already here are complete, and only the rest is fetched"
+        )
+    )]
+    FetchCut,
 
     #[error("left run {run} running on {host}")]
     #[diagnostic(code(ovr::detached), help("resume it with `ovr attach {host} {run}`"))]
@@ -157,6 +203,14 @@ pub async fn run(mut cli: Cli) -> Result<i32, Error> {
             Ok(0)
         }
         (Some(Command::Clean { hosts, all }), _) => clean(hosts, all).await,
+        (
+            Some(Command::Get {
+                host,
+                sources,
+                dest,
+            }),
+            _,
+        ) => fetch::get(host, sources, dest).await,
         (None, Some(host)) => run_on(host, cli.run).await,
         (None, None) => Err(Error::Host("no host given".to_owned())),
     }
@@ -516,7 +570,7 @@ fn report(target: &str, cleaned: &Cleaned) {
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn bytes(bytes: u64) -> String {
+pub(crate) fn bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
     if bytes < 1024 {
         return format!("{bytes} B");

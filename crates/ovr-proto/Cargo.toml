@@ -11,6 +11,7 @@ repository.workspace = true
 bytes.workspace = true
 directories.workspace = true
 futures.workspace = true
+globset.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true

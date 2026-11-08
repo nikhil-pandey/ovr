@@ -1,7 +1,7 @@
 //! The agent half of a stream; see the client half in `ovr`'s `session` module for the sequence.
 //!
 //! A stream starts a run after syncing (`HELLO`) or without (`ENTER`), resumes one (`ATTACH`), lists runs (`RUNS`),
-//! or cleans up (`CLEAN`). Once a run has started, the agent only relays frames between the client and the run's
+//! cleans up (`CLEAN`), or copies files back (`GET`). Once a run has started, the agent only relays frames between the client and the run's
 //! keeper, so the stream's end never ends the run.
 
 use std::time::Instant;
@@ -98,6 +98,7 @@ async fn dispatch<S: AsyncRead + AsyncWrite>(
                 .await?;
             Ok(())
         }
+        FrameKind::Get => super::fetch::serve(writer, frames, config, first.parse()?).await,
         kind => Err(ovr_proto::Error::Unexpected(kind).into()),
     }
 }
@@ -370,7 +371,7 @@ async fn replay<S: AsyncRead + AsyncWrite>(
     Ok(())
 }
 
-async fn next<S: AsyncRead>(frames: &mut Reader<S>) -> Result<Frame, Error> {
+pub(super) async fn next<S: AsyncRead>(frames: &mut Reader<S>) -> Result<Frame, Error> {
     Ok(frames.next().await.ok_or(Error::Disconnected)??)
 }
 

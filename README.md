@@ -39,6 +39,7 @@ ovr ps                                     # runs on every connected host
 ovr logs bigbox 12                         # follow a run's output
 ovr attach bigbox 12                       # take a run's terminal back
 ovr kill bigbox 12
+ovr get bigbox target/doc out/             # copy files back: out/doc/..., skipping unchanged ones
 ```
 
 Hosts you cannot SSH to dial in instead. Pair one by running the command `ovrd pair` prints on it:

@@ -2,8 +2,10 @@
 
 pub mod checkout;
 pub mod clean;
+mod fetch;
 pub mod keeper;
 mod log;
+mod pacer;
 pub mod process;
 pub mod runs;
 pub mod session;

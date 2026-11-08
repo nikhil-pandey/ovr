@@ -516,6 +516,67 @@ fn runs_without_syncing_in_the_checkout_as_it_is_or_the_home_directory() -> Resu
 }
 
 #[test]
+fn copies_files_back_and_then_only_what_changed() -> Result {
+    let world = World::new()?;
+    let script =
+        "mkdir -p target/doc/sub && echo a > target/doc/a.html && echo b > target/doc/sub/b.html";
+    assert_eq!(
+        world.run(&["box", "--", "sh", "-c", script])?.status.code(),
+        Some(0)
+    );
+
+    let first = world.run(&["get", "box", "target/doc", "out/"])?;
+    assert_eq!(first.status.code(), Some(0), "{}", text(&first.stderr));
+    assert!(
+        text(&first.stderr).starts_with("fetched 2 files to out/, "),
+        "{}",
+        text(&first.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(world.file("repo/out/doc/sub/b.html"))?,
+        "b\n"
+    );
+
+    let again = world.run(&["get", "box", "target/doc", "out/"])?;
+    assert!(
+        text(&again.stderr).starts_with("fetched 0 files (2 unchanged) to out/ in "),
+        "{}",
+        text(&again.stderr)
+    );
+
+    // Partial failure: what can be fetched is, and the rest says where it was looked for.
+    let some = world.run(&["get", "box", "msg.txt", "missing", "partial"])?;
+    let stderr = text(&some.stderr);
+    assert_eq!(some.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("ovr: missing: not found on the host at /"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(world.file("repo/partial/msg.txt"))?,
+        "hello\n"
+    );
+
+    // `~` is the host user's home, wherever ovr runs, and a glob keeps the path below its prefix.
+    let outside = world
+        .ovr(&["get", "box", "~/agent.pid", "*.pid", "pids"])
+        .current_dir(world.dir.path())
+        .output()?;
+    assert_eq!(outside.status.code(), Some(0), "{}", text(&outside.stderr));
+    let pid = std::fs::read_to_string(world.host().join("agent.pid"))?;
+    assert_eq!(std::fs::read_to_string(world.file("pids/agent.pid"))?, pid);
+
+    let usage = world.run(&["get", "box", "target/doc"])?;
+    assert_eq!(usage.status.code(), Some(125));
+    assert!(
+        text(&usage.stderr).contains("ovr get HOST SRC... DEST"),
+        "{}",
+        text(&usage.stderr)
+    );
+    Ok(())
+}
+
+#[test]
 fn cleans_hosts_and_this_machine_but_not_what_is_running() -> Result {
     let world = World::new()?;
     assert_eq!(world.run(&["box", "--", "true"])?.status.code(), Some(0));
