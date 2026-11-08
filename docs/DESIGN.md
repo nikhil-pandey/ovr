@@ -299,7 +299,9 @@ jobs:
   a warning, so the action never fails a job. With `hold` (`30m`, `1h`, `90s`; a bare number is minutes), its step
   keeps the job running for that long and shows the connection log; without it, the runner serves only while the
   job's later steps run. Gating the step on `failure() || runner.debug == '1'` connects only when a job fails or
-  is re-run with debug logging.
+  is re-run with debug logging. To reach the runner while the job runs and still keep it afterwards, use the action
+  twice: first without `hold`, and as the last step with it, perhaps gated on `failure()`. The second use finds the
+  first's connection, which lasts until the job ends, and only holds, so the host keeps its name.
 - **Reaching the initiator.** `ovrd trust` prints the open tunnel's address if there is one, the Dev Tunnel first,
   as it keeps its address; a Cloudflare quick tunnel's changes when it restarts. Storing the address and fingerprint
   as repository or organization variables keeps the step the same in every workflow.

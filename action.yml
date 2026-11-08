@@ -18,7 +18,8 @@ inputs:
   hold:
     description: >-
       Keep the job running for this long once connected, as in `30m`, `1h`, or `90s`; a bare number is minutes. By
-      default the step returns at once and the runner serves only until the job's other steps finish.
+      default the step returns at once and the runner serves only until the job's other steps finish. A later step
+      of the job that uses this action again with `hold` reuses the connection and only holds.
     default: ""
 
 runs:
@@ -34,6 +35,12 @@ runs:
       run: |
         set +e
         warn() { echo "::warning title=ovr::$*"; exit 0; }
+        # An earlier step of this job already connected; its background ovrd serves until the job ends.
+        if [ -n "$ovr_action_log" ]; then
+          echo "already connected earlier in this job"
+          echo "log=$ovr_action_log" >>"$GITHUB_OUTPUT"
+          exit 0
+        fi
         case "$RUNNER_OS-$RUNNER_ARCH" in
           Linux-X64) target=x86_64-unknown-linux-musl ext=tar.gz ;;
           Linux-ARM64) target=aarch64-unknown-linux-musl ext=tar.gz ;;
@@ -94,6 +101,7 @@ runs:
         export OVR_STATE_DIR="$RUNNER_TEMP/ovr/state"
         ovrd connect "$ADDR" "github:$INITIATOR" || warn "ovrd connect could not start; see above"
         echo "log=$OVR_STATE_DIR/connect-github.log" >>"$GITHUB_OUTPUT"
+        echo "ovr_action_log=$OVR_STATE_DIR/connect-github.log" >>"$GITHUB_ENV"
 
     - if: inputs.hold != '' && steps.connect.outputs.log != ''
       shell: bash
