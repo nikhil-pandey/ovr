@@ -92,8 +92,23 @@ pub async fn connect_or_spawn(program: &Path) -> io::Result<ClientStream> {
 /// Starts `program` detached from this process, its terminal, and its signals, logging to `ovrd.log`.
 fn spawn(program: &Path) -> io::Result<()> {
     let log = std::fs::File::create(paths::log_dir()?.join("ovrd.log"))?;
+    spawn_detached(program, &[], log)
+}
+
+/// Starts `program` with `args` detached from this process, its terminal, and its signals, with stderr going to
+/// `log`.
+///
+/// # Errors
+///
+/// Returns an error when `program` cannot be started.
+pub fn spawn_detached(
+    program: &Path,
+    args: &[std::ffi::OsString],
+    log: std::fs::File,
+) -> io::Result<()> {
     let mut command = std::process::Command::new(program);
     command
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log);

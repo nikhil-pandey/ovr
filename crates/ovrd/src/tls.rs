@@ -56,6 +56,20 @@ impl Identity {
         })
     }
 
+    /// A new identity kept only in memory, for a host that serves one workload and leaves nothing behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the key cannot be generated.
+    pub fn ephemeral() -> io::Result<Self> {
+        let (cert, key) = new_certificate()?;
+        Ok(Self {
+            fingerprint: fingerprint(&cert),
+            cert: cert.into(),
+            key: key.into(),
+        })
+    }
+
     /// Server side: requires a client certificate, which the caller then checks against the pairing records.
     ///
     /// # Errors
@@ -97,14 +111,19 @@ impl Identity {
 }
 
 fn generate(cert_path: &Path, key_path: &Path) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let (cert, key) = new_certificate()?;
+    state::write_private(key_path, &key)?;
+    state::write_private(cert_path, &cert)?;
+    Ok((cert, key))
+}
+
+/// A self-signed Ed25519 certificate and its PKCS #8 key, DER-encoded.
+fn new_certificate() -> io::Result<(Vec<u8>, Vec<u8>)> {
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).map_err(io::Error::other)?;
     let cert = rcgen::CertificateParams::new(vec![SERVER_NAME.to_owned()])
         .and_then(|params| params.self_signed(&key))
         .map_err(io::Error::other)?;
-    let (cert, key) = (cert.der().to_vec(), key.serialize_der());
-    state::write_private(key_path, &key)?;
-    state::write_private(cert_path, &cert)?;
-    Ok((cert, key))
+    Ok((cert.der().to_vec(), key.serialize_der()))
 }
 
 /// The fingerprint of the certificate the peer presented in a completed handshake.

@@ -8,7 +8,8 @@
 The initiator job prepares repositories, pairs a host on each OS through this run's artifacts, syncs every
 repository to every host at once with `ovr`, times each step, and publishes a report. Host jobs publish their specs
 and a key, then serve the initiator with `ovrd connect --foreground` until it uploads `finished`, streaming ovrd's
-log and every run's output as they go.
+log and every run's output as they go. Each host job also connects a second time as a trusted GitHub Actions job,
+as the action does, and the initiator checks a sync to each of those.
 """
 
 from __future__ import annotations
@@ -99,9 +100,9 @@ def run(args: list[str], cwd: Path | None = None, check: bool = True) -> str:
     return result.stdout.strip()
 
 
-async def arun(args: list[str], cwd: Path | None = None) -> str:
+async def arun(args: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
     child = await asyncio.create_subprocess_exec(
-        *args, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        *args, cwd=cwd, env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
     )
     out, _ = await child.communicate()
     if child.returncode != 0:
@@ -278,6 +279,13 @@ def cmd_pair(args: argparse.Namespace) -> None:
                 input=f"{addr} {code}\n".encode(),
                 check=True,
             )
+        # Trusted jobs need no pairing, and the address and fingerprint they dial are not secret.
+        printed = await arun(["ovrd", "trust", f"github:{os.environ['GITHUB_REPOSITORY']}"])
+        values = dict(re.findall(r"gh variable set (OVR_ADDR|OVR_INITIATOR) .*--body (\S+)", printed))
+        if len(values) != 2:
+            raise SystemExit(f"ovrd trust printed no address and fingerprint:\n{printed}")
+        (out / "trust").write_text(f"{values['OVR_ADDR']} {values['OVR_INITIATOR']}\n")
+        say("initiator", f"trusting this repository's jobs through {values['OVR_ADDR']}")
 
     asyncio.run(main())
 
@@ -374,6 +382,29 @@ async def pipe_lines(who: str, prefix: str, stream: asyncio.StreamReader, log: P
             handle.close()
 
 
+async def connect_trusted(who: str) -> list[asyncio.Task]:
+    """Connects again as this GitHub Actions job, as the action does: `ovrd connect ADDR github:FP` returns at once
+    and serves in the background. It gets its own directories, so that it shares nothing with the paired host."""
+    addr, fingerprint = Path("pairs/trust").read_text().split()
+    root = Path(os.environ["RUNNER_TEMP"]) / "ovr-trusted"
+    env = {
+        **os.environ,
+        "OVR_DATA_DIR": str(root / "data"),
+        "OVR_STATE_DIR": str(root / "state"),
+        "OVR_CHECKOUTS": str(root / "checkouts"),
+    }
+    say(who, f"connecting as a trusted job to {addr}")
+    try:
+        printed = await asyncio.wait_for(arun(["ovrd", "connect", addr, f"github:{fingerprint}"], env=env), 60)
+    except TimeoutError:
+        raise SystemExit("ovrd connect github:FP did not return; the background ovrd holds its output open") from None
+    say(who, escape(printed))
+    return [
+        asyncio.create_task(follow_file(who, "trusted ovrd", root / "state" / "connect-github.log")),
+        asyncio.create_task(follow_runs(who, root / "state" / "runs")),
+    ]
+
+
 def cmd_serve(args: argparse.Namespace) -> None:
     """Pairs with the initiator and serves it, streaming ovrd's log and every run, until it uploads `finished`."""
 
@@ -415,6 +446,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
             asyncio.create_task(pipe_lines(who, "ovrd", ovrd.stdout, Path(args.log))),
             asyncio.create_task(follow_runs(who, runs_dir())),
         ]
+        background += await connect_trusted(who)
         try:
             await await_artifact(who, "finished", Path("finished"), args.serve_timeout, lambda: ovrd.returncode is None)
         finally:
@@ -554,7 +586,8 @@ def cmd_hosts(args: argparse.Namespace) -> None:
         hosts = {}
         for line in listing.splitlines():
             parts = line.split()
-            if len(parts) == 3 and parts[1] == "online":
+            # Trusted jobs' hosts, named OWNER/REPO/JOB, are checked by `trusted`.
+            if len(parts) == 3 and parts[1] == "online" and "/" not in parts[0]:
                 hosts[parts[2].split("/")[0]] = parts[0]
         if all(os_name in hosts for os_name in OSES):
             say("initiator", f"every host is online:\n{escape(listing)}")
@@ -563,6 +596,54 @@ def cmd_hosts(args: argparse.Namespace) -> None:
         if time.monotonic() > deadline:
             raise SystemExit(f"hosts did not all dial in:\n{listing}")
         time.sleep(5)
+
+
+def cmd_trusted(args: argparse.Namespace) -> None:
+    """Waits until every host job has also connected as a trusted job, which all share the job ID `host`, and
+    checks that the working tree reaches each one."""
+    base = f"{os.environ['GITHUB_REPOSITORY']}/host"
+    want = {base, *(f"{base}-{n}" for n in range(2, len(OSES) + 1))}
+    deadline = time.monotonic() + args.timeout
+    while True:
+        listing = run(["ovr", "hosts"], check=False)
+        online = {}
+        for line in listing.splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[1] == "online" and parts[0] in want:
+                online[parts[0]] = parts[2].split("/")[0]
+        if set(online) == want and sorted(online.values()) == sorted(OSES):
+            say("initiator", f"every trusted job is online:\n{escape(listing)}")
+            break
+        if time.monotonic() > deadline:
+            raise SystemExit(f"trusted jobs did not all connect as {sorted(want)}:\n{listing}")
+        time.sleep(5)
+
+    repo, logs = Path(args.dir), Path(args.logs)
+    repo.mkdir(parents=True, exist_ok=True)
+    logs.mkdir(parents=True, exist_ok=True)
+    run(["git", "init", "-q"], cwd=repo)
+    (repo / "README").write_text("trusted\n")
+    run(["git", "add", "README"], cwd=repo)
+    run(["git", "-c", "user.name=e2e", "-c", "user.email=e2e@localhost", "commit", "-qm", "init"], cwd=repo)
+
+    async def check(name: str, os_name: str) -> str | None:
+        marker = repo / f"marker-{os_name}.txt"
+        marker.write_text(secrets.token_hex(32))
+        hashed = run(["git", "hash-object", marker.name], cwd=repo)
+        info = {"path": str(repo), "workdir": "", "name": "trusted"}
+        code, _, output = await ovr(os_name, name, info, name, ["git", "hash-object", marker.name], logs, 600)
+        if code != 0:
+            return f"{name} ({os_name}): exit {code}"
+        if hashed not in output:
+            return f"{name} ({os_name}): content differs"
+        return None
+
+    async def main() -> list[str]:
+        return [f for f in await asyncio.gather(*(check(n, o) for n, o in online.items())) if f]
+
+    failed = asyncio.run(main())
+    if failed:
+        raise SystemExit(f"trusted jobs failed: {', '.join(failed)}")
 
 
 async def ovr(
@@ -912,6 +993,12 @@ def main() -> None:
     p.add_argument("--timeout", type=float, default=900)
     p.add_argument("--out", default="hosts.json")
     p.set_defaults(func=cmd_hosts)
+
+    p = sub.add_parser("trusted", help="initiator: wait for every host's trusted job and sync to each")
+    p.add_argument("--timeout", type=float, default=600)
+    p.add_argument("--dir", default=str(Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "trusted-repo"))
+    p.add_argument("--logs", default="logs")
+    p.set_defaults(func=cmd_trusted)
 
     p = sub.add_parser("bench", help="initiator: sync and run every repository on every host at once")
     p.add_argument("--hosts", default="hosts.json")

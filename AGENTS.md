@@ -9,11 +9,14 @@ source of truth for behaviour; read it before changing anything user-visible.
 - `crates/ovrd`: the server. Initiator-side host connections, and the agent that runs on hosts.
 - `crates/ovr-proto`: what both binaries share: the wire format, running `git`, where files live, and finding and
   starting the local `ovrd`.
+- `action.yml`: the GitHub action that connects a job to an initiator through `ovrd connect ADDR github:FP`. It stays
+  best effort: every failure is a warning.
 
 ## Principles
 
 - Keep it minimal. No configuration files, no flags that a fixed default can replace, and no environment variables
-  beyond the `OVR_*` directory overrides in `crates/ovr-proto/src/paths.rs`.
+  beyond the `OVR_*` directory overrides in `crates/ovr-proto/src/paths.rs` and those a CI provider sets for its
+  jobs, such as GitHub Actions' token request variables.
 - Keep the README short: what it is, install, one example per command, a link to the design. Details belong in
   `docs/DESIGN.md`, not the README.
 - Update `docs/DESIGN.md` in the same change when behaviour changes.

@@ -6,7 +6,8 @@ name: Tunnel e2e
 #
 # Quick tunnel addresses are random, so the jobs meet through this run's artifacts: each host uploads its specs and a
 # public key, the initiator answers with `ovrd connect` arguments encrypted to each key, and uploads `finished` at
-# the end.
+# the end. Each host also connects as a trusted job of this repository, without pairing, and the initiator checks a
+# sync to each.
 on:
   workflow_dispatch:
     inputs:
@@ -79,6 +80,8 @@ jobs:
           retention-days: 1
       - name: Wait for the hosts to dial in
         run: uv run .github/e2e/e2e.py hosts
+      - name: Sync to every trusted job
+        run: uv run .github/e2e/e2e.py trusted
       - name: Sync and run on every host
         run: uv run .github/e2e/e2e.py bench
       - if: always()
@@ -120,6 +123,10 @@ jobs:
           - { name: windows, os: windows-2025-vs2026 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 350
+    permissions:
+      contents: read
+      actions: read
+      id-token: write # connects as a trusted job too
     env:
       RUNS_ON: ${{ matrix.os }}
     steps:
@@ -167,5 +174,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: host-log-${{ matrix.name }}
-          path: ovrd.log
+          path: |
+            ovrd.log
+            ${{ runner.temp }}/ovr-trusted/state/connect-github.log
           if-no-files-found: ignore

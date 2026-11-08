@@ -37,9 +37,9 @@ Constraints that shape the design:
 
 ## Principles
 
-- **No configuration.** No project file and no user file. The only state is what `ssh` already has and the pairing
-  and tunnel records created by `ovrd pair`. A few environment variables move where files live (see
-  [Files](#files)); none is needed.
+- **No configuration.** No project file and no user file. The only state is what `ssh` already has, the pairing
+  and tunnel records created by `ovrd pair`, and the trust rules added by `ovrd trust`. A few environment variables
+  move where files live (see [Files](#files)); none is needed.
 - **No environment forwarding.** The remote command sees the remote user's login environment, nothing from the
   initiator. Credentials never leave the machine by accident.
 - **Git decides what is sent.** Tracked and untracked files are sent; `.gitignore`d files are never sent. Build
@@ -59,7 +59,8 @@ Constraints that shape the design:
 - Two-way sync or remote editing. Use your editor's remote mode for that.
 - Copying build outputs back. Run the thing remotely, or `scp` what you need.
 - Provisioning machines, SSH keys, networks, or tunnel accounts. Tunnels use a provider CLI you already have.
-- Keeping CI jobs alive. A tunnel reaches a runner for as long as its job runs, no longer.
+- Keeping CI jobs alive. A runner serves for as long as its job runs, no longer, unless the job asks the action to
+  hold it for a while.
 
 ## Two binaries
 
@@ -89,8 +90,11 @@ ovrd                        the initiator server; started automatically by ovr, 
 ovrd pair [PROVIDER]        print a one-shot command for a host that must dial in; PROVIDER opens a tunnel first
 ovrd tunnel                 list open tunnels and the command that points a paired host at each
 ovrd tunnel close PROVIDER  close a tunnel that `ovrd pair` opened
+ovrd trust [RULE]           trust workloads matching RULE to dial in without pairing; list the rules and how to dial
+ovrd untrust RULE           stop trusting workloads matching RULE
 ovrd connect ADDR CODE      on a host: pair with the initiator at ADDR and keep serving it (printed by `pair`)
 ovrd connect [ADDR]         on a host: keep serving the initiator it paired with, at ADDR from now on if given
+ovrd connect ADDR github:FP in a GitHub Actions job: serve the initiator with fingerprint FP while the job runs
 ```
 
 - `HOST` is a dialed-in host's name (its hostname, as shown by `ovr hosts`) or an SSH destination: an alias from
@@ -237,7 +241,68 @@ Microsoft Dev Tunnels.
   reboots; it suits short-lived hosts such as CI runners. `ovrd tunnel` shows each tunnel's current address with the
   `ovrd connect ADDR` command that moves a paired host to it.
 - **CI runners.** `--foreground` serves for as long as the job runs and installs nothing. When the job ends, its
-  runs end with it.
+  runs end with it. A runner that should connect on every run, without a fresh code each time, is a
+  [trusted workload](#trusted-workloads) instead.
+
+### Trusted workloads
+
+A pairing code is single-use and expires in ten minutes, and an ephemeral host keeps nothing from one run to the
+next, so CI runners would need a fresh code every time. Instead, the initiator can trust a **workload** that an
+identity provider vouches for. GitHub Actions is the only provider so far.
+
+```
+ initiator$ ovrd trust github:nikhil-pandey/ovr
+ trusting github:nikhil-pandey/ovr
+ ...
+   gh variable set OVR_ADDR --repo nikhil-pandey/ovr --body devtunnel:quiet-river-x1y2z3
+   gh variable set OVR_INITIATOR --repo nikhil-pandey/ovr --body 2bc272ae...fc000972
+```
+
+```yaml
+jobs:
+  build:
+    permissions:
+      id-token: write
+    steps:
+      - if: failure() || runner.debug == '1'
+        uses: nikhil-pandey/ovr@vX.Y.Z   # as `ovrd trust` prints it
+        with:
+          addr: ${{ vars.OVR_ADDR }}
+          initiator: ${{ vars.OVR_INITIATOR }}
+          hold: 30m
+```
+
+- **Rules.** `ovrd trust github:OWNER/REPO` trusts the jobs of one repository, and `github:OWNER` those of every
+  repository of an owner; `ovrd untrust` removes a rule. Rules live in `trust.json` in the data directory. Names
+  match without regard to case, as on GitHub, and the first token a rule admits records the owner's and
+  repository's IDs, so that an account or repository created later under a released name is refused.
+- **Tokens.** On every connection, the host asks the runner for a fresh OIDC token whose audience is
+  `ovr:<initiator fingerprint>`, and sends it in a `FEDERATED` frame in place of the `BANNER`. The initiator checks
+  the RS256 signature against GitHub's published keys (fetched when a token names one it has not seen, at most once
+  a minute), then the issuer, audience, expiry, and rules. Tokens for any other audience are refused, so a token
+  that unlocks anything else is never accepted, and one issued for this initiator is useless elsewhere. Nothing is
+  stored on either side: no pairing record, and on the host no identity, which lives in memory for the process.
+- **The fingerprint pins the initiator.** `github:FP` gives the host the initiator's fingerprint, which it checks
+  before sending any token, as a paired host does. Neither the fingerprint nor the address is a secret, so the
+  workflow carries none; GitHub does not let pull requests from forks request tokens.
+- **Names.** A trusted host is named `OWNER/REPO/JOB`, after the repository and the job's ID in the workflow, as in
+  `ovr nikhil-pandey/ovr/build -- cargo test`; a job without an ID is refused. While another host holds or, for two
+  minutes after disconnecting, keeps that name, the next gets `OWNER/REPO/JOB-2`, and so on; a host reconnecting
+  under the same identity gets its name back. The name contains `/`, so it can never be a paired host's or an SSH
+  destination's, and `ovr hosts` lists it only while it is connected.
+- **In the background.** Without `--foreground`, `ovrd connect ADDR github:FP` starts itself again in the
+  background, logging to `connect-github.log` in the log directory, and returns at once. It retries with the usual
+  backoff for as long as the job runs; the runner ends it with the job. A missing `id-token: write` permission is
+  reported before it starts.
+- **The action.** `action.yml` at the repository root installs the `ovrd` release matching its tag (else the
+  latest) and, on runners without it, the tunnel CLI the address needs, then runs `ovrd connect`. Every failure is
+  a warning, so the action never fails a job. With `hold` (`30m`, `1h`, `90s`; a bare number is minutes), its step
+  keeps the job running for that long and shows the connection log; without it, the runner serves only while the
+  job's later steps run. Gating the step on `failure() || runner.debug == '1'` connects only when a job fails or
+  is re-run with debug logging.
+- **Reaching the initiator.** `ovrd trust` prints the open tunnel's address if there is one, the Dev Tunnel first,
+  as it keeps its address; a Cloudflare quick tunnel's changes when it restarts. Storing the address and fingerprint
+  as repository or organization variables keeps the step the same in every workflow.
 
 Nothing about the initiator-side `ovrd` is tied to a laptop; the same server can run on an always-on VM later
 (see Milestones). It usually runs on your laptop because that needs no additional machine.
@@ -517,12 +582,17 @@ caches such as sccache or bazel-remote are a per-host concern and work unchanged
 
 ## Security
 
-- Hosts come only from the command line and from explicit pairing; `ovrd` never discovers or scans anything.
+- Hosts come only from the command line, explicit pairing, and trust rules; `ovrd` never discovers or scans
+  anything.
 - Tunnels are transport only and anonymous by design: authentication is the pinned mutual TLS inside them, so a
   tunnel's public address is not a secret, and no provider credential is ever printed or logged.
 - SSH hosts: authentication and host verification are OpenSSH's, using your existing configuration.
 - Dial-in hosts: mutual TLS 1.3 with keys pinned at pairing. A host serves only the initiator it paired with; the
   initiator accepts only hosts it paired. Pairing codes are one-shot, expiring, and rate-limited.
+- Trusted workloads: the same TLS, with the initiator pinned by the fingerprint the host is given, and the host
+  admitted by a provider token for this initiator's audience that a trust rule matches. Anyone who can run a trusted
+  workflow can make a host appear, but a host only receives work: a trusted host is named `OWNER/REPO/JOB`, never a
+  paired host's name, and runs nothing until you send it something.
 - Dial-in agents run as a normal user, inside their checkouts directory only.
 - No environment is forwarded, so local tokens and keys cannot leak into the remote process.
 - `.gitignore`d files never leave the initiator, and neither does Git history: hosts hold only snapshots.
@@ -539,7 +609,7 @@ caches such as sccache or bazel-remote are a per-host concern and work unchanged
 
 | | Linux | macOS | Windows |
 |---|---|---|---|
-| Identity, pairings, tunnels, locks | `~/.local/share/ovr` | `~/Library/Application Support/ovr` | `%LOCALAPPDATA%\ovr\data` |
+| Identity, pairings, tunnels, trust rules, locks | `~/.local/share/ovr` | `~/Library/Application Support/ovr` | `%LOCALAPPDATA%\ovr\data` |
 | Downloaded agents | `~/.cache/ovr` | `~/Library/Caches/ovr` | `%LOCALAPPDATA%\ovr\cache` |
 | Logs | `~/.local/state/ovr` | `~/Library/Logs/ovr` | `%LOCALAPPDATA%\ovr\data` |
 | Runs (hosts) | `~/.local/state/ovr/runs` | `~/Library/Application Support/ovr/runs` | `%LOCALAPPDATA%\ovr\data\runs` |
@@ -551,7 +621,7 @@ or relative values are ignored:
 
 | Variable | Moves |
 |---|---|
-| `OVR_DATA_DIR` | identity, pairings, tunnels, locks; checkouts and the macOS and Windows socket and runs follow |
+| `OVR_DATA_DIR` | identity, pairings, tunnels, trust rules, locks; checkouts and the macOS and Windows socket and runs follow |
 | `OVR_CACHE_DIR` | downloaded agents |
 | `OVR_STATE_DIR` | logs, and runs at `runs/` beneath it |
 | `OVR_CHECKOUTS` | checkouts, for example onto a fast NVMe disk: `OVR_CHECKOUTS=/nvme/ovr` |
@@ -586,7 +656,9 @@ before `ovrd` runs.
 4. **Windows.** Windows agent (Job Objects, ConPTY, paths, Scheduled Task install) and Windows initiator.
 5. **Tunnels.** `ovrd pair PROVIDER` with Cloudflare quick tunnels and Dev Tunnels, tunnel addresses and
    `--foreground` for `ovrd connect`, and heartbeats on dial-in connections.
-6. **Later, only if needed.** `ovrd` on an always-on VM shared by several people's machines, copying outputs back, a
+6. **Trusted workloads.** `ovrd trust` with GitHub Actions OIDC, `ovrd connect ADDR github:FP` in the background,
+   and the GitHub action.
+7. **Later, only if needed.** `ovrd` on an always-on VM shared by several people's machines, copying outputs back, a
    remembered default host.
 
 ## Prior art

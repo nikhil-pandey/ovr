@@ -54,6 +54,7 @@ pub enum FrameKind {
     Accept = 49,
     Pair = 50,
     PairOk = 51,
+    Federated = 52,
 }
 
 impl TryFrom<u8> for FrameKind {
@@ -62,8 +63,8 @@ impl TryFrom<u8> for FrameKind {
     fn try_from(byte: u8) -> Result<Self, Error> {
         use FrameKind::{
             Accept, Attach, Attached, Banner, Clean, Cleaned, Consumed, Err, Error as Fail, Exec,
-            Exit, Hello, In, Interrupt, Kill, Out, Pack, Pair, PairOk, Request, Resize, Response,
-            RunList, Runs, Synced, Welcome,
+            Exit, Federated, Hello, In, Interrupt, Kill, Out, Pack, Pair, PairOk, Request, Resize,
+            Response, RunList, Runs, Synced, Welcome,
         };
         Ok(match byte {
             1 => Hello,
@@ -92,6 +93,7 @@ impl TryFrom<u8> for FrameKind {
             49 => Accept,
             50 => Pair,
             51 => PairOk,
+            52 => Federated,
             other => return Result::Err(Error::UnknownFrame(other)),
         })
     }

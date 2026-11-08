@@ -21,6 +21,7 @@ use tokio::task::JoinSet;
 use crate::mux::{Channel, Mux};
 use crate::pairing::Codes;
 use crate::tls::Identity;
+use crate::trust::{Rule, Trust};
 use crate::{Error, state};
 
 /// TCP port dial-in hosts connect to.
@@ -46,6 +47,8 @@ pub async fn run() -> Result<(), Error> {
         dialed: Registry::default(),
         ssh: ssh::Pool::default(),
         codes: Mutex::default(),
+        trust: Trust::new(dir.clone()),
+        admitting: tokio::sync::Mutex::default(),
         tunnels: tunnels::Tunnels::new(dir.clone()),
         dir,
     });
@@ -91,6 +94,9 @@ pub(crate) struct Server {
     dialed: Registry,
     ssh: ssh::Pool,
     codes: Mutex<Codes>,
+    trust: Trust,
+    /// Held while a federated host is given a name, so that two cannot be given the same one.
+    admitting: tokio::sync::Mutex<()>,
     tunnels: tunnels::Tunnels,
 }
 
@@ -174,6 +180,12 @@ async fn handle(server: Arc<Server>, stream: ipc::ServerStream, restart: Arc<Not
         Op::Clean => clean().await.unwrap_or_else(|err| Response::Failed {
             message: err.to_string(),
         }),
+        Op::Trust { rule } => server
+            .trust_rule(rule.as_deref(), true)
+            .unwrap_or_else(|message| Response::Failed { message }),
+        Op::Untrust { rule } => server
+            .trust_rule(Some(&rule), false)
+            .unwrap_or_else(|message| Response::Failed { message }),
     };
     if respond(&mut stream, &response).await.is_ok() {
         let _ = stream.close().await;
@@ -220,19 +232,73 @@ impl Server {
                 })?;
             return Ok((mux.open().await?, None));
         }
+        // A federated host is named `OWNER/REPO/JOB`, which no paired host or SSH destination is; it may be
+        // reconnecting.
+        if is_federated(host) {
+            let mux = self
+                .dialed
+                .wait_for(host, ONLINE_WAIT)
+                .await
+                .ok_or_else(|| Error::Host(format!("{host} is not connected")))?;
+            return Ok((mux.open().await?, None));
+        }
         let (channel, lease) = self.ssh.open(host).await?;
         Ok((channel, Some(lease)))
     }
 
+    /// Paired hosts, then federated hosts while they are connected.
     fn hosts(&self) -> io::Result<Response> {
-        let hosts = state::hosts(&self.dir)?
+        let mut hosts: Vec<HostStatus> = state::hosts(&self.dir)?
             .into_iter()
             .map(|host| HostStatus {
                 platform: self.dialed.platform(&host.name),
                 name: host.name,
             })
             .collect();
+        for name in self.dialed.names() {
+            if !hosts.iter().any(|host| host.name == name) {
+                hosts.push(HostStatus {
+                    platform: self.dialed.platform(&name),
+                    name,
+                });
+            }
+        }
         Ok(Response::Hosts { hosts })
+    }
+
+    /// Adds `rule` to the trust rules, or removes it unless `add`, and answers with the rules and what a trusted
+    /// workload needs to dial in: this initiator's fingerprint and an address, through an open tunnel if any.
+    fn trust_rule(&self, rule: Option<&str>, add: bool) -> Result<Response, String> {
+        if let Some(rule) = rule {
+            let rule: Rule = rule.parse()?;
+            if add {
+                self.trust.add(rule).map_err(|err| err.to_string())?;
+            } else if !self.trust.remove(&rule).map_err(|err| err.to_string())? {
+                return Err(format!("{rule} is not trusted"));
+            }
+        }
+        let rules = self
+            .trust
+            .rules()
+            .map_err(|err| err.to_string())?
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let tunnels = self.tunnels.list();
+        let addr = [Provider::Devtunnel, Provider::Cloudflare]
+            .into_iter()
+            .find_map(|provider| {
+                tunnels
+                    .iter()
+                    .find(|tunnel| tunnel.provider == provider)
+                    .and_then(|tunnel| tunnel.addr.clone())
+            })
+            .unwrap_or_else(|| format!("{}:{PORT}", local_ip()));
+        Ok(Response::Trust {
+            rules,
+            initiator: self.identity.fingerprint.clone(),
+            addr,
+        })
     }
 
     /// Hosts with an open connection: dialed-in hosts that are online, then SSH hosts in use.
@@ -271,7 +337,7 @@ fn local_ip() -> std::net::IpAddr {
         .unwrap_or(std::net::Ipv4Addr::LOCALHOST.into())
 }
 
-/// Dialed-in hosts that are currently connected, by name.
+/// Dialed-in hosts by name: connected, or recently disconnected and keeping the name for a while.
 #[derive(Default)]
 struct Registry {
     hosts: Mutex<HashMap<String, Dialed>>,
@@ -281,19 +347,46 @@ struct Registry {
 
 struct Dialed {
     id: u64,
+    fingerprint: String,
     mux: Mux,
     platform: Platform,
+    /// When the connection was removed; the name stays reserved for the host until [`RESERVE`] has passed.
+    released: Option<Instant>,
+}
+
+impl Dialed {
+    fn live(&self) -> bool {
+        self.released.is_none() && !self.mux.is_closed()
+    }
+}
+
+/// How long a disconnected federated host keeps its name: well beyond its reconnection backoff.
+const RESERVE: Duration = Duration::from_mins(2);
+
+/// Whether `host` is shaped like a federated host's name: plain name parts joined by `/`.
+fn is_federated(host: &str) -> bool {
+    host.contains('/')
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
 }
 
 impl Registry {
     /// Registers a connection, replacing any earlier one from the same host. Returns an id for [`Registry::remove`].
-    fn insert(&self, name: &str, mux: Mux, platform: Platform) -> u64 {
+    fn insert(&self, name: &str, fingerprint: &str, mux: Mux, platform: Platform) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let dialed = Dialed {
+            id,
+            fingerprint: fingerprint.to_owned(),
+            mux,
+            platform,
+            released: None,
+        };
         let previous = self
             .hosts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(name.to_owned(), Dialed { id, mux, platform });
+            .insert(name.to_owned(), dialed);
         if let Some(previous) = previous {
             previous.mux.close();
         }
@@ -301,10 +394,33 @@ impl Registry {
         id
     }
 
+    /// The name the host with `fingerprint` had, if it is reconnecting, else `base`, `base-2`, `base-3`, and so on:
+    /// the first no other host has or recently had.
+    fn free_name(&self, base: &str, fingerprint: &str) -> String {
+        let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
+        hosts.retain(|_, dialed| dialed.released.is_none_or(|at| at.elapsed() < RESERVE));
+        if let Some(name) = hosts
+            .iter()
+            .find(|(_, dialed)| dialed.fingerprint == fingerprint)
+            .map(|(name, _)| name.clone())
+        {
+            return name;
+        }
+        // At most one name per host is taken, so one of these is free.
+        (1..=hosts.len() + 1)
+            .map(|n| match n {
+                1 => base.to_owned(),
+                n => format!("{base}-{n}"),
+            })
+            .find(|name| !hosts.contains_key(name))
+            .unwrap_or_else(|| base.to_owned())
+    }
+
+    /// Marks a connection gone, keeping its name reserved for a while.
     fn remove(&self, name: &str, id: u64) {
         let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
-        if hosts.get(name).is_some_and(|dialed| dialed.id == id) {
-            hosts.remove(name);
+        if let Some(dialed) = hosts.get_mut(name).filter(|dialed| dialed.id == id) {
+            dialed.released = Some(Instant::now());
         }
     }
 
@@ -312,15 +428,15 @@ impl Registry {
         let hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
         hosts
             .get(name)
+            .filter(|dialed| dialed.live())
             .map(|dialed| dialed.mux.clone())
-            .filter(|mux| !mux.is_closed())
     }
 
     fn names(&self) -> Vec<String> {
         let hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
         let mut names: Vec<String> = hosts
             .iter()
-            .filter(|(_, dialed)| !dialed.mux.is_closed())
+            .filter(|(_, dialed)| dialed.live())
             .map(|(name, _)| name.clone())
             .collect();
         names.sort();
@@ -331,7 +447,7 @@ impl Registry {
         let hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
         hosts
             .get(name)
-            .filter(|dialed| !dialed.mux.is_closed())
+            .filter(|dialed| dialed.live())
             .map(|dialed| dialed.platform.clone())
     }
 

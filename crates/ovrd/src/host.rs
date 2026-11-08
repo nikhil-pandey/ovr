@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use ovr_proto::frame::{self, Framed, Resumed};
 use ovr_proto::lock::Lock;
-use ovr_proto::msg::{Failure, Pair, PairOk};
+use ovr_proto::msg::{Accepted, Failure, Federated, Pair, PairOk};
 use ovr_proto::{Frame, FrameKind};
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
@@ -17,6 +17,7 @@ use tokio_rustls::client::TlsStream;
 use crate::mux::Incoming;
 use crate::state::{self, Initiator};
 use crate::tls::{self, Identity};
+use crate::trust::{Federation, Provider};
 use crate::tunnel::{self, Addr, Running};
 use crate::{Error, agent, autostart, mux, pairing};
 
@@ -35,6 +36,8 @@ type Stream = Framed<TlsStream<TcpStream>>;
 
 /// `ovrd connect`: pair with the initiator at `addr` using `code`, or move to `addr` without one, then keep serving
 /// it, in the foreground if asked to or if it cannot be started at login. Without `addr`, serve the paired initiator.
+/// A code of the form `PROVIDER:FINGERPRINT` serves as a workload that provider vouches for instead; see
+/// [`federated`].
 ///
 /// # Errors
 ///
@@ -45,6 +48,10 @@ pub async fn connect(
     foreground: bool,
 ) -> Result<(), Error> {
     match (addr, code) {
+        (Some(addr), Some(code)) if code.contains(':') => {
+            let federation = code.parse().map_err(Error::Invalid)?;
+            return federated(addr, federation, foreground).await;
+        }
         (Some(addr), Some(code)) => pair(&addr, code).await?,
         (Some(addr), None) => move_to(&addr).await?,
         (None, _) => return serve().await,
@@ -62,6 +69,48 @@ pub async fn connect(
             serve().await
         }
     }
+}
+
+/// Serves the initiator at `addr` as a workload `federation`'s provider vouches for, such as a GitHub Actions job,
+/// until this process ends. Nothing is installed or recorded, and the identity lives only in memory. Unless
+/// `foreground`, it starts itself again in the background, logging to a file, and returns at once, so that a CI
+/// step never waits for an initiator that is away.
+async fn federated(addr: Addr, federation: Federation, foreground: bool) -> Result<(), Error> {
+    federation
+        .provider
+        .check_environment()
+        .map_err(Error::Invalid)?;
+    if !foreground {
+        let log_path =
+            ovr_proto::paths::log_dir()?.join(format!("connect-{}.log", federation.provider));
+        let log = std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let args = [
+            "connect".into(),
+            addr.to_string().into(),
+            federation.to_string().into(),
+            "--foreground".into(),
+        ];
+        ovr_proto::ipc::spawn_detached(&std::env::current_exe()?, &args, log)?;
+        println!(
+            "serving {addr} in the background until this job ends; log: {}",
+            log_path.display()
+        );
+        return Ok(());
+    }
+    let identity = Identity::ephemeral()?;
+    let config = Arc::new(agent::Config::detect()?);
+    tracing::info!(%addr, provider = %federation.provider, "serving");
+    keep_serving(
+        &identity,
+        &addr,
+        &federation.initiator,
+        Some(federation.provider),
+        &config,
+    )
+    .await
 }
 
 /// Pairs with the initiator at `addr` using `code`.
@@ -143,7 +192,18 @@ pub async fn serve() -> Result<(), Error> {
     let identity = Identity::load_or_create(&dir)?;
     let config = Arc::new(agent::Config::detect()?);
     tracing::info!(%addr, "serving");
+    keep_serving(&identity, &addr, &initiator.fingerprint, None, &config).await
+}
 
+/// Serves the initiator at `addr` with fingerprint `pinned` forever, reconnecting with backoff. With `provider`,
+/// each connection presents a fresh token from it instead of relying on a pairing.
+async fn keep_serving(
+    identity: &Identity,
+    addr: &Addr,
+    pinned: &str,
+    provider: Option<Provider>,
+    config: &Arc<agent::Config>,
+) -> Result<(), Error> {
     let max_backoff = match addr {
         Addr::Direct(_) => MAX_BACKOFF,
         Addr::Tunnel { .. } => MAX_TUNNEL_BACKOFF,
@@ -152,12 +212,16 @@ pub async fn serve() -> Result<(), Error> {
     // Retries come every few seconds while the initiator is away, so only a new reason is logged.
     let mut reported = None;
     loop {
-        match attach(&identity, &addr, &initiator.fingerprint).await {
-            Ok((forwarder, stream)) => {
-                tracing::info!("connected");
+        match attach(identity, addr, pinned, provider).await {
+            Ok((forwarder, stream, name)) => {
+                if let Some(name) = name {
+                    tracing::info!(%name, "connected; run `ovr {name} -- CMD` on the initiator");
+                } else {
+                    tracing::info!("connected");
+                }
                 backoff = Duration::from_secs(1);
                 reported = None;
-                agent::serve(Incoming::accept_with_heartbeat(stream), Arc::clone(&config)).await;
+                agent::serve(Incoming::accept_with_heartbeat(stream), Arc::clone(config)).await;
                 drop(forwarder);
                 tracing::info!("disconnected");
             }
@@ -176,27 +240,60 @@ pub async fn serve() -> Result<(), Error> {
     }
 }
 
-/// Connects to the pinned initiator and announces this host. The forwarder, if any, must outlive the stream.
+/// Connects to the pinned initiator and announces this host, with a token from `provider` if given. Returns the
+/// forwarder, if any, which must outlive the stream, and the name the initiator gave a federated host.
 async fn attach(
     identity: &Identity,
     addr: &Addr,
     pinned: &str,
-) -> Result<(Option<Running>, Resumed<TlsStream<TcpStream>>), Error> {
+    provider: Option<Provider>,
+) -> Result<
+    (
+        Option<Running>,
+        Resumed<TlsStream<TcpStream>>,
+        Option<String>,
+    ),
+    Error,
+> {
     let (forwarder, mut stream, fingerprint) = dial(identity, addr).await?;
     if fingerprint != pinned {
-        return Err(Error::Pairing(format!(
-            "{addr} presented a different identity than when paired; pair again if the initiator was reset"
-        )));
+        return Err(Error::Pairing(match provider {
+            Some(_) => format!(
+                "{addr} presented a different identity than the fingerprint this host was given; check it with \
+                 `ovrd trust` on the initiator"
+            ),
+            None => format!(
+                "{addr} presented a different identity than when paired; pair again if the initiator was reset"
+            ),
+        }));
     }
-    stream
-        .send(Frame::json(FrameKind::Banner, &agent::banner())?)
-        .await?;
+    let banner = agent::banner();
+    let hello = match provider {
+        // A fresh token for every connection: they live for minutes, and this one only goes to the pinned initiator.
+        Some(provider) => Frame::json(
+            FrameKind::Federated,
+            &Federated {
+                provider: provider.name().to_owned(),
+                token: provider.token(pinned).await.map_err(Error::Host)?,
+                label: provider.label(),
+                banner,
+            },
+        )?,
+        None => Frame::json(FrameKind::Banner, &banner)?,
+    };
+    stream.send(hello).await?;
     let reply = tokio::time::timeout(CONNECT_TIMEOUT, stream.next())
         .await
         .map_err(|_| Error::Disconnected)?
         .ok_or(Error::Disconnected)??;
     match reply.kind {
-        FrameKind::Accept => Ok((forwarder, frame::resume(stream))),
+        FrameKind::Accept => {
+            let name = match provider {
+                Some(_) => Some(reply.parse::<Accepted>()?.name),
+                None => None,
+            };
+            Ok((forwarder, frame::resume(stream), name))
+        }
         FrameKind::Error => Err(Error::Pairing(reply.parse::<Failure>()?.message)),
         kind => Err(ovr_proto::Error::Unexpected(kind).into()),
     }

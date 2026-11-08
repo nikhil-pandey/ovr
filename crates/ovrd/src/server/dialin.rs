@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use ovr_proto::frame::{self, Framed};
-use ovr_proto::msg::{Banner, Failure, Pair, PairOk};
+use ovr_proto::msg::{Accepted, Banner, Failure, Federated, Pair, PairOk};
 use ovr_proto::{Frame, FrameKind, PROTOCOL_VERSION};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -83,6 +83,7 @@ async fn handle(server: &Server, acceptor: &TlsAcceptor, tcp: TcpStream) -> Resu
     match first.kind {
         FrameKind::Pair => pair(server, &mut tls, &first, &fingerprint).await,
         FrameKind::Banner => attach(server, tls, &first, &fingerprint).await,
+        FrameKind::Federated => federated(server, tls, &first, &fingerprint).await,
         kind => Err(ovr_proto::Error::Unexpected(kind).into()),
     }
 }
@@ -171,7 +172,7 @@ where
     let mux = Mux::open_with_heartbeat(frame::resume(stream));
     let id = server
         .dialed
-        .insert(&paired.name, mux.clone(), banner.platform);
+        .insert(&paired.name, fingerprint, mux.clone(), banner.platform);
     tracing::info!(
         name = paired.name,
         version = banner.version,
@@ -181,6 +182,94 @@ where
     server.dialed.remove(&paired.name, id);
     tracing::info!(name = paired.name, "host disconnected");
     Ok(())
+}
+
+/// Serves a host that is not paired but presents a token a trust rule admits, under a name taken from the workload
+/// and the host's label, as in `nikhil-pandey/ovr/build`, with a number added while another host has it.
+async fn federated<S>(
+    server: &Server,
+    mut stream: Framed<S>,
+    frame: &Frame,
+    fingerprint: &str,
+) -> Result<(), Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let request: Federated = frame.parse()?;
+    let admitted = if request.banner.protocol == PROTOCOL_VERSION {
+        server
+            .trust
+            .admit(
+                &request.provider,
+                &request.token,
+                &server.identity.fingerprint,
+            )
+            .await
+            .and_then(|workload| federated_name(&workload, &request.label))
+    } else {
+        Err(format!(
+            "ovrd {} on this host is incompatible with the initiator; install the initiator's version",
+            request.banner.version
+        ))
+    };
+    let base = match admitted {
+        Ok(base) => base,
+        Err(message) => {
+            let failure = Failure {
+                message: message.clone(),
+            };
+            stream
+                .send(Frame::json(FrameKind::Error, &failure)?)
+                .await?;
+            return Err(Error::Invalid(message));
+        }
+    };
+    // One admission at a time, so two hosts cannot both be told the same free name.
+    let admitting = server.admitting.lock().await;
+    let name = server.dialed.free_name(&base, fingerprint);
+    stream
+        .send(Frame::json(
+            FrameKind::Accept,
+            &Accepted { name: name.clone() },
+        )?)
+        .await?;
+    let mux = Mux::open_with_heartbeat(frame::resume(stream));
+    let id = server
+        .dialed
+        .insert(&name, fingerprint, mux.clone(), request.banner.platform);
+    drop(admitting);
+    tracing::info!(
+        name,
+        provider = request.provider,
+        version = request.banner.version,
+        "host connected"
+    );
+    mux.closed().await;
+    server.dialed.remove(&name, id);
+    tracing::info!(name, "host disconnected");
+    Ok(())
+}
+
+/// `WORKLOAD/LABEL`, as in `nikhil-pandey/ovr/build`. Every part must survive [`name_part`], so the name always
+/// contains `/`, which no paired host's name or SSH destination does.
+fn federated_name(workload: &str, label: &str) -> Result<String, String> {
+    let parts: Vec<String> = workload.split('/').chain([label]).map(name_part).collect();
+    if parts.len() < 2 || parts.iter().any(String::is_empty) {
+        return Err(format!(
+            "cannot name a host after {workload:?} and {label:?}; the job needs an ID"
+        ));
+    }
+    Ok(parts.join("/"))
+}
+
+/// Keeps the characters a host name may have, so that a workload's names cannot inject anything into one.
+fn name_part(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .take(64)
+        .collect::<String>()
+        .trim_start_matches(['-', '.'])
+        .to_owned()
 }
 
 /// Host names become `ovr` arguments, so they must look like one.

@@ -56,6 +56,14 @@ ovrd pair cloudflare    # or devtunnel
 ovrd tunnel             # open tunnels; `ovrd tunnel close cloudflare` closes one
 ```
 
+GitHub Actions jobs of repositories you trust dial in without pairing, through
+[the action](docs/DESIGN.md#trusted-workloads):
+
+```sh
+ovrd trust github:OWNER/REPO   # on your machine: prints the variables and the step to add
+ovr OWNER/REPO/JOB -- make test
+```
+
 Remove checkouts and finished runs, keeping anything in use:
 
 ```sh
