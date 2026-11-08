@@ -369,7 +369,8 @@ them, exactly as they would when you save files locally mid-build.
    When another Git process holds `.git/index.lock`, the reset retries every 100 ms for up to 2 seconds, then fails
    the sync with Git's error and advice to wait for that process or, once none remains, remove the lock. The apply
    lock only coordinates `ovr`'s own syncs, so the agent cannot tell a live writer from an abandoned lock and never
-   removes it.
+   removes it. Only Git's report that the lock file already exists counts, read with `LC_ALL=C`; other failures to
+   create it, such as permissions or a read-only filesystem, fail the sync at once with Git's error.
 3. Reflogs are off in the checkout, so a snapshot becomes unreachable once it is neither checked out nor among the
    four kept. After a command exits, its keeper runs `git gc --auto` unless a sync or another collection holds the
    object lock. Collection stays under that lock until Git finishes, alongside draining clients; a new sync waits

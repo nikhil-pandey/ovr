@@ -1,5 +1,6 @@
 //! The host's persistent checkout of one repository, updated in place from snapshot packs.
 
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -174,7 +175,8 @@ impl Checkout {
     async fn reset(&self, commit: &str) -> Result<(), Error> {
         let deadline = Instant::now() + INDEX_WAIT;
         loop {
-            match git::run(&self.dir, &["reset", "--hard", "-q", commit]).await {
+            let reset = ["reset", "--hard", "-q", commit];
+            match git::run_env(&self.dir, reset, &[("LC_ALL", OsStr::new("C"))]).await {
                 Ok(_) => return Ok(()),
                 Err(error) if !index_locked(&error) => return Err(error.into()),
                 Err(error) if Instant::now() >= deadline => {
@@ -311,9 +313,17 @@ pub fn owner(initiator: &str) -> Result<&str, Error> {
     Ok(&initiator[..initiator.len().min(16)])
 }
 
-/// Whether Git failed because another process holds the index's lock file.
+/// Whether Git failed because another process holds the index's lock file. Only `File exists` means contention; Git
+/// names the lock for other creation failures too, such as permissions or a read-only filesystem.
 fn index_locked(error: &git::Error) -> bool {
-    matches!(error, git::Error::Failed { stderr, .. } if stderr.contains("index.lock"))
+    matches!(error, git::Error::Failed { stderr, .. } if index_lock_exists(stderr))
+}
+
+/// Whether Git's `LC_ALL=C` `stderr` reports that the index's lock file already exists.
+fn index_lock_exists(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        line.contains("Unable to create '") && line.contains("index.lock': File exists")
+    })
 }
 
 /// The newest snapshot applied to the checkout whose Git directory is `git_dir`, and its number.
@@ -356,6 +366,20 @@ mod tests {
             );
         }
         Ok((checkout, commits))
+    }
+
+    #[test]
+    fn only_an_existing_index_lock_is_contention() {
+        let lock = "/r/.git/index.lock";
+        assert!(index_lock_exists(&format!(
+            "fatal: Unable to create '{lock}': File exists.\n\nAnother git process seems to be running"
+        )));
+        assert!(!index_lock_exists(&format!(
+            "fatal: Unable to create '{lock}': Permission denied"
+        )));
+        assert!(!index_lock_exists(
+            "fatal: Unable to create '/r/.git/refs/heads/main.lock': File exists."
+        ));
     }
 
     #[tokio::test]
