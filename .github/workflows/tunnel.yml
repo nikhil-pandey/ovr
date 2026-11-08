@@ -1,8 +1,8 @@
 name: Tunnel
 
 # An initiator on one runner opens a Cloudflare quick tunnel, and hosts on Linux, macOS, and Windows runners dial in
-# through it, one of each kind per OS: `paired` hosts pair with a code, and `trusted` ones connect as this repository's
-# GitHub Actions jobs with an OIDC token, as the action does. In `check` mode the initiator checks that syncs and exit
+# through it, one of each kind per OS: `paired` hosts pair with a code, and `trusted` ones use this repository's
+# action, which connects as the job with an OIDC token. In `check` mode the initiator checks that syncs and exit
 # codes reach every host; in `bench` mode it syncs real repositories to every host at once, builds them there, and
 # reports each runner's specs and every step's time in the job summary. `.github/e2e/e2e.py` does the work.
 #
@@ -161,11 +161,41 @@ jobs:
           name: host-${{ env.HOST }}
           path: host
           retention-days: 1
+      - name: Wait for the initiator
+        run: uv run .github/e2e/e2e.py await --host "$HOST" pairs
+      # A trusted host connects through this repository's action, with the ovrd built above on PATH. It uses the
+      # action twice, and holds with it at the end, as a job that connects early and holds when it fails does: only
+      # the first use dials in, so the host keeps its name.
+      - if: matrix.kind == 'trusted'
+        id: trust
+        run: |
+          read -r addr initiator <pairs/trust
+          echo "addr=$addr" >>"$GITHUB_OUTPUT"
+          echo "initiator=$initiator" >>"$GITHUB_OUTPUT"
+      - if: matrix.kind == 'trusted'
+        uses: ./
+        with:
+          addr: ${{ steps.trust.outputs.addr }}
+          initiator: ${{ steps.trust.outputs.initiator }}
+          name: ${{ matrix.platform.name }}
+      - if: matrix.kind == 'trusted'
+        uses: ./
+        with:
+          addr: ${{ steps.trust.outputs.addr }}
+          initiator: ${{ steps.trust.outputs.initiator }}
+          name: ${{ matrix.platform.name }}
       - name: Serve the initiator until it has finished
         run: |
           key=()
           if [[ $HOST == *-paired ]]; then key=(--key "$RUNNER_TEMP/key/key.pem"); fi
           uv run .github/e2e/e2e.py serve --host "$HOST" "${key[@]}"
+      - if: always() && matrix.kind == 'trusted'
+        uses: ./
+        with:
+          addr: ${{ steps.trust.outputs.addr }}
+          initiator: ${{ steps.trust.outputs.initiator }}
+          name: ${{ matrix.platform.name }}
+          hold: 5s
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

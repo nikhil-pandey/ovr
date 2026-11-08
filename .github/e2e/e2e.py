@@ -6,9 +6,9 @@
 """Cross-runner e2e for ovr through a Cloudflare quick tunnel.
 
 Hosts are an OS and a kind, such as `linux-paired`. A paired host dials in with a code the initiator issues through
-this run's artifacts and serves with `ovrd connect --foreground`; a trusted host dials in as this GitHub Actions job
-with an OIDC token and serves in the background, as the action does. `KINDS` picks which kinds the run has, one host
-of each per OS. Host jobs publish their specs, and paired ones a key, then serve the initiator until it uploads
+this run's artifacts and serves with `ovrd connect --foreground`; a trusted host uses the action, which dials in as
+this GitHub Actions job with an OIDC token and serves in the background. `KINDS` picks which kinds the run has, one
+host of each per OS. Host jobs publish their specs, and paired ones a key, then serve the initiator until it uploads
 `finished`, streaming ovrd's log and every run's output as they go. The initiator either checks that syncs reach
 every host (`check`), or syncs real repositories to every host at once, builds them there, times each step, and
 publishes a report (`bench`).
@@ -467,19 +467,15 @@ async def connect_paired(who: str, key: str, log: Path) -> Serving:
     return Serving(psutil.Process(ovrd.pid), asyncio.create_task(pipe_lines(who, "ovrd", ovrd.stdout, log)))
 
 
-async def connect_trusted(who: str, log: Path) -> Serving:
-    """Dials in as this GitHub Actions job, as the action does: `ovrd connect ADDR github:FP` starts serving in the
-    background and returns at once, which a step capturing its output relies on."""
-    addr, fingerprint = Path("pairs/trust").read_text().split()
-    say(who, f"connecting as a trusted job to {addr}")
-    try:
-        printed = await asyncio.wait_for(arun(["ovrd", "connect", addr, f"github:{fingerprint}"]), 60)
-    except TimeoutError:
-        raise SystemExit("ovrd connect github:FP did not return; the background ovrd holds its output open") from None
-    say(who, escape(printed))
-    found = re.search(r"; log: (.+)$", printed, re.MULTILINE)
-    if not found:
-        raise SystemExit("ovrd connect github:FP printed no log")
+def trusted_state() -> Path:
+    """Where the action this job used keeps ovrd's state and log."""
+    return Path(os.environ["ovr_action_log"]).parent
+
+
+async def attach_trusted(who: str, log: Path) -> Serving:
+    """Follows the ovrd this job's uses of the action started in the background. Only the first dials in, so there
+    is exactly one."""
+    fingerprint = Path("pairs/trust").read_text().split()[1]
     background = [
         process
         for process in psutil.process_iter(["cmdline"])
@@ -487,28 +483,34 @@ async def connect_trusted(who: str, log: Path) -> Serving:
     ]
     if len(background) != 1:
         raise SystemExit(f"expected one ovrd serving in the background, found {len(background)}")
-    tail = asyncio.create_task(follow_file(who, "ovrd", Path(found[1].strip()), log))
+    say(who, f"serving as {escape(' '.join(background[0].info['cmdline'][1:]))}")
+    tail = asyncio.create_task(follow_file(who, "ovrd", Path(os.environ["ovr_action_log"]), log))
     return Serving(background[0], tail)
 
 
+def cmd_await(args: argparse.Namespace) -> None:
+    asyncio.run(await_artifact(args.host, args.name, Path(args.name), args.timeout))
+
+
 def cmd_serve(args: argparse.Namespace) -> None:
-    """Dials in as this host's kind and serves the initiator, streaming ovrd's log and every run, until it uploads
-    `finished`."""
+    """Dials in as a paired host, or follows the trusted job's connection, and serves the initiator, streaming
+    ovrd's log and every run, until it uploads `finished`."""
 
     async def main() -> None:
         who = args.host
-        await await_artifact(who, "pairs", Path("pairs"), args.timeout)
         if who.endswith("-paired"):
             if not args.key:
                 raise SystemExit("a paired host needs --key")
             serving = await connect_paired(who, args.key, Path(args.log))
+            runs = runs_dir()
         else:
-            serving = await connect_trusted(who, Path(args.log))
-        runs = asyncio.create_task(follow_runs(who, runs_dir()))
+            serving = await attach_trusted(who, Path(args.log))
+            runs = trusted_state() / "runs"
+        following = asyncio.create_task(follow_runs(who, runs))
         try:
             await await_artifact(who, "finished", Path("finished"), args.serve_timeout, serving.alive)
         finally:
-            runs.cancel()
+            following.cancel()
             alive = serving.alive()
             await serving.stop()
         if not alive:
@@ -635,10 +637,8 @@ def cmd_prepare(args: argparse.Namespace) -> None:
 
 def cmd_hosts(args: argparse.Namespace) -> None:
     """Waits until every host is online, and records each one's name. A paired host is named after its machine; a
-    trusted one after its job, `host`, which every host job shares, numbered in the order they connected, so its OS
-    tells which one it is."""
+    trusted one after its job, `host`, which every host job shares, and the OS it names itself after."""
     job = f"{os.environ['GITHUB_REPOSITORY']}/host"
-    trusted = {job, *(f"{job}-{n}" for n in range(2, len(OSES) + 1))}
     deadline = time.monotonic() + args.timeout
     while True:
         listing = run(["ovr", "hosts"], check=False)
@@ -648,11 +648,14 @@ def cmd_hosts(args: argparse.Namespace) -> None:
             if len(parts) != 3 or parts[1] != "online":
                 continue
             name, os_name = parts[0], parts[2].split("/")[0]
-            if name in trusted:
-                hosts[f"{os_name}-trusted"] = name
+            if name.startswith(f"{job}/"):
+                # A trusted job names itself after its OS; any other name means it dialed in twice.
+                hosts[f"{os_name}-trusted" if name == f"{job}/{os_name}" else name] = name
             elif "/" not in name:
                 hosts[f"{os_name}-paired"] = name
-        if set(HOSTS) <= set(hosts):
+        if extra := set(hosts) - set(HOSTS):
+            raise SystemExit(f"unexpected hosts {', '.join(sorted(extra))}:\n{listing}")
+        if set(hosts) == set(HOSTS):
             say("initiator", f"every host is online:\n{escape(listing)}")
             Path(args.out).write_text(json.dumps({host: hosts[host] for host in HOSTS}, indent=2))
             return
@@ -704,8 +707,8 @@ def cmd_check(args: argparse.Namespace) -> None:
 async def ovr(
     host: str, name: str, repo: dict, step: str, argv: list[str], logs: Path, timeout: float
 ) -> tuple[int | str, float, str]:
-    """Runs `ovr NAME -- argv` on `host` in the repository, streaming its output; returns its exit code, or `timeout` when it
-    was killed for taking longer than `timeout` seconds, its time, and its output."""
+    """Runs `ovr NAME -- argv` on `host` in the repository, streaming its output; returns its exit code, or
+    `timeout` when it was killed for taking longer than `timeout` seconds, its time, and its output."""
     cwd = Path(repo["path"]) / repo["workdir"]
     prefix = f"{repo['name']}: {step}"
     say(host, f"[bold]{escape(prefix)}[/]: $ ovr {name} -- {escape(' '.join(argv))}")
@@ -1008,11 +1011,16 @@ def main() -> None:
     p.add_argument("--timeout", type=float, default=3600)
     p.set_defaults(func=cmd_pair)
 
-    p = sub.add_parser("serve", help="host: dial in, then serve the initiator until it has finished")
+    p = sub.add_parser("await", help="host: download an artifact the initiator uploads, into a directory of its name")
+    p.add_argument("--host", required=True, choices=HOSTS)
+    p.add_argument("name")
+    p.add_argument("--timeout", type=float, default=2 * 3600)
+    p.set_defaults(func=cmd_await)
+
+    p = sub.add_parser("serve", help="host: serve the initiator until it has finished")
     p.add_argument("--host", required=True, choices=HOSTS)
     p.add_argument("--key", help="a paired host's private key, whose public half it published")
     p.add_argument("--log", default="ovrd.log")
-    p.add_argument("--timeout", type=float, default=2 * 3600)
     p.add_argument("--serve-timeout", type=float, default=6 * 3600)
     p.set_defaults(func=cmd_serve)
 
