@@ -59,6 +59,15 @@ impl Provider {
         }
     }
 
+    /// Where the workload's files are, such as a GitHub Actions job's `GITHUB_WORKSPACE`: where runs without a
+    /// checkout start, instead of the home directory.
+    #[must_use]
+    pub fn workspace(self) -> Option<PathBuf> {
+        match self {
+            Self::Github => github::workspace(),
+        }
+    }
+
     /// What tells apart hosts of one workload.
     #[must_use]
     pub fn label(self) -> String {

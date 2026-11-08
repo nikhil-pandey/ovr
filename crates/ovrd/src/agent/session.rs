@@ -1,14 +1,17 @@
 //! The agent half of a stream; see the client half in `ovr`'s `session` module for the sequence.
 //!
-//! A stream starts a run (`HELLO`), resumes one (`ATTACH`), lists runs (`RUNS`), or cleans up (`CLEAN`). Once a run has started, the
-//! agent only relays frames between the client and the run's keeper, so the stream's end never ends the run.
+//! A stream starts a run after syncing (`HELLO`) or without (`ENTER`), resumes one (`ATTACH`), lists runs (`RUNS`),
+//! or cleans up (`CLEAN`). Once a run has started, the agent only relays frames between the client and the run's
+//! keeper, so the stream's end never ends the run.
 
 use std::time::Instant;
 
 use futures::{SinkExt, StreamExt};
 use ovr_proto::frame::{self, Reader, Writer};
 use ovr_proto::lock::Lock;
-use ovr_proto::msg::{Attach, Attached, Clean, Exec, Failure, Hello, RunList, Runs, Welcome};
+use ovr_proto::msg::{
+    Attach, Attached, Clean, Enter, Exec, Failure, Hello, RunList, Runs, Welcome,
+};
 use ovr_proto::{Frame, FrameKind};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
@@ -62,18 +65,17 @@ async fn dispatch<S: AsyncRead + AsyncWrite>(
     match first.kind {
         FrameKind::Hello => {
             let (run, _claim) = start(writer, frames, config, &store, first.parse()?).await?;
-            let attach = Attach {
-                run: run.id,
-                out: 0,
-                err: 0,
-            };
-            attach_to(writer, frames, &run, attach).await
+            attach_to(writer, frames, &run, from_start(&run)).await
+        }
+        FrameKind::Enter => {
+            let enter: Enter = first.parse()?;
+            let exec: Exec = next(frames).await?.expect(FrameKind::Exec)?;
+            let (run, _claim) = start_unsynced(writer, config, &store, enter, exec).await?;
+            attach_to(writer, frames, &run, from_start(&run)).await
         }
         FrameKind::Attach => {
             let attach: Attach = first.parse()?;
             let run = store.open(attach.run)?;
-            let meta = run.meta()?;
-            let _claim = checkout::claim(&config.root, &meta.initiator, &meta.checkout).await?;
             attach_to(writer, frames, &run, attach).await
         }
         FrameKind::Runs => {
@@ -146,9 +148,14 @@ async fn start<S: AsyncRead + AsyncWrite>(
     }
     let meta = Meta {
         initiator: hello.initiator,
-        checkout: hello.checkout,
+        checkout: Some(hello.checkout),
         dir: checkout.dir().to_owned(),
-        cwd: checkout.cwd(&exec.cwd)?,
+        cwd: checkout.cwd(&exec.cwd)?.ok_or_else(|| {
+            Error::Invalid(format!(
+                "{} does not exist on the host because it holds no files that are sent",
+                exec.cwd.trim_end_matches('/')
+            ))
+        })?,
         exec,
         started: runs::now(),
         synced_snapshot: Some(applied.commit),
@@ -156,12 +163,91 @@ async fn start<S: AsyncRead + AsyncWrite>(
     let run = store.create(&meta).await?;
     tracing::info!(
         run = run.id,
-        checkout = meta.checkout,
+        checkout = meta.checkout.as_deref().unwrap_or_default(),
         snapshot = meta.synced_snapshot,
         "recorded run"
     );
     keeper::start(config, &run).await?;
     Ok((run, checkout.into_claim()))
+}
+
+/// Records a run in the checkout as the host has it, or in the base directory when there is none, and starts its
+/// keeper. Nothing is written to the checkout; it stays claimed until the claim is dropped.
+async fn start_unsynced<S: AsyncRead + AsyncWrite>(
+    writer: &mut Writer<S>,
+    config: &Config,
+    store: &Store,
+    enter: Enter,
+    exec: Exec,
+) -> Result<(Run, Option<Lock>), Error> {
+    checkout::owner(&enter.initiator)?;
+    let found = match &enter.checkout {
+        Some(name) => Checkout::find(&config.root, &enter.initiator, name).await?,
+        None => None,
+    };
+    let (dir, cwd) = if let Some(found) = &found {
+        let cwd = found.cwd(&exec.cwd)?.ok_or_else(|| {
+            Error::Invalid(format!(
+                "{} is not in the host's checkout as it is; run without -n to sync it first",
+                exec.cwd.trim_end_matches('/')
+            ))
+        })?;
+        (found.dir().to_owned(), cwd)
+    } else {
+        let base = &config.base;
+        if !base.is_dir() {
+            return Err(Error::Invalid(format!(
+                "the host's base directory {} does not exist",
+                base.display()
+            )));
+        }
+        if let Some(name) = &enter.checkout {
+            let warning = no_checkout(name, base, &exec.cwd);
+            writer
+                .send(Frame::new(FrameKind::Err, format!("ovr: {warning}\n")))
+                .await?;
+        }
+        (base.clone(), base.clone())
+    };
+    let meta = Meta {
+        initiator: enter.initiator,
+        checkout: found.as_ref().and(enter.checkout),
+        dir,
+        cwd,
+        exec,
+        started: runs::now(),
+        synced_snapshot: None,
+    };
+    let run = store.create(&meta).await?;
+    tracing::info!(
+        run = run.id,
+        checkout = meta.checkout.as_deref().unwrap_or_default(),
+        dir = %meta.cwd.display(),
+        "recorded a run without syncing"
+    );
+    keeper::start(config, &run).await?;
+    Ok((run, found.and_then(Checkout::into_claim)))
+}
+
+fn no_checkout(name: &str, base: &std::path::Path, prefix: &str) -> String {
+    let prefix = prefix.trim_end_matches('/');
+    let instead = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!(", not in {prefix}")
+    };
+    format!(
+        "this host has no checkout of {name} yet; running in {}{instead}",
+        base.display()
+    )
+}
+
+fn from_start(run: &Run) -> Attach {
+    Attach {
+        run: run.id,
+        out: 0,
+        err: 0,
+    }
 }
 
 /// Indexes pack frames as they arrive, until the empty end-of-pack frame, and returns the pack's size.
@@ -195,13 +281,15 @@ async fn receive_pack<S: AsyncRead>(
     Ok(bytes)
 }
 
-/// Relays between the client and the run's keeper or, once the run has ended, replays its log from disk.
+/// Relays between the client and the run's keeper or, once the run has ended, replays its log from disk. The run,
+/// and so its checkout, is watched meanwhile, so cleaning leaves both alone.
 async fn attach_to<S: AsyncRead + AsyncWrite>(
     writer: &mut Writer<S>,
     frames: &mut Reader<S>,
     run: &Run,
     attach: Attach,
 ) -> Result<(), Error> {
+    let _watch = run.watch().await?;
     if run.ended()?.is_none()
         && let Ok(stream) = keeper::connect(run).await
     {
@@ -302,6 +390,7 @@ mod tests {
             root: dir.path().join("checkouts"),
             runs: dir.path().join("runs"),
             agents: dir.path().join("agents"),
+            base: dir.path().to_owned(),
             shell: Shell::new("/bin/sh"),
             keeper: None,
         };

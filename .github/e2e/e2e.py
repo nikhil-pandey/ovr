@@ -25,6 +25,7 @@ import re
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -671,8 +672,8 @@ def cmd_hosts(args: argparse.Namespace) -> None:
 
 
 def cmd_check(args: argparse.Namespace) -> None:
-    """Checks on every host at once that the working tree arrives, that a change to it does too, and that a
-    command's exit code comes back."""
+    """Checks on every host at once that syncs arrive, that exit codes come back, that `-n` does not sync, and that
+    runs outside a repository start in the base directory: a trusted job's workspace, a paired host's home."""
     hosts = json.loads(Path(args.hosts).read_text())
     root, logs = Path(args.dir), Path(args.logs)
     root.mkdir(parents=True, exist_ok=True)
@@ -682,12 +683,15 @@ def cmd_check(args: argparse.Namespace) -> None:
     run(["git", "add", "README"], cwd=root)
     run(["git", "-c", "user.name=e2e", "-c", "user.email=e2e@localhost", "commit", "-qm", "init"], cwd=root)
     repo = {"path": str(root), "workdir": "", "name": "check"}
+    outside = Path(tempfile.mkdtemp())
 
     async def check(host: str) -> list[str]:
         failed = []
 
-        async def step(name: str, argv: list[str], want_code: int, want_output: str = "") -> None:
-            code, _, output = await ovr(host, hosts[host], repo, name, argv, logs, args.step_timeout)
+        async def step(
+            name: str, argv: list[str], want_code: int, want_output: str = "", flags=(), cwd: Path | None = None
+        ) -> None:
+            code, _, output = await ovr(host, hosts[host], repo, name, argv, logs, args.step_timeout, flags, cwd)
             if code != want_code:
                 failed.append(f"{host} {name}: exit {code}, not {want_code}")
             elif want_output not in output:
@@ -699,6 +703,15 @@ def cmd_check(args: argparse.Namespace) -> None:
             marker.write_text(secrets.token_hex(32))
             await step(name, ["git", "hash-object", marker.name], 0, run(["git", "hash-object", marker.name], cwd=root))
         await step("exit code", ["git", "hash-object", "missing"], 128)
+        synced = run(["git", "hash-object", marker.name], cwd=root)
+        marker.write_text(secrets.token_hex(32))
+        await step("without syncing", ["git", "hash-object", marker.name], 0, synced, flags=("-n",))
+        script = ".github/e2e/e2e.py"
+        if host.endswith("-trusted"):
+            want = run(["git", "hash-object", script])
+            await step("outside a repository", ["git", "hash-object", script], 0, want, cwd=outside)
+        else:
+            await step("outside a repository", ["git", "hash-object", script], 128, cwd=outside)
         return failed
 
     async def main() -> list[str]:
@@ -711,17 +724,26 @@ def cmd_check(args: argparse.Namespace) -> None:
 
 
 async def ovr(
-    host: str, name: str, repo: dict, step: str, argv: list[str], logs: Path, timeout: float
+    host: str,
+    name: str,
+    repo: dict,
+    step: str,
+    argv: list[str],
+    logs: Path,
+    timeout: float,
+    flags=(),
+    cwd: Path | None = None,
 ) -> tuple[int | str, float, str]:
-    """Runs `ovr NAME -- argv` on `host` in the repository, streaming its output; returns its exit code, or
-    `timeout` when it was killed for taking longer than `timeout` seconds, its time, and its output."""
-    cwd = Path(repo["path"]) / repo["workdir"]
+    """Runs `ovr FLAGS NAME -- argv` on `host` in the repository, or in `cwd`, streaming its output; returns its exit
+    code, or `timeout` when it was killed for taking longer than `timeout` seconds, its time, and its output."""
+    cwd = cwd or Path(repo["path"]) / repo["workdir"]
     prefix = f"{repo['name']}: {step}"
-    say(host, f"[bold]{escape(prefix)}[/]: $ ovr {name} -- {escape(' '.join(argv))}")
+    say(host, f"[bold]{escape(prefix)}[/]: $ ovr {' '.join((*flags, name))} -- {escape(' '.join(argv))}")
     log = logs / f"{host}-{repo['name']}-{re.sub(r'[^a-z0-9]+', '-', step.lower()).strip('-')}.log"
     start = time.monotonic()
     child = await asyncio.create_subprocess_exec(
         "ovr",
+        *flags,
         name,
         "--",
         *argv,

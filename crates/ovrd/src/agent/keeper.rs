@@ -219,10 +219,19 @@ async fn keep(run: Run, shell: Shell) -> Result<(), Error> {
     run.end(&ended)?;
     progress_tx.send_modify(|progress| progress.ended = true);
     drop(listener);
-    let checkout = Checkout::at(meta.dir);
-    tokio::join!(checkout.collect_garbage(), async {
-        while clients.join_next().await.is_some() {}
-    });
+    // Only after a sync: a run without one leaves the checkout alone, and the base directory may be any repository.
+    let checkout = meta
+        .synced_snapshot
+        .is_some()
+        .then(|| Checkout::at(meta.dir));
+    tokio::join!(
+        async {
+            if let Some(checkout) = &checkout {
+                checkout.collect_garbage().await;
+            }
+        },
+        async { while clients.join_next().await.is_some() {} }
+    );
     Ok(())
 }
 

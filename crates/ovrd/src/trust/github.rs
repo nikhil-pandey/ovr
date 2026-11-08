@@ -1,5 +1,6 @@
 //! GitHub Actions: jobs prove which repository they run for with an OIDC token from the runner.
 
+use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -248,6 +249,14 @@ pub fn check_environment() -> Result<(), String> {
     } else {
         Err("`github:` connects only from a GitHub Actions job".to_owned())
     }
+}
+
+/// The job's workspace, where `actions/checkout` puts the repository.
+#[must_use]
+pub fn workspace() -> Option<PathBuf> {
+    std::env::var_os("GITHUB_WORKSPACE")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
 }
 
 /// Requests a token for `audience` from the runner.

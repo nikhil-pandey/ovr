@@ -28,6 +28,8 @@ pub struct Config {
     pub runs: PathBuf,
     /// Where agents uploaded over SSH live, so that cleaning removes other versions.
     pub agents: PathBuf,
+    /// Where runs without a checkout start: the user's home, or a CI job's workspace.
+    pub base: PathBuf,
     pub shell: Shell,
     /// The `ovrd` that keeps runs, as `ovrd keep`; `None` keeps them in this process, which only tests want, since
     /// runs then end with it.
@@ -35,16 +37,19 @@ pub struct Config {
 }
 
 impl Config {
-    /// The checkouts, runs, and uploaded agents directories, the user's shell, and this `ovrd` as keeper.
+    /// The checkouts, runs, and uploaded agents directories, the home directory as base, the user's shell, and this
+    /// `ovrd` as keeper.
     ///
     /// # Errors
     ///
     /// Returns an error when the home directory is unknown or a directory cannot be created.
     pub fn detect() -> io::Result<Self> {
+        let home = ovr_proto::paths::home_dir()?;
         Ok(Self {
             root: ovr_proto::paths::checkouts_dir()?,
             runs: ovr_proto::paths::runs_dir()?,
-            agents: ovr_proto::paths::home_dir()?.join(ovr_proto::paths::SSH_AGENTS),
+            agents: home.join(ovr_proto::paths::SSH_AGENTS),
+            base: home,
             shell: Shell::detect(),
             keeper: Some(std::env::current_exe()?),
         })

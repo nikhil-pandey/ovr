@@ -27,12 +27,22 @@ pub enum Welcome {
     Rebase { have: Option<String> },
 }
 
-/// `EXEC`: what to run once the snapshot is checked out.
+/// `ENTER`: first frame of a stream that starts a run without syncing, in the checkout as the host has it or, when
+/// there is none, in the host's base directory. `EXEC` follows at once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Enter {
+    /// The initiator starting the run, whose runs `ovr ps` lists.
+    pub initiator: String,
+    /// This repository's checkout, `<repo>-<key>`, named as for [`Hello`]; `None` outside a repository.
+    pub checkout: Option<String>,
+}
+
+/// `EXEC`: what to run once the snapshot is checked out, or, after [`Enter`], in the checkout as it is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Exec {
     /// Argument vector; empty opens a login shell.
     pub argv: Vec<String>,
-    /// Directory relative to the checkout root, `/`-separated.
+    /// Directory relative to the checkout root, `/`-separated; ignored for a run in the host's base directory.
     pub cwd: String,
     /// Run under a pseudo-terminal; otherwise stdout and stderr are separate pipes.
     pub tty: bool,
@@ -92,7 +102,8 @@ pub struct Cleaned {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunInfo {
     pub run: u64,
-    pub checkout: String,
+    /// `None` for a run in the host's base directory.
+    pub checkout: Option<String>,
     pub argv: Vec<String>,
     /// Seconds since the Unix epoch.
     pub started: u64,

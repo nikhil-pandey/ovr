@@ -466,6 +466,56 @@ fn runs_in_the_foreground_and_the_background() -> Result {
 }
 
 #[test]
+fn runs_without_syncing_in_the_checkout_as_it_is_or_the_home_directory() -> Result {
+    let world = World::new()?;
+    let home = std::fs::canonicalize(world.host())?;
+
+    let unsynced = world.run(&["-n", "box", "--", "pwd", "-P"])?;
+    assert_eq!(
+        (unsynced.status.code(), text(&unsynced.stdout).trim_end()),
+        (Some(0), home.to_string_lossy().as_ref())
+    );
+    let stderr = text(&unsynced.stderr);
+    assert!(
+        stderr.contains("ovr: this host has no checkout of repo-")
+            && stderr.contains("; running in "),
+        "{stderr}"
+    );
+
+    let built = world.run(&["box", "--", "sh", "-c", "echo built > msg.txt"])?;
+    assert_eq!(built.status.code(), Some(0));
+    std::fs::write(world.file("repo/msg.txt"), "local\n")?;
+    let looked = world.run(&["-n", "box", "--", "cat", "msg.txt"])?;
+    assert_eq!(
+        (looked.status.code(), text(&looked.stdout).as_str()),
+        (Some(0), "built\n"),
+        "{}",
+        text(&looked.stderr)
+    );
+    assert!(!text(&looked.stderr).contains("checkout"));
+    let synced = world.run(&["box", "--", "cat", "msg.txt"])?;
+    assert_eq!(text(&synced.stdout), "local\n");
+
+    let outside = world
+        .ovr(&["box", "--", "sh", "-c", "pwd -P; exit 3"])
+        .current_dir(world.dir.path())
+        .output()?;
+    assert_eq!(
+        (outside.status.code(), text(&outside.stdout).trim_end()),
+        (Some(3), home.to_string_lossy().as_ref()),
+        "{}",
+        text(&outside.stderr)
+    );
+    let ps = text(&world.run(&["ps", "box"])?.stdout);
+    let line = ps
+        .lines()
+        .find(|line| line.contains("exit 3"))
+        .ok_or_else(|| format!("no run outside the repository in {ps}"))?;
+    assert_eq!(line.split_whitespace().nth(5), Some("-"), "{ps}");
+    Ok(())
+}
+
+#[test]
 fn cleans_hosts_and_this_machine_but_not_what_is_running() -> Result {
     let world = World::new()?;
     assert_eq!(world.run(&["box", "--", "true"])?.status.code(), Some(0));
