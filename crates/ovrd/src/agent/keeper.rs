@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use ovr_proto::frame::{self, INPUT_WINDOW, MAX_LEN, Reader, Writer};
+use ovr_proto::lock::Lock;
 use ovr_proto::msg::{Attach, Attached, Consumed, Exit, Failure, Resize, RunState};
-use ovr_proto::{Frame, FrameKind, git, ipc};
+use ovr_proto::{Frame, FrameKind, ipc};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -144,7 +145,7 @@ impl Kept {
 }
 
 async fn keep(run: Run, shell: Shell) -> Result<(), Error> {
-    let _lock = git::lock(run.lock_path()).await?;
+    let _lock = Lock::exclusive(run.lock_path()).await?;
     // Recorded as lost while this keeper was starting.
     if run.ended()?.is_some() {
         return Ok(());
@@ -218,8 +219,10 @@ async fn keep(run: Run, shell: Shell) -> Result<(), Error> {
     run.end(&ended)?;
     progress_tx.send_modify(|progress| progress.ended = true);
     drop(listener);
-    Checkout::at(meta.dir).collect_garbage();
-    while clients.join_next().await.is_some() {}
+    let checkout = Checkout::at(meta.dir);
+    tokio::join!(checkout.collect_garbage(), async {
+        while clients.join_next().await.is_some() {}
+    });
     Ok(())
 }
 

@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use futures::{SinkExt, StreamExt};
 use ovr_proto::frame::{self, Reader, Writer};
+use ovr_proto::lock::Lock;
 use ovr_proto::msg::{Attach, Attached, Clean, Exec, Failure, Hello, RunList, Runs, Welcome};
 use ovr_proto::{Frame, FrameKind};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -106,16 +107,20 @@ async fn start<S: AsyncRead + AsyncWrite>(
     config: &Config,
     store: &Store,
     hello: Hello,
-) -> Result<(Run, Option<std::fs::File>), Error> {
+) -> Result<(Run, Option<Lock>), Error> {
     let checkout = Checkout::open(&config.root, &hello.initiator, &hello.checkout).await?;
-    let welcome = match &hello.base {
-        Some(base) if !checkout.has_commit(base).await => Welcome::NeedFull,
-        _ => Welcome::Ok,
+    let objects = checkout.hold_objects().await?;
+    let welcome = if checkout.has_commits(&hello.bases).await {
+        Welcome::Ok
+    } else {
+        Welcome::Rebase {
+            have: checkout.newest().await?,
+        }
     };
     writer
         .send(Frame::json(FrameKind::Welcome, &welcome)?)
         .await?;
-    if welcome == Welcome::NeedFull {
+    if welcome != Welcome::Ok {
         // The speculative pack is useless without its base; skip it and its EXEC.
         while next(frames).await?.kind != FrameKind::Exec {}
     }
@@ -124,7 +129,8 @@ async fn start<S: AsyncRead + AsyncWrite>(
     let exec: Exec = next(frames).await?.expect(FrameKind::Exec)?;
 
     let applying = Instant::now();
-    let warning = checkout.apply(&hello.snapshot, hello.seq).await?;
+    let applied = checkout.apply(&hello.snapshot, hello.seq).await?;
+    drop(objects);
     writer.send(Frame::empty(FrameKind::Synced)).await?;
     tracing::info!(
         checkout = hello.checkout,
@@ -133,7 +139,7 @@ async fn start<S: AsyncRead + AsyncWrite>(
         apply_ms = applying.elapsed().as_millis(),
         "synced"
     );
-    if let Some(warning) = warning {
+    if let Some(warning) = applied.warning {
         writer
             .send(Frame::new(FrameKind::Err, format!("ovr: {warning}\n")))
             .await?;
@@ -145,8 +151,15 @@ async fn start<S: AsyncRead + AsyncWrite>(
         cwd: checkout.cwd(&exec.cwd)?,
         exec,
         started: runs::now(),
+        synced_snapshot: Some(applied.commit),
     };
     let run = store.create(&meta).await?;
+    tracing::info!(
+        run = run.id,
+        checkout = meta.checkout,
+        snapshot = meta.synced_snapshot,
+        "recorded run"
+    );
     keeper::start(config, &run).await?;
     Ok((run, checkout.into_claim()))
 }
@@ -308,7 +321,7 @@ mod tests {
         let hello = Hello {
             checkout: "repo-key".to_owned(),
             seq: 1,
-            base: None,
+            bases: Vec::new(),
             snapshot: "0".repeat(40),
             initiator: "me".to_owned(),
         };

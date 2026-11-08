@@ -2,7 +2,7 @@
 //!
 //! | File | Written by | Holds |
 //! |---|---|---|
-//! | `run.json` | agent | the request: initiator, checkout, command, start time |
+//! | `run.json` | agent | the request: initiator, checkout, command, start time, snapshot synced |
 //! | `lock` | keeper | locked for the keeper's whole life, so a free lock means no keeper |
 //! | `pid` | keeper | the command's process group, once it has started |
 //! | `out.*`, `err.*` | keeper | the output log; see [`super::log`] |
@@ -13,7 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ovr_proto::git;
+use ovr_proto::lock::Lock;
 use ovr_proto::msg::{Exec, RunInfo, RunState};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,9 @@ pub struct Meta {
     pub exec: Exec,
     /// Seconds since the Unix epoch.
     pub started: u64,
+    /// The snapshot checked out by the run's sync: the one it sent, or a newer one already applied. The checkout may
+    /// have moved on by the time the command started. `None` in records written before it was kept.
+    pub synced_snapshot: Option<String>,
 }
 
 /// How a run ended.
@@ -134,17 +137,8 @@ impl Run {
     }
 
     /// The keeper's lock, when no keeper holds it.
-    fn lock_unkept(&self) -> io::Result<Option<std::fs::File>> {
-        let file = std::fs::File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.lock_path())?;
-        match file.try_lock() {
-            Ok(()) => Ok(Some(file)),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-            Err(std::fs::TryLockError::Error(err)) => Err(err),
-        }
+    fn lock_unkept(&self) -> io::Result<Option<Lock>> {
+        Lock::try_exclusive(&self.lock_path())
     }
 
     /// The run's state. A run whose keeper is gone without a record is recorded as lost, after killing whatever
@@ -211,7 +205,7 @@ impl Store {
     /// Returns an error when the run cannot be recorded.
     pub async fn create(&self, meta: &Meta) -> Result<Run, Error> {
         std::fs::create_dir_all(&self.dir)?;
-        let _lock = git::lock(self.dir.join("lock")).await?;
+        let _lock = Lock::exclusive(self.dir.join("lock")).await?;
         let next = self.dir.join("next");
         let id = match std::fs::read_to_string(&next) {
             Ok(text) => text.trim().parse().unwrap_or(1),
@@ -339,6 +333,7 @@ mod tests {
                 rows: 24,
             },
             started: now(),
+            synced_snapshot: None,
         }
     }
 
@@ -359,7 +354,7 @@ mod tests {
             .process_group(0)
             .spawn()?;
         run.started(Some(command.id()))?;
-        let keeper = git::lock(run.lock_path()).await?;
+        let keeper = Lock::exclusive(run.lock_path()).await?;
         assert_eq!(run.state()?, RunState::Running, "the keeper holds the run");
 
         drop(keeper);

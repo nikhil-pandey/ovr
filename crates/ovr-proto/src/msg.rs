@@ -2,28 +2,29 @@
 
 use serde::{Deserialize, Serialize};
 
-/// `HELLO`: first frame of a new run. `base` is the snapshot the client believes the host already has.
+/// `HELLO`: first frame of a new run. `bases` are the snapshots the client believes the host still has, most
+/// recently confirmed first; the pack that follows leaves out everything they hold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     /// The host's checkout for this initiator and local repository: `<repo>-<key>`.
     pub checkout: String,
     /// Orders the snapshots of one local repository; a checkout never goes back to a lower one.
     pub seq: u64,
-    pub base: Option<String>,
+    pub bases: Vec<String>,
     pub snapshot: String,
     /// The initiator starting the run, whose runs `ovr ps` lists.
     pub initiator: String,
 }
 
 /// `WELCOME`: the agent's answer to [`Hello`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Welcome {
-    /// The base is present; the speculative thin pack will be applied.
+    /// Every base is present; the speculative thin pack will be applied.
     Ok,
-    /// The base is missing. The agent discards everything up to the first `EXEC`; the client follows it with a
-    /// full pack and a second `EXEC`.
-    NeedFull,
+    /// A base is missing. The agent discards everything up to the first `EXEC`; the client follows it with a
+    /// pack against `have`, the newest snapshot the checkout applied, or a full pack, and a second `EXEC`.
+    Rebase { have: Option<String> },
 }
 
 /// `EXEC`: what to run once the snapshot is checked out.

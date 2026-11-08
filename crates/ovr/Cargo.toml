@@ -17,6 +17,7 @@ futures.workspace = true
 miette = { workspace = true, features = ["fancy"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
+tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }
@@ -24,6 +25,7 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_
 [dev-dependencies]
 ovrd.workspace = true
 tempfile.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt", "std"] }
 
 [lints]
 workspace = true

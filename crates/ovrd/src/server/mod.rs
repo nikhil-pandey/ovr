@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
+use ovr_proto::lock::Lock;
 use ovr_proto::msg::{HostStatus, Op, Platform, Provider, Request, Response};
 use ovr_proto::{Frame, FrameKind, VERSION, frame, ipc};
 use tokio::sync::Notify;
@@ -71,24 +72,16 @@ pub async fn run() -> Result<(), Error> {
     Ok(())
 }
 
-async fn acquire(path: PathBuf) -> Result<std::fs::File, Error> {
-    let file = std::fs::File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)?;
+async fn acquire(path: PathBuf) -> Result<Lock, Error> {
     let deadline = Instant::now() + LOCK_WAIT;
     loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                return Err(Error::Invalid("another ovrd is already running".to_owned()));
-            }
-            Err(std::fs::TryLockError::Error(err)) => return Err(err.into()),
+        if let Some(lock) = Lock::try_exclusive(&path)? {
+            return Ok(lock);
         }
+        if Instant::now() >= deadline {
+            return Err(Error::Invalid("another ovrd is already running".to_owned()));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

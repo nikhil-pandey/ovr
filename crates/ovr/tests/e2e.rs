@@ -223,6 +223,17 @@ impl World {
         }
     }
 
+    /// Where the host keeps checkouts, one directory per initiator.
+    fn checkouts(&self) -> PathBuf {
+        #[cfg(target_os = "macos")]
+        let checkouts = self
+            .host()
+            .join("Library/Application Support/ovr/checkouts");
+        #[cfg(not(target_os = "macos"))]
+        let checkouts = self.host().join(".local/share/ovr/checkouts");
+        checkouts
+    }
+
     /// The host's record of run `run`.
     fn run_dir(&self, run: &str) -> PathBuf {
         #[cfg(target_os = "macos")]
@@ -371,6 +382,16 @@ fn git(dir: &Path, args: &[&str]) -> Result {
     }
 }
 
+/// Runs Git in `dir` and returns its trimmed output.
+fn git_out(dir: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git").args(args).current_dir(dir).output()?;
+    if output.status.success() {
+        Ok(text(&output.stdout).trim().to_owned())
+    } else {
+        Err(format!("git {args:?} failed: {}", text(&output.stderr)).into())
+    }
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -468,24 +489,17 @@ fn cleans_hosts_and_this_machine_but_not_what_is_running() -> Result {
 
     assert_eq!(world.run(&["kill", "box", &run])?.status.code(), Some(0));
     // The keeper lets go of the run once it has told everyone attached how it ended.
-    let lock = std::fs::File::options()
-        .write(true)
-        .open(world.run_dir(&run).join("lock"))?;
-    wait_for("the keeper to exit", || lock.try_lock().is_ok())?;
-    drop(lock);
+    let lock = world.run_dir(&run).join("lock");
+    wait_for("the keeper to exit", || {
+        ovr_proto::lock::Lock::try_exclusive(&lock).is_ok_and(|held| held.is_some())
+    })?;
     let idle = text(&world.run(&["clean", "box"])?.stdout);
     assert!(
         idle.starts_with("box: removed 1 checkout, 1 run, 0 agents; freed ")
             && !idle.contains("kept"),
         "{idle}"
     );
-    #[cfg(target_os = "macos")]
-    let checkouts = world
-        .host()
-        .join("Library/Application Support/ovr/checkouts");
-    #[cfg(not(target_os = "macos"))]
-    let checkouts = world.host().join(".local/share/ovr/checkouts");
-    for owner in std::fs::read_dir(&checkouts)? {
+    for owner in std::fs::read_dir(world.checkouts())? {
         let owner = owner?;
         if !owner.file_name().to_string_lossy().starts_with('.') {
             assert_eq!(std::fs::read_dir(owner.path())?.count(), 0);
@@ -504,6 +518,73 @@ fn cleans_hosts_and_this_machine_but_not_what_is_running() -> Result {
             Some(0),
             "this machine: removed 0 checkouts, 0 runs, 0 agents; freed 0 B\n"
         )
+    );
+    Ok(())
+}
+
+#[test]
+fn keeps_several_bases_and_recovers_one_the_host_lacks() -> Result {
+    let world = World::new()?;
+    let repo = world.file("repo");
+    let cat = |expected: &str| -> Result {
+        std::fs::write(repo.join("msg.txt"), expected)?;
+        let output = world.run(&["box", "--", "cat", "msg.txt"])?;
+        assert_eq!(
+            (output.status.code(), text(&output.stdout).as_str()),
+            (Some(0), expected),
+            "{}",
+            text(&output.stderr)
+        );
+        Ok(())
+    };
+    // The contents of the snapshots in a set of retained refs, most recent first.
+    let contents = |dir: &Path, prefix: &str| -> Result<Vec<String>> {
+        let ids = git_out(dir, &["for-each-ref", "--format=%(objectname)", prefix])?;
+        ids.lines()
+            .map(|id| git_out(dir, &["show", &format!("{id}:msg.txt")]))
+            .collect()
+    };
+
+    cat("one\n")?;
+    cat("two\n")?;
+    let owner = std::fs::read_dir(world.checkouts())?
+        .filter_map(std::result::Result::ok)
+        .find(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        .ok_or("no checkouts")?;
+    let checkout = std::fs::read_dir(owner.path())?
+        .next()
+        .ok_or("no checkout")??
+        .path();
+    assert_eq!(contents(&repo, "refs/ovr/bases/")?, ["two", "one"]);
+    assert_eq!(contents(&checkout, "refs/ovr/kept/")?, ["two", "one"]);
+
+    // Bases the host never received, as when it lost them after a missed acknowledgement: it offers what it has.
+    let tree = git_out(&repo, &["mktree"])?;
+    let unknown = git_out(
+        &repo,
+        &[
+            "-c",
+            "user.name=ovr",
+            "-c",
+            "user.email=ovr@localhost",
+            "commit-tree",
+            "-m",
+            "never sent",
+            &tree,
+        ],
+    )?;
+    let bases = git_out(
+        &repo,
+        &["for-each-ref", "--format=%(refname)", "refs/ovr/bases/"],
+    )?;
+    for base in bases.lines() {
+        git(&repo, &["update-ref", base, &unknown])?;
+    }
+    cat("three\n")?;
+    assert_eq!(contents(&repo, "refs/ovr/bases/")?, ["three", "two"]);
+    assert_eq!(
+        contents(&checkout, "refs/ovr/kept/")?,
+        ["three", "two", "one"]
     );
     Ok(())
 }

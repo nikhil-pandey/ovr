@@ -6,8 +6,10 @@
 pub mod frame;
 pub mod git;
 pub mod ipc;
+pub mod lock;
 pub mod msg;
 pub mod paths;
+pub mod retained;
 
 use std::io;
 
@@ -17,7 +19,7 @@ pub use frame::{Frame, FrameKind};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Agent protocol version. Dial-in hosts may run an older `ovrd`; they are accepted while this matches.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// FNV-1a: a stable, dependency-free hash for short names derived from paths. Not for anything secret.
 #[must_use]
