@@ -164,6 +164,11 @@ pub enum Op {
     CloseTunnel { provider: Provider },
     /// Remove every checkout and finished run on this machine, and downloaded and uploaded agents of other versions.
     Clean,
+    /// Trust workloads matching `rule`, as in `github:OWNER/REPO`, to dial in without pairing; without one, list the
+    /// rules.
+    Trust { rule: Option<String> },
+    /// Stop trusting workloads matching `rule`.
+    Untrust { rule: String },
 }
 
 /// `RESPONSE`: the local `ovrd`'s answer to a [`Request`].
@@ -189,6 +194,12 @@ pub enum Response {
     },
     TunnelClosed,
     Cleaned(Cleaned),
+    /// The trust rules, this initiator's fingerprint, and the address trusted workloads should dial.
+    Trust {
+        rules: Vec<String>,
+        initiator: String,
+        addr: String,
+    },
     /// `ovrd` is a different version and is exiting; reconnect to start the matching one.
     Restart,
     Failed {
@@ -201,6 +212,9 @@ pub struct HostStatus {
     pub name: String,
     /// Present while the host is connected.
     pub platform: Option<Platform>,
+    /// What a trusted host serves, such as its workflow run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
 }
 
 /// A tunnel provider, whose CLI `ovrd` runs to reach the initiator from networks that cannot.
@@ -280,6 +294,23 @@ pub struct Banner {
 pub struct Pair {
     pub hostname: String,
     pub mac: String,
+}
+
+/// `FEDERATED`: a host that is not paired asks to serve as a workload its identity provider vouches for. `token`
+/// is a JWT issued for the audience `ovr:<initiator fingerprint>`; `label` tells apart hosts of one workload, such
+/// as the jobs of a GitHub Actions run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Federated {
+    pub provider: String,
+    pub token: String,
+    pub label: String,
+    pub banner: Banner,
+}
+
+/// `ACCEPT` in answer to [`Federated`]: the name the initiator gave the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Accepted {
+    pub name: String,
 }
 
 /// `PAIR_OK`: the initiator proves it knows the code too.

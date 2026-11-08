@@ -1,0 +1,35 @@
+name: Bench
+
+# Syncs real repositories through a Cloudflare quick tunnel to paired hosts on Linux, macOS, and Windows at once,
+# builds them there, and reports every step's time; see tunnel.yml.
+on:
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "standard: four repositories, built on each host. large: adds llvm-project, chromium, and a generated repository, synced and checked on each host."
+        type: choice
+        options: [standard, large]
+        default: standard
+      synthetic-gib:
+        description: Size of the generated repository in the large tier, in GiB
+        default: "10"
+  schedule:
+    - cron: "17 4 * * *"
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write # tunnel.yml's hosts may connect as trusted jobs
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.tier || 'standard' }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    uses: ./.github/workflows/tunnel.yml
+    with:
+      kinds: '["paired"]'
+      mode: bench
+      tier: ${{ inputs.tier || 'standard' }}
+      synthetic-gib: ${{ inputs.synthetic-gib || '10' }}

@@ -1,0 +1,204 @@
+name: Tunnel
+
+# An initiator on one runner opens a Cloudflare quick tunnel, and hosts on Linux, macOS, and Windows runners dial in
+# through it, one of each kind per OS: `paired` hosts pair with a code, and `trusted` ones use this repository's
+# action, which connects as the job with an OIDC token. In `check` mode the initiator checks that syncs and exit
+# codes reach every host; in `bench` mode it syncs real repositories to every host at once, builds them there, and
+# reports each runner's specs and every step's time in the job summary. `.github/e2e/e2e.py` does the work.
+#
+# Quick tunnel addresses are random, so the jobs meet through this run's artifacts: each host uploads its specs and,
+# when paired, a public key; the initiator answers with `ovrd connect` arguments, a paired host's encrypted to its key,
+# and uploads `finished` at the end.
+on:
+  workflow_call:
+    inputs:
+      kinds:
+        description: 'The kinds of host, as a JSON list of "paired" and "trusted"'
+        type: string
+        required: true
+      mode:
+        description: "check or bench"
+        type: string
+        required: true
+      tier:
+        description: "bench: standard or large"
+        type: string
+        default: standard
+      synthetic-gib:
+        description: "bench: size of the large tier's generated repository, in GiB"
+        type: string
+        default: "10"
+
+env:
+  CARGO_TERM_COLOR: always
+  GH_TOKEN: ${{ github.token }}
+  PYTHONUNBUFFERED: "1"
+  KINDS: ${{ join(fromJSON(inputs.kinds), ' ') }}
+  # renovate: datasource=github-releases depName=cloudflare/cloudflared
+  CLOUDFLARED_VERSION: 2026.10.7
+  # renovate: datasource=pypi depName=uv
+  UV_VERSION: 0.13.7
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  initiator:
+    runs-on: ubuntu-26.04
+    timeout-minutes: ${{ inputs.mode == 'bench' && 330 || 40 }}
+    env:
+      RUNS_ON: ubuntu-26.04
+      REPOS: /mnt/e2e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/e2e/setup
+        with:
+          packages: -p ovr -p ovrd
+      # The repositories go on the runner's larger scratch disk.
+      - if: inputs.mode == 'bench'
+        run: sudo mkdir -p "$REPOS" && sudo chown "$USER" "$REPOS"
+      - if: inputs.mode == 'bench'
+        run: uv run .github/e2e/e2e.py specs --role initiator --disk "$REPOS" --out specs/initiator/specs.json
+      - if: inputs.mode == 'bench'
+        name: Prepare the repositories
+        env:
+          TIER: ${{ inputs.tier }}
+          SYNTHETIC_GIB: ${{ inputs.synthetic-gib }}
+        run: uv run .github/e2e/e2e.py prepare --tier "$TIER" --synthetic-gib "$SYNTHETIC_GIB" --dir "$REPOS"
+      - name: Let the hosts dial in
+        run: uv run .github/e2e/e2e.py pair
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pairs
+          path: pairs
+          retention-days: 1
+      - name: Wait for the hosts to dial in
+        run: uv run .github/e2e/e2e.py hosts
+      - if: inputs.mode == 'check'
+        name: Check every host
+        run: uv run .github/e2e/e2e.py check
+      - if: inputs.mode == 'bench'
+        name: Sync and run on every host
+        run: uv run .github/e2e/e2e.py bench
+      - if: always() && inputs.mode == 'bench'
+        name: Report
+        run: uv run .github/e2e/e2e.py report
+      - if: always()
+        name: Close the tunnel
+        run: |
+          mkdir -p finished && echo finished >finished/finished
+          ovrd tunnel close cloudflare || true
+          mkdir -p logs && cp ~/.local/state/ovr/*.log logs/ 2>/dev/null || true
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: finished
+          path: finished
+          retention-days: 1
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: report
+          path: |
+            report.md
+            repos.json
+            hosts.json
+            results.json
+            specs
+            logs
+          if-no-files-found: ignore
+
+  host:
+    name: host (${{ matrix.platform.name }}, ${{ matrix.kind }})
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { name: linux, os: ubuntu-26.04 }
+          - { name: macos, os: macos-26 }
+          - { name: windows, os: windows-2025-vs2026 }
+        kind: ${{ fromJSON(inputs.kinds) }}
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: ${{ inputs.mode == 'bench' && 350 || 45 }}
+    permissions:
+      contents: read
+      actions: read
+      id-token: write # a trusted host connects with the job's OIDC token
+    env:
+      RUNS_ON: ${{ matrix.platform.os }}
+      HOST: ${{ matrix.platform.name }}-${{ matrix.kind }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/e2e/setup
+        with:
+          packages: -p ovrd
+      # OVR_CHECKOUTS puts the bench's checkouts on the larger scratch disk on Linux, and on the drive with the most
+      # room on Windows, where deep trees also need long paths. The specs measure free space there.
+      - if: inputs.mode == 'bench' && runner.os == 'Linux'
+        run: |
+          sudo mkdir -p /mnt/ovr && sudo chown "$USER" /mnt/ovr
+          echo "OVR_CHECKOUTS=/mnt/ovr" >>"$GITHUB_ENV"
+      - if: inputs.mode == 'bench' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, Root, Used, Free
+          $drive = Get-PSDrive -PSProvider FileSystem | Where-Object Free | Sort-Object Free -Descending | Select-Object -First 1
+          $dir = Join-Path $drive.Root ovr
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          "OVR_CHECKOUTS=$dir" >> $env:GITHUB_ENV
+      - name: Publish specs, and a key the initiator can encrypt to
+        run: |
+          mkdir -p "$RUNNER_TEMP/key" host
+          if [[ $HOST == *-paired ]]; then
+            openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$RUNNER_TEMP/key/key.pem"
+            openssl pkey -in "$RUNNER_TEMP/key/key.pem" -pubout -out host/key.pub
+          fi
+          uv run .github/e2e/e2e.py specs --role "$HOST host" --out host/specs.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: host-${{ env.HOST }}
+          path: host
+          retention-days: 1
+      - name: Wait for the initiator
+        run: uv run .github/e2e/e2e.py await --host "$HOST" pairs
+      # A trusted host connects through this repository's action, with the ovrd built above on PATH. It uses the
+      # action twice, and holds with it at the end, as a job that connects early and holds when it fails does: only
+      # the first use dials in, so the host keeps its name.
+      - if: matrix.kind == 'trusted'
+        id: trust
+        run: |
+          read -r addr initiator <pairs/trust
+          echo "addr=$addr" >>"$GITHUB_OUTPUT"
+          echo "initiator=$initiator" >>"$GITHUB_OUTPUT"
+      - if: matrix.kind == 'trusted'
+        uses: ./
+        with:
+          addr: ${{ steps.trust.outputs.addr }}
+          initiator: ${{ steps.trust.outputs.initiator }}
+          name: ${{ matrix.platform.name }}
+      - if: matrix.kind == 'trusted'
+        uses: ./
+        with:
+          addr: ${{ steps.trust.outputs.addr }}
+          initiator: ${{ steps.trust.outputs.initiator }}
+          name: ${{ matrix.platform.name }}
+      - name: Serve the initiator until it has finished
+        run: |
+          key=()
+          if [[ $HOST == *-paired ]]; then key=(--key "$RUNNER_TEMP/key/key.pem"); fi
+          uv run .github/e2e/e2e.py serve --host "$HOST" "${key[@]}"
+      - if: always() && matrix.kind == 'trusted'
+        uses: ./
+        with:
+          addr: ${{ steps.trust.outputs.addr }}
+          initiator: ${{ steps.trust.outputs.initiator }}
+          name: ${{ matrix.platform.name }}
+          hold: 5s
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: host-log-${{ env.HOST }}
+          path: ovrd.log
+          if-no-files-found: ignore

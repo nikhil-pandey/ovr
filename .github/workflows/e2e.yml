@@ -1,0 +1,27 @@
+name: E2E
+
+# Checks that syncs and exit codes reach hosts on Linux, macOS, and Windows through a Cloudflare quick tunnel, both
+# paired hosts and trusted ones that connect with the job's OIDC token, as the action does; see tunnel.yml. Pull
+# requests from forks get no OIDC token, so they check paired hosts only. Pushes to main refresh the caches pull
+# requests restore from.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  tunnel:
+    uses: ./.github/workflows/tunnel.yml
+    with:
+      kinds: ${{ github.event.pull_request.head.repo.fork && '["paired"]' || '["paired", "trusted"]' }}
+      mode: check

@@ -7,6 +7,8 @@ use ovr_proto::msg::Provider;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::trust::Rule;
+
 /// A host paired with this initiator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairedHost {
@@ -40,6 +42,10 @@ fn initiator_path(dir: &Path) -> PathBuf {
 
 fn tunnels_path(dir: &Path) -> PathBuf {
     dir.join("tunnels.json")
+}
+
+fn trust_path(dir: &Path) -> PathBuf {
+    dir.join("trust.json")
 }
 
 /// # Errors
@@ -88,6 +94,20 @@ pub fn tunnels(dir: &Path) -> io::Result<Vec<Tunnel>> {
 /// Returns an error when the records cannot be written.
 pub fn set_tunnels(dir: &Path, tunnels: &[Tunnel]) -> io::Result<()> {
     write(&tunnels_path(dir), &tunnels)
+}
+
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read or parsed.
+pub fn trust_rules(dir: &Path) -> io::Result<Vec<Rule>> {
+    Ok(read(&trust_path(dir))?.unwrap_or_default())
+}
+
+/// # Errors
+///
+/// Returns an error when the rules cannot be written.
+pub fn set_trust_rules(dir: &Path, rules: &[Rule]) -> io::Result<()> {
+    write(&trust_path(dir), &rules)
 }
 
 fn read<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {

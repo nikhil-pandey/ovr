@@ -9,11 +9,14 @@ source of truth for behaviour; read it before changing anything user-visible.
 - `crates/ovrd`: the server. Initiator-side host connections, and the agent that runs on hosts.
 - `crates/ovr-proto`: what both binaries share: the wire format, running `git`, where files live, and finding and
   starting the local `ovrd`.
+- `action.yml`: the GitHub action that connects a job to an initiator through `ovrd connect ADDR github:FP`. It stays
+  best effort: every failure is a warning.
 
 ## Principles
 
 - Keep it minimal. No configuration files, no flags that a fixed default can replace, and no environment variables
-  beyond the `OVR_*` directory overrides in `crates/ovr-proto/src/paths.rs`.
+  beyond the `OVR_*` directory overrides in `crates/ovr-proto/src/paths.rs` and those a CI provider sets for its
+  jobs, such as GitHub Actions' token request variables.
 - Keep the README short: what it is, install, one example per command, a link to the design. Details belong in
   `docs/DESIGN.md`, not the README.
 - Update `docs/DESIGN.md` in the same change when behaviour changes.
@@ -46,6 +49,10 @@ it builds `ovrd` itself, under Bazel it gets both binaries as data. Its ignored 
 `cargo test -p ovr --test e2e -- --ignored` with `cloudflared` installed and `devtunnel` logged in. They take a few
 minutes, mostly waiting for a new quick tunnel to resolve. Platform-specific code (Windows Job Objects,
 ConPTY, named pipes) is only compiled on its platform; CI checks every released OS.
+
+Across runners, `.github/workflows/tunnel.yml` (driven by `.github/e2e/e2e.py`) has Linux, macOS, and Windows hosts
+dial an initiator through a quick tunnel, either paired or as trusted jobs with an OIDC token. `e2e.yml` checks
+syncs to both kinds on every pull request; `bench.yml` times real repositories on paired hosts nightly or on dispatch.
 
 ## Release
 

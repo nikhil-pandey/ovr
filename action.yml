@@ -1,0 +1,139 @@
+name: ovr connect
+description: Lets your machine run commands on this job's runner with ovr, best effort, while the job runs.
+author: Nikhil Pandey
+branding:
+  icon: terminal
+  color: gray-dark
+
+# The job needs `permissions: id-token: write`, and the initiator `ovrd trust github:OWNER/REPO`, which prints this
+# action's inputs. Nothing here fails the job: when the initiator is away, the background `ovrd` keeps retrying
+# until the job ends.
+inputs:
+  addr:
+    description: The initiator's address, as `ovrd trust` prints it, such as `devtunnel:ID` or `host:7420`.
+    required: true
+  initiator:
+    description: The initiator's fingerprint, as `ovrd trust` prints it.
+    required: true
+  name:
+    description: >-
+      Tells this job's runner apart from others of the same job in the run, such as a matrix's OS: it is named
+      `OWNER/REPO/WORKFLOW/RUN/JOB/NAME`. By default it is `OWNER/REPO/WORKFLOW/RUN/JOB`, numbered `-2`, `-3`, and so
+      on in the order such runners connect.
+    default: ""
+  hold:
+    description: >-
+      Keep the job running for this long once connected, as in `30m`, `1h`, or `90s`; a bare number is minutes. By
+      default the step returns at once and the runner serves only until the job's other steps finish. A later step
+      of the job that uses this action again with `hold` reuses the connection and only holds.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - id: connect
+      shell: bash
+      env:
+        ADDR: ${{ inputs.addr }}
+        INITIATOR: ${{ inputs.initiator }}
+        NAME: ${{ inputs.name }}
+        ACTION_REF: ${{ github.action_ref }}
+      # Best effort throughout: every failure is a warning, never a failed job.
+      run: |
+        set +e
+        warn() { echo "::warning title=ovr::$*"; exit 0; }
+        # An earlier step of this job already connected; its background ovrd serves until the job ends.
+        if [ -n "$ovr_action_log" ]; then
+          echo "already connected earlier in this job"
+          echo "log=$ovr_action_log" >>"$GITHUB_OUTPUT"
+          exit 0
+        fi
+        bin="$RUNNER_TEMP/ovr/bin"
+        mkdir -p "$bin"
+        echo "$bin" >>"$GITHUB_PATH"
+        # Git Bash on Windows needs its own form of the path in PATH.
+        path_bin=$(cygpath -u "$bin" 2>/dev/null || echo "$bin")
+        export PATH="$path_bin:$PATH"
+
+        # An ovrd already on PATH, as on a runner that installs or builds it, needs no download.
+        if ! command -v ovrd >/dev/null; then
+          case "$RUNNER_OS-$RUNNER_ARCH" in
+            Linux-X64) target=x86_64-unknown-linux-musl ext=tar.gz ;;
+            Linux-ARM64) target=aarch64-unknown-linux-musl ext=tar.gz ;;
+            macOS-X64) target=x86_64-apple-darwin ext=tar.gz ;;
+            macOS-ARM64) target=aarch64-apple-darwin ext=tar.gz ;;
+            Windows-X64) target=x86_64-pc-windows-gnu ext=zip ;;
+            Windows-ARM64) target=aarch64-pc-windows-gnullvm ext=zip ;;
+            *) warn "no ovr build for $RUNNER_OS on $RUNNER_ARCH" ;;
+          esac
+          # The release matching this action's tag, else the latest.
+          releases=https://github.com/nikhil-pandey/ovr/releases
+          if [[ "$ACTION_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then url=$releases/download/$ACTION_REF; else url=$releases/latest/download; fi
+          archive="$RUNNER_TEMP/ovr/ovr.$ext"
+          curl -fsSL --retry 3 -o "$archive" "$url/ovr-$target.$ext" || warn "cannot download ovr from $url"
+          if [ "$ext" = zip ]; then
+            pwsh -NoProfile -Command "Expand-Archive -Force -LiteralPath '$archive' -DestinationPath '$bin'" ||
+              warn "cannot unpack ovr"
+          else
+            tar -xzf "$archive" -C "$bin" || warn "cannot unpack ovr"
+          fi
+        fi
+
+        # A tunnel address needs the provider's CLI to forward through.
+        case "$ADDR" in
+          devtunnel:*) cli=devtunnel ;;
+          cloudflare:*) cli=cloudflared ;;
+          *) cli= ;;
+        esac
+        if [ -n "$cli" ] && ! command -v "$cli" >/dev/null; then
+          os=$(echo "${RUNNER_OS/macOS/osx}" | tr '[:upper:]' '[:lower:]')
+          arch=$(echo "$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]')
+          case "$cli-$os" in
+            # Windows on Arm runs the x64 builds.
+            devtunnel-windows) src="https://aka.ms/TunnelsCliDownload/win-x64" dst=devtunnel.exe ;;
+            devtunnel-osx) src="https://aka.ms/TunnelsCliDownload/osx-$arch-zip" dst=zip ;;
+            devtunnel-linux) src="https://aka.ms/TunnelsCliDownload/linux-$arch" dst=devtunnel ;;
+            cloudflared-windows) src="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" dst=cloudflared.exe ;;
+            cloudflared-osx) src="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-${arch/x64/amd64}.tgz" dst= ;;
+            cloudflared-linux) src="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch/x64/amd64}" dst=cloudflared ;;
+          esac
+          if [ -z "$dst" ]; then
+            curl -fsSL --retry 3 "$src" | tar -xz -C "$bin" || warn "cannot install $cli"
+          elif [ "$dst" = zip ]; then
+            curl -fsSL --retry 3 -o "$bin/$cli.zip" "$src" && unzip -oq "$bin/$cli.zip" -d "$bin" &&
+              chmod +x "$bin/$cli" || warn "cannot install $cli"
+          else
+            curl -fsSL --retry 3 -o "$bin/$dst" "$src" && chmod +x "$bin/$dst" || warn "cannot install $cli"
+          fi
+        fi
+
+        # Logs and runs go to the runner's temporary directory, so the log has a known place.
+        export OVR_STATE_DIR="$RUNNER_TEMP/ovr/state"
+        ovrd connect "$ADDR" "github:$INITIATOR" ${NAME:+--name "$NAME"} || warn "ovrd connect could not start; see above"
+        echo "log=$OVR_STATE_DIR/connect-github.log" >>"$GITHUB_OUTPUT"
+        echo "ovr_action_log=$OVR_STATE_DIR/connect-github.log" >>"$GITHUB_ENV"
+
+    - if: inputs.hold != '' && steps.connect.outputs.log != ''
+      shell: bash
+      env:
+        HOLD: ${{ inputs.hold }}
+        LOG: ${{ steps.connect.outputs.log }}
+      # Best effort too: a hold that goes wrong ends early with a warning.
+      run: |
+        set +e
+        if [[ ! "$HOLD" =~ ^([0-9]+)([smh]?)$ ]]; then
+          echo "::warning title=ovr::hold must look like 30m, 1h, or 90s, not $HOLD"
+          exit 0
+        fi
+        amount=$((10#${BASH_REMATCH[1]}))
+        case "${BASH_REMATCH[2]}" in
+          s) seconds=$amount ;;
+          h) seconds=$((amount * 3600)) ;;
+          *) seconds=$((amount * 60)) ;;
+        esac
+        echo "holding this job for $HOLD; on your machine, \`ovr hosts\` lists this runner once it connects"
+        touch "$LOG"
+        tail -n +1 -f "$LOG" &
+        sleep "$seconds"
+        kill $! 2>/dev/null
+        echo "released the hold; the runner serves until the job's other steps finish"

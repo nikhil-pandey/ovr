@@ -11,6 +11,7 @@ mod server;
 mod state;
 mod target;
 mod tls;
+mod trust;
 mod tunnel;
 
 use std::io;
@@ -42,14 +43,30 @@ pub enum Command {
         #[command(subcommand)]
         command: Option<TunnelCommand>,
     },
+    /// Trust workloads matching RULE, such as GitHub Actions jobs of a repository, to dial in without pairing.
+    /// Without RULE, list the rules. Either way, print what a trusted workload needs to dial in.
+    Trust {
+        /// `github:OWNER/REPO`, or `github:OWNER` for every repository of OWNER.
+        rule: Option<String>,
+    },
+    /// Stop trusting workloads matching RULE.
+    Untrust {
+        /// A rule as `ovrd trust` lists it.
+        rule: String,
+    },
     /// On a host: pair with the initiator at ADDR, then keep serving it. Without a code, move a paired host to ADDR.
     /// Without arguments, serve the paired initiator.
     Connect {
         /// `host:port`, `cloudflare:HOSTNAME`, or `devtunnel:ID`, as printed by `ovrd pair` or `ovrd tunnel`.
         addr: Option<tunnel::Addr>,
-        /// Pairing code printed by `ovrd pair`.
+        /// Pairing code printed by `ovrd pair`, or `github:FINGERPRINT` printed by `ovrd trust` to serve as this
+        /// GitHub Actions job, in the background until the job ends.
         #[arg(requires = "addr")]
         code: Option<String>,
+        /// With `github:FINGERPRINT`, tell this job's host apart from others of the same job, such as a matrix's:
+        /// it is named `OWNER/REPO/WORKFLOW/RUN/JOB/NAME`.
+        #[arg(long, requires = "code")]
+        name: Option<String>,
         /// Serve in the foreground and install nothing to start at login, as on a CI runner.
         #[arg(long, conflicts_with = "service")]
         foreground: bool,
@@ -122,6 +139,8 @@ pub async fn run(cli: Cli) -> Result<(), Error> {
     match cli.command {
         None => until_stopped(server::run()).await,
         Some(Command::Pair { provider }) => pair(provider).await,
+        Some(Command::Trust { rule }) => trust(Op::Trust { rule }).await,
+        Some(Command::Untrust { rule }) => trust(Op::Untrust { rule }).await,
         Some(Command::Tunnel { command: None }) => tunnels().await,
         Some(Command::Tunnel {
             command: Some(TunnelCommand::Close { provider }),
@@ -129,9 +148,18 @@ pub async fn run(cli: Cli) -> Result<(), Error> {
         Some(Command::Connect {
             addr,
             code,
+            name,
             foreground,
             ..
-        }) => until_stopped(host::connect(addr, code.as_deref(), foreground)).await,
+        }) => {
+            until_stopped(host::connect(
+                addr,
+                code.as_deref(),
+                name.as_deref(),
+                foreground,
+            ))
+            .await
+        }
         Some(Command::Agent) => Ok(agent::serve_stdio().await?),
         Some(Command::Keep { dir }) => agent::keeper::main(dir).await,
     }
@@ -180,6 +208,64 @@ async fn pair(tunnel: Option<Provider>) -> Result<(), Error> {
     match request(Op::Pair { tunnel }).await? {
         Response::Pair { addr, code } => {
             println!("run this on the host within 10 minutes:\n  ovrd connect {addr} {code}");
+            Ok(())
+        }
+        other => Err(unexpected(other)),
+    }
+}
+
+/// `ovrd trust` and `ovrd untrust`: changes the rules, if asked to, then lists them and how a workload dials in.
+async fn trust(op: Op) -> Result<(), Error> {
+    let changed = match &op {
+        Op::Trust { rule: Some(rule) } => Some(format!("trusting {rule}")),
+        Op::Untrust { rule } => Some(format!("no longer trusting {rule}")),
+        _ => None,
+    };
+    match request(op).await? {
+        Response::Trust {
+            rules,
+            initiator,
+            addr,
+        } => {
+            if let Some(changed) = changed {
+                println!("{changed}");
+            }
+            if rules.is_empty() {
+                println!(
+                    "no workload is trusted; `ovrd trust github:OWNER/REPO` trusts a repository's jobs"
+                );
+                return Ok(());
+            }
+            println!("trusted:");
+            for rule in &rules {
+                println!("  {rule}");
+            }
+            let repo = rules
+                .iter()
+                .find_map(|rule| {
+                    rule.strip_prefix("github:")
+                        .filter(|spec| spec.contains('/'))
+                })
+                .unwrap_or("OWNER/REPO");
+            println!(
+                "\nstore where this machine is as repository variables (or organization variables, with --org):\n  \
+                 gh variable set OVR_ADDR --repo {repo} --body {addr}\n  \
+                 gh variable set OVR_INITIATOR --repo {repo} --body {initiator}\n\n\
+                 then add a step to a job with `permissions: id-token: write`:\n  \
+                 - if: failure() || runner.debug == '1'\n    \
+                 uses: nikhil-pandey/ovr@v{VERSION}\n    \
+                 with:\n      \
+                 addr: ${{{{ vars.OVR_ADDR }}}}\n      \
+                 initiator: ${{{{ vars.OVR_INITIATOR }}}}\n      \
+                 hold: 30m\n\n\
+                 or run `ovrd connect {addr} github:{initiator}` in any step"
+            );
+            if !addr.starts_with(Provider::Devtunnel.name()) {
+                println!(
+                    "\nGitHub-hosted runners reach {addr} only through a tunnel or your tailnet; \
+                     `ovrd pair devtunnel` opens a tunnel whose address stays the same"
+                );
+            }
             Ok(())
         }
         other => Err(unexpected(other)),
