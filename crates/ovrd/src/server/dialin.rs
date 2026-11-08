@@ -189,7 +189,7 @@ where
 }
 
 /// Serves a host that is not paired but presents a token a trust rule admits, under a name taken from the workload
-/// and the host's label, as in `nikhil-pandey/ovr/build`, with a number added while another host has it.
+/// and the host's label, as in `nikhil-pandey/ovr/ci/57/build`, with a number added while another host has it.
 async fn federated<S>(
     server: &Server,
     mut stream: Framed<S>,
@@ -258,8 +258,8 @@ where
     Ok(())
 }
 
-/// `WORKLOAD/LABEL`, as in `nikhil-pandey/ovr/build`, or `nikhil-pandey/ovr/build/windows` for a host that also
-/// names itself. Every part must survive [`name_part`], so the name always contains `/`, which no paired host's name
+/// `WORKLOAD/LABEL`, as in `nikhil-pandey/ovr/ci/57/build`, or `nikhil-pandey/ovr/ci/57/build/windows` for a host
+/// that also names itself. Every part must survive [`name_part`], so the name always contains `/`, which no paired host's name
 /// or SSH destination does.
 fn federated_name(workload: &str, label: &str) -> Result<String, String> {
     let parts: Vec<String> = workload

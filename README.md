@@ -61,7 +61,7 @@ GitHub Actions jobs of repositories you trust dial in without pairing, through
 
 ```sh
 ovrd trust github:OWNER/REPO   # on your machine: prints the variables and the step to add
-ovr OWNER/REPO/JOB -- make test
+ovr OWNER/REPO/WORKFLOW/RUN/JOB -- make test
 ```
 
 Remove checkouts and finished runs, keeping anything in use:

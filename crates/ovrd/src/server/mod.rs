@@ -232,7 +232,7 @@ impl Server {
                 })?;
             return Ok((mux.open().await?, None));
         }
-        // A federated host is named `OWNER/REPO/JOB`, which no paired host or SSH destination is; it may be
+        // A federated host is named `OWNER/REPO/WORKFLOW/RUN/JOB`, which no paired host or SSH destination is; it may be
         // reconnecting.
         if is_federated(host) {
             let mux = self

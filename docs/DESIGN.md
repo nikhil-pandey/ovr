@@ -285,14 +285,17 @@ jobs:
 - **The fingerprint pins the initiator.** `github:FP` gives the host the initiator's fingerprint, which it checks
   before sending any token, as a paired host does. Neither the fingerprint nor the address is a secret, so the
   workflow carries none; GitHub does not let pull requests from forks request tokens.
-- **Names.** A trusted host is named `OWNER/REPO/JOB`, after the repository and the job's ID in the workflow, as in
-  `ovr nikhil-pandey/ovr/build -- cargo test`; a job without an ID is refused. While another host holds or, for two
-  minutes after disconnecting, keeps that name, the next gets `OWNER/REPO/JOB-2`, and so on; a host reconnecting
-  under the same identity gets its name back. The jobs of a matrix share an ID, so that numbering follows the order
-  they connect; `ovrd connect ADDR github:FP --name NAME` names a host `OWNER/REPO/JOB/NAME` instead, as in
-  `nikhil-pandey/ovr/build/windows`. The name contains `/`, so it can never be a paired host's or an SSH
-  destination's, and `ovr hosts` lists it only while it is connected, with its workflow, branch, and run from the
-  verified token, as in `CI on main, https://github.com/nikhil-pandey/ovr/actions/runs/ID`.
+- **Names.** A trusted host is named `OWNER/REPO/WORKFLOW/RUN/JOB`, after the repository, the run, and the job's ID in
+  the workflow, as in `ovr nikhil-pandey/ovr/ci/57/build -- cargo test`. `WORKFLOW` is the workflow's name,
+  lowercased, with a `-` for each run of other characters; `RUN` is the run's number, as GitHub shows it, with
+  `.ATTEMPT` added on a re-run, as in `57.2`; all three come from the verified token, while the job's ID comes from
+  the runner, and a job without one is refused. So concurrent runs never share names. While another host holds or, for
+  two minutes after disconnecting, keeps a name, the next gets `-2`, and so on; a host reconnecting under the same
+  identity gets its name back. The jobs of a matrix share an ID, so that numbering follows the order they connect;
+  `ovrd connect ADDR github:FP --name NAME` names a host `OWNER/REPO/WORKFLOW/RUN/JOB/NAME` instead, as in
+  `nikhil-pandey/ovr/ci/57/build/windows`. The name contains `/`, so it can never be a paired host's or an SSH
+  destination's, and `ovr hosts` lists it only while it is connected, with its workflow, branch, and a link to the run
+  from the verified token, as in `CI on main, https://github.com/nikhil-pandey/ovr/actions/runs/ID`.
 - **In the background.** Without `--foreground`, `ovrd connect ADDR github:FP` starts itself again in the
   background, logging to `connect-github.log` in the log directory, and returns at once. It retries with the usual
   backoff for as long as the job runs; the runner ends it with the job. A missing `id-token: write` permission is
@@ -597,8 +600,8 @@ caches such as sccache or bazel-remote are a per-host concern and work unchanged
   initiator accepts only hosts it paired. Pairing codes are one-shot, expiring, and rate-limited.
 - Trusted workloads: the same TLS, with the initiator pinned by the fingerprint the host is given, and the host
   admitted by a provider token for this initiator's audience that a trust rule matches. Anyone who can run a trusted
-  workflow can make a host appear, but a host only receives work: a trusted host is named `OWNER/REPO/JOB`, never a
-  paired host's name, and runs nothing until you send it something.
+  workflow can make a host appear, but a host only receives work: a trusted host is named `OWNER/REPO/WORKFLOW/RUN/JOB`,
+  never a paired host's name, and runs nothing until you send it something.
 - Dial-in agents run as a normal user, inside their checkouts directory only.
 - No environment is forwarded, so local tokens and keys cannot leak into the remote process.
 - `.gitignore`d files never leave the initiator, and neither does Git history: hosts hold only snapshots.

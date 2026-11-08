@@ -138,9 +138,33 @@ pub struct Claims {
     pub git_ref: String,
     #[serde(default)]
     pub run_id: String,
+    #[serde(default)]
+    pub run_number: String,
+    #[serde(default)]
+    pub run_attempt: String,
 }
 
 impl Claims {
+    /// Names the run, as in `OWNER/REPO/e2e/57`, or `OWNER/REPO/e2e/57.2` for its second attempt, so that hosts of
+    /// concurrent runs are told apart. The workflow's name is lowercased, with a `-` for each run of other characters.
+    #[must_use]
+    pub fn workload(&self) -> String {
+        let mut workflow = String::new();
+        for c in self.workflow.chars() {
+            if c.is_ascii_alphanumeric() {
+                workflow.push(c.to_ascii_lowercase());
+            } else if !workflow.is_empty() && !workflow.ends_with('-') {
+                workflow.push('-');
+            }
+        }
+        let workflow = workflow.trim_end_matches('-');
+        let run = match self.run_attempt.as_str() {
+            "" | "1" => self.run_number.clone(),
+            attempt => format!("{}.{attempt}", self.run_number),
+        };
+        format!("{}/{workflow}/{run}", self.repository)
+    }
+
     /// The workflow, the branch or other ref, and a link to the run, as in
     /// `CI on main, https://github.com/OWNER/REPO/actions/runs/ID`. The workflow's name is the repository's to choose,
     /// so control characters are dropped before it reaches a terminal.

@@ -64,7 +64,7 @@ pub enum Command {
         #[arg(requires = "addr")]
         code: Option<String>,
         /// With `github:FINGERPRINT`, tell this job's host apart from others of the same job, such as a matrix's:
-        /// it is named `OWNER/REPO/JOB/NAME`.
+        /// it is named `OWNER/REPO/WORKFLOW/RUN/JOB/NAME`.
         #[arg(long, requires = "code")]
         name: Option<String>,
         /// Serve in the foreground and install nothing to start at login, as on a CI runner.

@@ -257,7 +257,7 @@ impl Trust {
                 .map_err(|err| format!("cannot read the trust rules: {err}"))?;
                 match admission {
                     github::Admission::Yes | github::Admission::Pinned => {
-                        Ok((claims.repository.clone(), claims.about()))
+                        Ok((claims.workload(), claims.about()))
                     }
                     github::Admission::Replaced => Err(format!(
                         "{} is not the account or repository that was trusted, which has been renamed or deleted",

@@ -17,9 +17,9 @@ inputs:
     required: true
   name:
     description: >-
-      Tells this job's runner apart from others of the same job, such as a matrix's OS: it is
-      named `OWNER/REPO/JOB/NAME`. By default it is `OWNER/REPO/JOB`, numbered `-2`, `-3`, and so on in the order
-      such runners connect.
+      Tells this job's runner apart from others of the same job in the run, such as a matrix's OS: it is named
+      `OWNER/REPO/WORKFLOW/RUN/JOB/NAME`. By default it is `OWNER/REPO/WORKFLOW/RUN/JOB`, numbered `-2`, `-3`, and so
+      on in the order such runners connect.
     default: ""
   hold:
     description: >-

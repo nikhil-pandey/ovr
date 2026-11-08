@@ -637,8 +637,12 @@ def cmd_prepare(args: argparse.Namespace) -> None:
 
 def cmd_hosts(args: argparse.Namespace) -> None:
     """Waits until every host is online, and records each one's name. A paired host is named after its machine; a
-    trusted one after its job, `host`, which every host job shares, and the OS it names itself after."""
-    job = f"{os.environ['GITHUB_REPOSITORY']}/host"
+    trusted one after this run, as `OWNER/REPO/WORKFLOW/NUMBER[.ATTEMPT]`, its job, `host`, which every host job
+    shares, and the OS it names itself after."""
+    env = os.environ
+    workflow = re.sub(r"[^a-z0-9]+", "-", env["GITHUB_WORKFLOW"].lower()).strip("-")
+    attempt = "" if env["GITHUB_RUN_ATTEMPT"] == "1" else f".{env['GITHUB_RUN_ATTEMPT']}"
+    job = f"{env['GITHUB_REPOSITORY']}/{workflow}/{env['GITHUB_RUN_NUMBER']}{attempt}/host"
     deadline = time.monotonic() + args.timeout
     while True:
         listing = run(["ovr", "hosts"], check=False)
