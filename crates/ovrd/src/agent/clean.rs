@@ -8,6 +8,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use ovr_proto::VERSION;
+use ovr_proto::lock::Lock;
 use ovr_proto::msg::{Cleaned, RunState};
 
 use super::Config;
@@ -47,15 +48,9 @@ pub fn clean(config: &Config, initiator: Option<&str>) -> Result<Cleaned, Error>
                 continue;
             }
             std::fs::create_dir_all(&locks)?;
-            let lock = std::fs::File::options()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(locks.join(&name))?;
-            match lock.try_lock() {
-                Ok(()) => claimed.push((format!("{owner}-{name}"), name, dir, lock)),
-                Err(std::fs::TryLockError::WouldBlock) => in_use.push((dir, name)),
-                Err(std::fs::TryLockError::Error(err)) => return Err(err.into()),
+            match Lock::try_exclusive(&locks.join(&name))? {
+                Some(lock) => claimed.push((format!("{owner}-{name}"), name, dir, lock)),
+                None => in_use.push((dir, name)),
             }
         }
     }
@@ -211,7 +206,7 @@ mod tests {
         let draining = synced(&config, "me", "draining").await?;
         let drained = store.create(&meta("me", &draining)).await?;
         drained.end(&Ended::Exited { code: 0 })?;
-        let keeper = ovr_proto::git::lock(drained.lock_path()).await?;
+        let keeper = Lock::exclusive(drained.lock_path()).await?;
         store
             .create(&meta("you", &theirs))
             .await?

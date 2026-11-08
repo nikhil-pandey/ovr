@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use ovr_proto::lock::Lock;
 use ovr_proto::{git, retained};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, Command};
@@ -29,7 +30,7 @@ pub struct Checkout {
     dir: PathBuf,
     /// Held shared while the checkout is synced or a client is attached to one of its runs, so cleaning leaves it
     /// alone.
-    claim: Option<std::fs::File>,
+    claim: Option<Lock>,
 }
 
 impl Checkout {
@@ -59,7 +60,7 @@ impl Checkout {
 
     /// Hands the checkout's claim over to a caller that needs it for longer.
     #[must_use]
-    pub fn into_claim(self) -> Option<std::fs::File> {
+    pub fn into_claim(self) -> Option<Lock> {
         self.claim
     }
 
@@ -80,8 +81,8 @@ impl Checkout {
     /// # Errors
     ///
     /// Returns an error when the lock cannot be opened or taken.
-    pub async fn hold_objects(&self) -> io::Result<std::fs::File> {
-        git::lock_shared(self.dir.join(".git").join(GC_LOCK)).await
+    pub async fn hold_objects(&self) -> io::Result<Lock> {
+        Lock::shared(self.dir.join(".git").join(GC_LOCK)).await
     }
 
     /// Whether the object database has `commit`.
@@ -103,7 +104,7 @@ impl Checkout {
     /// Returns an error when the apply lock cannot be taken.
     pub async fn newest(&self) -> Result<Option<String>, Error> {
         let git_dir = self.dir.join(".git");
-        let _lock = git::lock(git_dir.join("ovr.lock")).await?;
+        let _lock = Lock::exclusive(git_dir.join("ovr.lock")).await?;
         let Some((_, commit)) = applied(&git_dir) else {
             return Ok(None);
         };
@@ -140,7 +141,7 @@ impl Checkout {
             )));
         }
         let git_dir = self.dir.join(".git");
-        let _lock = git::lock(git_dir.join("ovr.lock")).await?;
+        let _lock = Lock::exclusive(git_dir.join("ovr.lock")).await?;
         let (target, newest) = match applied(&git_dir) {
             Some((newer, commit)) if newer > seq && self.has_commit(&commit).await => {
                 (commit, false)
@@ -227,17 +228,9 @@ impl Checkout {
 
     /// Repacks when Git thinks it is time, unless a sync or another collection is using the objects.
     pub async fn collect_garbage(&self) {
-        let Ok(lock) = std::fs::File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.dir.join(".git").join(GC_LOCK))
-        else {
+        let Ok(Some(_lock)) = Lock::try_exclusive(&self.dir.join(".git").join(GC_LOCK)) else {
             return;
         };
-        if lock.try_lock().is_err() {
-            return;
-        }
         let _ = Command::new("git")
             .args(["-c", "gc.autoDetach=false", "gc", "--auto", "--quiet"])
             .current_dir(&self.dir)
@@ -284,13 +277,13 @@ impl Indexer {
     }
 }
 
-/// Claims `initiator`'s checkout `name` until the returned file is dropped, so that cleaning leaves it and its runs
+/// Claims `initiator`'s checkout `name` until the returned lock is dropped, so that cleaning leaves it and its runs
 /// alone.
 ///
 /// # Errors
 ///
 /// Returns an error for an invalid initiator or name, or when the claim cannot be taken.
-pub async fn claim(root: &Path, initiator: &str, name: &str) -> Result<std::fs::File, Error> {
+pub async fn claim(root: &Path, initiator: &str, name: &str) -> Result<Lock, Error> {
     let owner = owner(initiator)?;
     let valid = !name.is_empty()
         && name != "."
@@ -302,7 +295,7 @@ pub async fn claim(root: &Path, initiator: &str, name: &str) -> Result<std::fs::
     }
     let locks = root.join(LOCKS).join(owner);
     tokio::fs::create_dir_all(&locks).await?;
-    Ok(git::lock_shared(locks.join(name)).await?)
+    Ok(Lock::shared(locks.join(name)).await?)
 }
 
 /// The directory holding `initiator`'s checkouts: a prefix of its fingerprint, short for Windows' path limits.

@@ -570,7 +570,9 @@ before `ovrd` runs.
 - Rust. Two binaries from one workspace: `ovr` (CLI) and `ovrd` (server, agent, dial-in client).
 - Crates: `clap`, `miette`, `tokio` + `tokio-util` (framing), `yamux` (multiplexing), `serde_json`, `rustls` +
   `rcgen` + `ring`, `process-wrap` (process groups, Job Objects), `portable-pty`, `crossterm`, `directories`, `nix`
-  (signals), `windows-sys` (ConPTY Job Objects, console control). File locks are `std::fs::File::lock`.
+  (signals), `windows-sys` (ConPTY Job Objects, console control). File locks are `std::fs::File::lock`, unlocked
+  explicitly before the file is closed: a process another thread is spawning shares the open file until it execs, so
+  closing alone could leave the lock held for that long.
 - Uses the system `ssh`, `git`, and tunnel CLIs (`cloudflared`, `devtunnel`); reimplements none of them.
 - Prebuilt binaries for macOS, Linux, and Windows on arm64 and x86-64.
 

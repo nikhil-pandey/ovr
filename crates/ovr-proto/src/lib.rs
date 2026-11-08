@@ -6,6 +6,7 @@
 pub mod frame;
 pub mod git;
 pub mod ipc;
+pub mod lock;
 pub mod msg;
 pub mod paths;
 pub mod retained;

@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use futures::{SinkExt, StreamExt};
 use ovr_proto::frame::{self, Reader, Writer};
+use ovr_proto::lock::Lock;
 use ovr_proto::msg::{Attach, Attached, Clean, Exec, Failure, Hello, RunList, Runs, Welcome};
 use ovr_proto::{Frame, FrameKind};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -106,7 +107,7 @@ async fn start<S: AsyncRead + AsyncWrite>(
     config: &Config,
     store: &Store,
     hello: Hello,
-) -> Result<(Run, Option<std::fs::File>), Error> {
+) -> Result<(Run, Option<Lock>), Error> {
     let checkout = Checkout::open(&config.root, &hello.initiator, &hello.checkout).await?;
     let objects = checkout.hold_objects().await?;
     let welcome = if checkout.has_commits(&hello.bases).await {

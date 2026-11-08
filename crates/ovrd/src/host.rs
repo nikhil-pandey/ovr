@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use ovr_proto::frame::{self, Framed, Resumed};
+use ovr_proto::lock::Lock;
 use ovr_proto::msg::{Failure, Pair, PairOk};
 use ovr_proto::{Frame, FrameKind};
 use rustls::pki_types::ServerName;
@@ -134,14 +135,9 @@ fn paired(dir: &std::path::Path) -> Result<Initiator, Error> {
 /// Returns an error when this host is not paired or another `ovrd connect` is already serving.
 pub async fn serve() -> Result<(), Error> {
     let dir = ovr_proto::paths::data_dir()?;
-    let lock = std::fs::File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join("connect.lock"))?;
-    if lock.try_lock().is_err() {
+    let Some(_lock) = Lock::try_exclusive(&dir.join("connect.lock"))? else {
         return Err(Error::Invalid("ovrd connect is already running".to_owned()));
-    }
+    };
     let initiator = paired(&dir)?;
     let addr: Addr = initiator.addr.parse().map_err(Error::Invalid)?;
     let identity = Identity::load_or_create(&dir)?;

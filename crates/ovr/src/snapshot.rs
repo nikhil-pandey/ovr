@@ -9,7 +9,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use ovr_proto::git::{self, lock};
+use ovr_proto::git;
+use ovr_proto::lock::Lock;
 use ovr_proto::msg::Hello;
 use ovr_proto::retained;
 use tokio::io::AsyncWriteExt;
@@ -80,7 +81,7 @@ impl Snapshot {
         let state = git_dir.join("ovr");
         std::fs::create_dir_all(&state)?;
         let waited = Instant::now();
-        let _lock = lock(state.join("lock")).await?;
+        let _lock = Lock::exclusive(state.join("lock")).await?;
         tracing::debug!(elapsed = ?waited.elapsed(), "took the snapshot lock");
         let built = Instant::now();
         let index = state.join("index");
@@ -244,11 +245,11 @@ impl Delivery<'_> {
 }
 
 /// Locks the bases of one host and checkout for reading or rewriting.
-async fn lock_bases(path: &Path) -> Result<std::fs::File, Error> {
+async fn lock_bases(path: &Path) -> Result<Lock, Error> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    Ok(lock(path.to_owned()).await?)
+    Ok(Lock::exclusive(path.to_owned()).await?)
 }
 
 /// The next snapshot number: one more than the last, and at least the time in milliseconds, so numbering keeps
