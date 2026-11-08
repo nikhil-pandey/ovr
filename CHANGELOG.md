@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4](https://github.com/nikhil-pandey/ovr/compare/v0.2.3...v0.2.4) - 2026-11-08
+
+### Added
+
+- trust GitHub Actions jobs to dial in without pairing ([#13](https://github.com/nikhil-pandey/ovr/pull/13))
+
 ## [0.2.3](https://github.com/nikhil-pandey/ovr/compare/v0.2.2...v0.2.3) - 2026-11-08
 
 ### Added
