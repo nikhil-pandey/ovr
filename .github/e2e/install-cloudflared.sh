@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # Installs cloudflared, at the version in CLOUDFLARED_VERSION, onto this runner's PATH.
 set -euo pipefail
-bin="$RUNNER_TEMP/bin"
+bin="$RUNNER_TEMP/cloudflared"
 mkdir -p "$bin"
 case $RUNNER_OS in
   Linux) asset=cloudflared-linux-amd64 ;;
   macOS) asset=cloudflared-darwin-arm64.tgz ;;
   Windows) asset=cloudflared-windows-amd64.exe ;;
 esac
+echo "$bin" >>"$GITHUB_PATH"
+# A cached binary of this version, restored before this script, needs no download.
+if "$bin/cloudflared" --version 2>/dev/null; then
+  exit 0
+fi
 # Release downloads sometimes fail for minutes at a time; the API is a second way to the same asset.
 curl -fsSL --retry 10 --retry-all-errors --retry-max-time 300 -o "$bin/$asset" \
   "https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/$asset" ||
@@ -17,5 +22,4 @@ case $asset in
   *.exe) mv "$bin/$asset" "$bin/cloudflared.exe" ;;
   *) mv "$bin/$asset" "$bin/cloudflared" && chmod +x "$bin/cloudflared" ;;
 esac
-echo "$bin" >>"$GITHUB_PATH"
 "$bin/cloudflared" --version

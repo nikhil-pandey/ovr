@@ -50,6 +50,10 @@ it builds `ovrd` itself, under Bazel it gets both binaries as data. Its ignored 
 minutes, mostly waiting for a new quick tunnel to resolve. Platform-specific code (Windows Job Objects,
 ConPTY, named pipes) is only compiled on its platform; CI checks every released OS.
 
+Across runners, `.github/workflows/tunnel.yml` (driven by `.github/e2e/e2e.py`) has Linux, macOS, and Windows hosts
+dial an initiator through a quick tunnel, either paired or as trusted jobs with an OIDC token. `e2e.yml` checks
+syncs to both kinds on every pull request; `bench.yml` times real repositories on paired hosts nightly or on dispatch.
+
 ## Release
 
 Use [Conventional Commits](https://www.conventionalcommits.org); release-plz turns them into a release PR that bumps
