@@ -317,8 +317,9 @@ orders them.
   has it, and discards the speculative pack and its `EXEC`. The client then sends a thin pack against `have`, once
   it has checked that `have` is an object ID of a commit it still has; nothing at all when `have` is this run's
   snapshot; and otherwise, as when the checkout is gone or `git gc` pruned `have` locally, a full pack. Then it
-  sends `EXEC` again. After such a sync `ovr` records only the snapshot and `have` as bases, the two the host is
-  known to hold. The common case pays zero extra round trips; a stale base pays one, and usually a small pack.
+  sends `EXEC` again. After such a sync `ovr` drops the bases it sent and records the snapshot and `have` first,
+  keeping only bases that concurrent runs confirmed since. The common case pays zero extra round trips; a stale
+  base pays one, and usually a small pack.
   Reading applied state takes the apply lock, so a concurrent reset cannot leave recovery reading a partial record.
   From base validation through applying the received snapshot, each sync holds a shared `.git/ovr-gc.lock`;
   automatic collection takes it exclusively. Concurrent syncs still receive and apply without waiting for each
@@ -356,7 +357,9 @@ orders them.
 
 Receiving packs does not take the apply lock. Applying holds a per-checkout lock for the reset and submodule
 update, never while a command runs. Commands already running in the checkout keep running while it changes under
-them, exactly as they would when you save files locally mid-build.
+them, exactly as they would when you save files locally mid-build. A connection that drops mid-apply does not
+interrupt it: the agent lets the sync reach its next read or write, so Git is never killed holding its lock files,
+and `.git/ovr-applied` is replaced whole.
 
 1. `git index-pack --stdin --fix-thin` streams the pack straight into `.git/objects/pack/`.
 2. `git reset --hard` to the newest snapshot the checkout has seen: this run's, or a higher `seq` already applied

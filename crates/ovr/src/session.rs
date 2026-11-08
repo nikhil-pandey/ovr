@@ -545,6 +545,8 @@ async fn next<S: AsyncRead>(frames: &mut Reader<S>) -> Result<Frame, Error> {
 #[cfg(all(test, unix))]
 mod tests {
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
     use ovr_proto::msg::RunState;
@@ -559,6 +561,8 @@ mod tests {
         code: i32,
         stdout: String,
         stderr: String,
+        /// Bytes of the pack the host indexed.
+        sent: u64,
     }
 
     async fn ovr(
@@ -591,7 +595,7 @@ mod tests {
         signals: mpsc::Receiver<Signal>,
     ) -> Result<Run, Error> {
         let delivery = snapshot.deliver_to("box", "me").await?;
-        let (client, agent) = agent(host_root);
+        let (client, agent, sent) = counted(host_root);
 
         let (stdin_tx, stdin_rx) = mpsc::channel(4);
         let stdin = Bytes::copy_from_slice(stdin);
@@ -622,6 +626,7 @@ mod tests {
             code,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            sent: sent.load(Ordering::Relaxed),
         })
     }
 
@@ -631,6 +636,39 @@ mod tests {
         let (client, agent) = tokio::io::duplex(1 << 16);
         let agent = tokio::spawn(async move { ovrd::agent::session::serve(agent, &config).await });
         (client, agent)
+    }
+
+    /// Like [`agent`], also counting the bytes of the pack the agent indexes: the last one before an `EXEC`.
+    fn counted(host_root: &Path) -> (DuplexStream, JoinHandle<()>, Arc<AtomicU64>) {
+        let (agent_end, agent) = agent(host_root);
+        let (client, proxy) = tokio::io::duplex(1 << 16);
+        let (mut from_client, mut to_client) = frame::split(proxy);
+        let (mut from_agent, mut to_agent) = frame::split(agent_end);
+        let sent = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&sent);
+        tokio::spawn(async move {
+            let mut pack = 0;
+            while let Some(Ok(frame)) = from_client.next().await {
+                match frame.kind {
+                    FrameKind::Pack => pack += frame.payload.len() as u64,
+                    FrameKind::Exec => counter.store(std::mem::take(&mut pack), Ordering::Relaxed),
+                    _ => {}
+                }
+                if to_agent.send(frame).await.is_err() {
+                    break;
+                }
+            }
+            let _ = to_agent.close().await;
+        });
+        tokio::spawn(async move {
+            while let Some(Ok(frame)) = from_agent.next().await {
+                if to_client.send(frame).await.is_err() {
+                    break;
+                }
+            }
+            let _ = to_client.close().await;
+        });
+        (client, agent, sent)
     }
 
     fn exec(snapshot: &Snapshot, script: &str) -> Exec {
@@ -849,12 +887,11 @@ mod tests {
         let repo = repo()?;
         std::fs::write(repo.path().join("noise"), noise(1 << 20))?;
         let host = tempfile::tempdir()?;
-        ovr(repo.path(), "", host.path(), "true", b"").await?;
+        let full = ovr(repo.path(), "", host.path(), "true", b"").await?.sent;
         let checkout = std::fs::read_dir(host.path().join("me"))?
             .next()
             .ok_or_else(|| Error::Host("no checkout".to_owned()))??
             .path();
-        let full = packed(&checkout)?;
 
         // A base the host never received, as when it collected the base after a lost SYNCED.
         let main = repo.path().join("src/main.rs");
@@ -867,14 +904,13 @@ mod tests {
         std::fs::write(&main, "v1\n")?;
         git(repo.path(), &lose_base).await?;
         let run = ovr(repo.path(), "", host.path(), "cat src/main.rs", b"").await?;
-        assert_eq!(run.stdout, "v1\n");
-        assert_eq!(packed(&checkout)?, full);
+        assert_eq!((run.stdout.as_str(), run.sent), ("v1\n", 0));
 
         std::fs::write(&main, "v2\n")?;
         git(repo.path(), &lose_base).await?;
         let run = ovr(repo.path(), "", host.path(), "cat src/main.rs", b"").await?;
         assert_eq!(run.stdout, "v2\n");
-        let thin = packed(&checkout)? - full;
+        let thin = run.sent;
         assert!(
             thin * 10 < full,
             "{thin} bytes against what the host has, {full} in full"
@@ -886,10 +922,9 @@ mod tests {
         std::fs::write(checkout.join(".git/ovr-applied"), format!("0 {pruned}"))?;
         std::fs::write(&main, "v3\n")?;
         git(repo.path(), &lose_base).await?;
-        let before = packed(&checkout)?;
         let run = ovr(repo.path(), "", host.path(), "cat src/main.rs", b"").await?;
         assert_eq!(run.stdout, "v3\n");
-        assert!(packed(&checkout)? - before >= full, "a full pack is sent");
+        assert!(run.sent >= full, "a full pack is sent");
 
         // Missing, malformed, and collected applied state all require a full replacement pack.
         for (index, state) in [
@@ -910,10 +945,9 @@ mod tests {
             let content = format!("fallback {index}\n");
             std::fs::write(&main, &content)?;
             git(repo.path(), &lose_base).await?;
-            let before = packed(&checkout)?;
             let run = ovr(repo.path(), "", host.path(), "cat src/main.rs", b"").await?;
             assert_eq!(run.stdout, content);
-            assert!(packed(&checkout)? - before >= full, "a full pack is sent");
+            assert!(run.sent >= full, "a full pack is sent");
         }
         Ok(())
     }
@@ -926,25 +960,19 @@ mod tests {
         let streams = noise(2 << 20);
         let (a, b) = streams.split_at(1 << 20);
         std::fs::write(&big, a)?;
-        ovr(repo.path(), "", host.path(), "true", b"").await?;
+        let first = ovr(repo.path(), "", host.path(), "true", b"").await?.sent;
         let checkout = std::fs::read_dir(host.path().join("me"))?
             .next()
             .ok_or_else(|| Error::Host("no checkout".to_owned()))??
             .path();
-        let first = packed(&checkout)?;
         std::fs::write(&big, b)?;
-        ovr(repo.path(), "", host.path(), "true", b"").await?;
-        let second = packed(&checkout)?;
-        assert!(second - first >= 1 << 20, "b is new to the host");
+        let second = ovr(repo.path(), "", host.path(), "true", b"").await?.sent;
+        assert!(second >= 1 << 20, "b is new to the host");
 
         std::fs::write(&big, a)?;
         let run = ovr(repo.path(), "", host.path(), "wc -c < big", b"").await?;
         assert_eq!(run.stdout.trim(), (1 << 20).to_string());
-        assert_eq!(
-            packed(&checkout)?,
-            second,
-            "a is still a base on both sides"
-        );
+        assert_eq!(run.sent, 0, "a is still a base on both sides");
         let snapshot = Snapshot::take(repo.path()).await?;
         let kept = ovr_proto::retained::read(&checkout, "refs/ovr/kept/").await?;
         assert_eq!(kept, snapshot.deliver_to("box", "me").await?.bases);
@@ -955,22 +983,10 @@ mod tests {
         let run = ovr(repo.path(), "", host.path(), "cat big other | wc -c", b"").await?;
         assert_eq!(run.stdout.trim(), (2 << 20).to_string());
         assert!(
-            packed(&checkout)? - second < first / 10,
+            run.sent < first / 10,
             "the pack excludes objects from both bases"
         );
         Ok(())
-    }
-
-    /// Bytes of packs in `checkout`.
-    fn packed(checkout: &Path) -> Result<u64, Error> {
-        let mut bytes = 0;
-        for entry in std::fs::read_dir(checkout.join(".git/objects/pack"))? {
-            let entry = entry?;
-            if entry.path().extension().is_some_and(|ext| ext == "pack") {
-                bytes += entry.metadata()?.len();
-            }
-        }
-        Ok(bytes)
     }
 
     async fn git(dir: &Path, args: &[&str]) -> Result<String, Error> {

@@ -85,7 +85,9 @@ pub(crate) async fn serve(mut incoming: Incoming, config: Arc<Config>) {
             Some(_) = sessions.join_next() => {}
         }
     }
-    sessions.shutdown().await;
+    // Every stream has failed with the connection, so each session ends at its next read or write. Letting them get
+    // there, rather than aborting them, never kills Git mid-update and leaves its lock files behind.
+    while sessions.join_next().await.is_some() {}
 }
 
 /// `ovrd agent`: announce this host on stdout, then serve over stdin and stdout until SSH closes them.

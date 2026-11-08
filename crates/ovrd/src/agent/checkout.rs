@@ -149,7 +149,11 @@ impl Checkout {
         };
         self.reset(&target).await?;
         if newest {
-            std::fs::write(git_dir.join(APPLIED), format!("{seq} {snapshot}\n"))?;
+            // Replaced whole, so that a crash cannot leave a partial record that lets an older snapshot roll back.
+            crate::state::write_private(
+                &git_dir.join(APPLIED),
+                format!("{seq} {snapshot}\n").as_bytes(),
+            )?;
         }
         let kept = retained::read(&self.dir, KEPT).await?;
         retained::keep(&self.dir, KEPT, &kept, snapshot, &kept).await?;

@@ -215,8 +215,8 @@ impl Delivery<'_> {
     }
 
     /// Records that the host now has the snapshot, making it the most recent base of the next run. The other bases
-    /// stay, unless the host lacked one of them: then only `recovered`, what this run's pack was built against
-    /// instead, is known to be on the host.
+    /// stay, unless the host lacked one of the bases this run sent: then those are dropped in favour of `recovered`,
+    /// what this run's pack was built against instead, while bases acknowledged by concurrent runs since stay.
     ///
     /// # Errors
     ///
@@ -225,8 +225,15 @@ impl Delivery<'_> {
         let root = &self.snapshot.root;
         let _lock = lock_bases(&self.lock_file).await?;
         let current = retained::read(root, &self.refs).await?;
-        let rest = recovered.unwrap_or(&current);
-        retained::keep(root, &self.refs, &current, &self.snapshot.commit, rest).await?;
+        let rest: Vec<String> = match recovered {
+            None => current.clone(),
+            Some(recovered) => recovered
+                .iter()
+                .chain(current.iter().filter(|id| !self.bases.contains(id)))
+                .cloned()
+                .collect(),
+        };
+        retained::keep(root, &self.refs, &current, &self.snapshot.commit, &rest).await?;
         Ok(())
     }
 
@@ -439,11 +446,22 @@ mod tests {
         );
 
         let c = sync("c", None).await?;
-        sync("f", Some(&[c])).await?;
+        sync("f", Some(std::slice::from_ref(&c))).await?;
         assert_eq!(
             bases().await?,
             ["f", "c"],
             "after recovery, only what the host had"
+        );
+
+        std::fs::write(root.join("file"), "x")?;
+        let x = Snapshot::take(root).await?;
+        let recovering = x.deliver_to("box", "me").await?;
+        sync("y", None).await?;
+        recovering.synced(Some(&[c])).await?;
+        assert_eq!(
+            bases().await?,
+            ["x", "c", "y"],
+            "a recovery drops the bases it sent, not those acknowledged since"
         );
 
         std::fs::write(root.join("file"), "g")?;
@@ -459,7 +477,7 @@ mod tests {
         contents.sort();
         assert_eq!(
             contents,
-            ["c", "f", "g", "h"],
+            ["c", "g", "h", "x"],
             "both acknowledgements survive"
         );
 
