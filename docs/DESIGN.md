@@ -309,6 +309,37 @@ jobs:
   reach the runner while the job runs and still keep it afterwards, use the action twice: first without `hold`, and
   as the last step with it, perhaps gated on `failure()`. The second use finds the first's connection, which lasts
   until the job ends, and only holds, so the host keeps its name.
+
+  ```yaml
+  jobs:
+    build:
+      permissions:
+        contents: read
+        id-token: write
+      strategy:
+        matrix:
+          os: [ubuntu-latest, windows-latest]
+      runs-on: ${{ matrix.os }}
+      steps:
+        - uses: actions/checkout@v7
+        # Connect at the start; the runner serves in the background while the next steps run.
+        - uses: nikhil-pandey/ovr@vVERSION
+          with:
+            addr: ${{ vars.OVR_ADDR }}
+            initiator: ${{ vars.OVR_INITIATOR }}
+            name: ${{ matrix.os }}
+        - run: make test
+        # At the end, keep the job, and so the runner, for 30 minutes if a step failed.
+        - if: failure()
+          uses: nikhil-pandey/ovr@vVERSION
+          with:
+            addr: ${{ vars.OVR_ADDR }}
+            initiator: ${{ vars.OVR_INITIATOR }}
+            hold: 30m
+  ```
+
+  `VERSION` is the release `ovrd trust` prints. Keep only the first use to reach the runner while the job runs, or
+  only the second, gated on `failure() || runner.debug == '1'` as `ovrd trust` suggests, to connect just to debug.
 - **Reaching the initiator.** `ovrd trust` prints the open tunnel's address if there is one, the Dev Tunnel first,
   as it keeps its address; a Cloudflare quick tunnel's changes when it restarts. Storing the address and fingerprint
   as repository or organization variables keeps the step the same in every workflow.
