@@ -63,6 +63,10 @@ pub enum Command {
         /// GitHub Actions job, in the background until the job ends.
         #[arg(requires = "addr")]
         code: Option<String>,
+        /// With `github:FINGERPRINT`, tell this job's host apart from others of the same job, such as a matrix's:
+        /// it is named `OWNER/REPO/JOB/NAME`.
+        #[arg(long, requires = "code")]
+        name: Option<String>,
         /// Serve in the foreground and install nothing to start at login, as on a CI runner.
         #[arg(long, conflicts_with = "service")]
         foreground: bool,
@@ -144,9 +148,18 @@ pub async fn run(cli: Cli) -> Result<(), Error> {
         Some(Command::Connect {
             addr,
             code,
+            name,
             foreground,
             ..
-        }) => until_stopped(host::connect(addr, code.as_deref(), foreground)).await,
+        }) => {
+            until_stopped(host::connect(
+                addr,
+                code.as_deref(),
+                name.as_deref(),
+                foreground,
+            ))
+            .await
+        }
         Some(Command::Agent) => Ok(agent::serve_stdio().await?),
         Some(Command::Keep { dir }) => agent::keeper::main(dir).await,
     }

@@ -250,13 +250,19 @@ where
     Ok(())
 }
 
-/// `WORKLOAD/LABEL`, as in `nikhil-pandey/ovr/build`. Every part must survive [`name_part`], so the name always
-/// contains `/`, which no paired host's name or SSH destination does.
+/// `WORKLOAD/LABEL`, as in `nikhil-pandey/ovr/build`, or `nikhil-pandey/ovr/build/windows` for a host that also
+/// names itself. Every part must survive [`name_part`], so the name always contains `/`, which no paired host's name
+/// or SSH destination does.
 fn federated_name(workload: &str, label: &str) -> Result<String, String> {
-    let parts: Vec<String> = workload.split('/').chain([label]).map(name_part).collect();
+    let parts: Vec<String> = workload
+        .split('/')
+        .chain(label.split('/'))
+        .map(name_part)
+        .collect();
     if parts.len() < 2 || parts.iter().any(String::is_empty) {
         return Err(format!(
-            "cannot name a host after {workload:?} and {label:?}; the job needs an ID"
+            "cannot name a host after {workload:?} and {label:?}; the job needs an ID, and a name has letters, \
+             digits, `-`, `_`, or `.`"
         ));
     }
     Ok(parts.join("/"))

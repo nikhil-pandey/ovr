@@ -288,20 +288,23 @@ jobs:
 - **Names.** A trusted host is named `OWNER/REPO/JOB`, after the repository and the job's ID in the workflow, as in
   `ovr nikhil-pandey/ovr/build -- cargo test`; a job without an ID is refused. While another host holds or, for two
   minutes after disconnecting, keeps that name, the next gets `OWNER/REPO/JOB-2`, and so on; a host reconnecting
-  under the same identity gets its name back. The name contains `/`, so it can never be a paired host's or an SSH
+  under the same identity gets its name back. The jobs of a matrix share an ID, so that numbering follows the order
+  they connect; `ovrd connect ADDR github:FP --name NAME` names a host `OWNER/REPO/JOB/NAME` instead, as in
+  `nikhil-pandey/ovr/build/windows`. The name contains `/`, so it can never be a paired host's or an SSH
   destination's, and `ovr hosts` lists it only while it is connected.
 - **In the background.** Without `--foreground`, `ovrd connect ADDR github:FP` starts itself again in the
   background, logging to `connect-github.log` in the log directory, and returns at once. It retries with the usual
   backoff for as long as the job runs; the runner ends it with the job. A missing `id-token: write` permission is
   reported before it starts.
-- **The action.** `action.yml` at the repository root installs the `ovrd` release matching its tag (else the
-  latest) and, on runners without it, the tunnel CLI the address needs, then runs `ovrd connect`. Every failure is
-  a warning, so the action never fails a job. With `hold` (`30m`, `1h`, `90s`; a bare number is minutes), its step
-  keeps the job running for that long and shows the connection log; without it, the runner serves only while the
-  job's later steps run. Gating the step on `failure() || runner.debug == '1'` connects only when a job fails or
-  is re-run with debug logging. To reach the runner while the job runs and still keep it afterwards, use the action
-  twice: first without `hold`, and as the last step with it, perhaps gated on `failure()`. The second use finds the
-  first's connection, which lasts until the job ends, and only holds, so the host keeps its name.
+- **The action.** `action.yml` at the repository root installs the `ovrd` release matching its tag (else the latest)
+  unless `ovrd` is on `PATH` and, on runners without it, the tunnel CLI the address needs, then runs `ovrd connect`,
+  with `--name` from its `name` input, such as `${{ matrix.os }}`. Every failure is a warning, so the action never
+  fails a job. With `hold` (`30m`, `1h`, `90s`; a bare number is minutes), its step keeps the job running for that
+  long and shows the connection log; without it, the runner serves only while the job's later steps run. Gating the
+  step on `failure() || runner.debug == '1'` connects only when a job fails or is re-run with debug logging. To
+  reach the runner while the job runs and still keep it afterwards, use the action twice: first without `hold`, and
+  as the last step with it, perhaps gated on `failure()`. The second use finds the first's connection, which lasts
+  until the job ends, and only holds, so the host keeps its name.
 - **Reaching the initiator.** `ovrd trust` prints the open tunnel's address if there is one, the Dev Tunnel first,
   as it keeps its address; a Cloudflare quick tunnel's changes when it restarts. Storing the address and fingerprint
   as repository or organization variables keeps the step the same in every workflow.
