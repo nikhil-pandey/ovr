@@ -124,8 +124,36 @@ pub fn spawn_detached(
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        std_handles::stop_inheriting();
     }
     command.spawn().map(drop)
+}
+
+/// Windows hands a child every inheritable handle, not only the ones it is given, so a detached `ovrd` would keep
+/// this process's stdout open, and whoever reads it, such as a CI step capturing `ovrd connect`, would wait for it
+/// forever. Rust duplicates the handles it passes explicitly, so other children are unaffected.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod std_handles {
+    use windows_sys::Win32::Foundation::{
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    pub fn stop_inheriting() {
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: GetStdHandle has no preconditions, and SetHandleInformation only changes a flag on a handle
+            // this process owns; failure means there is no such handle, which needs nothing done.
+            unsafe {
+                let handle = GetStdHandle(which);
+                if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+        }
+    }
 }
 
 /// The server side of an endpoint. Only one process may hold it; callers serialise with a lock file.

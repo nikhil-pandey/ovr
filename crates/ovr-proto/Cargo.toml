@@ -17,6 +17,9 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "process", "rt", "sync", "time"] }
 tokio-util = { workspace = true, features = ["codec"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
 
