@@ -11,14 +11,26 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 use ovr_proto::frame::Resumed;
 use ovr_proto::ipc::ClientStream;
-use ovr_proto::msg::{Attach, Cleaned, Exec, Op, Resize, Response, RunInfo, RunState};
+use ovr_proto::msg::{Attach, Cleaned, Enter, Exec, Op, Resize, Response, RunInfo, RunState};
 use ovr_proto::{Frame, FrameKind};
 
 use crate::session::{End, Io, Mode, Position, Signal, Stream};
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Repository, Snapshot};
 
 /// Exit code for failures in `ovr` itself, following `docker run`.
 pub const FAILURE: i32 = 125;
+
+const EXAMPLES: &str = "\
+Examples:
+  ovr bigbox -- cargo test          sync this working tree to bigbox, run there, exit with its code
+  ovr bigbox                        a login shell in the synced checkout
+  ovr -d bigbox -- cargo build      in the background; prints the run number for logs, attach, and kill
+  ovr -n bigbox -- cat Cargo.lock   without syncing: in the checkout as bigbox has it
+  ovr ps                            runs on every connected host
+
+Commands run in the same directory relative to the repository root as here. Outside a Git repository
+nothing is synced, and commands run in the host's base directory: its home, or a trusted CI job's workspace.
+HOST is an SSH destination, or a host that dialed in: see `ovrd pair` and `ovrd trust`.";
 
 /// Longest wait between attempts to reach a host again.
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
@@ -29,7 +41,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
     name = "ovr",
     version,
     args_conflicts_with_subcommands = true,
-    subcommand_negates_reqs = true
+    subcommand_negates_reqs = true,
+    after_help = EXAMPLES
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -70,6 +83,10 @@ pub struct RunArgs {
     #[arg(short = 'd')]
     pub detach: bool,
 
+    /// Do not sync: run in the checkout as the host has it, or in the host's base directory when it has none yet.
+    #[arg(short = 'n')]
+    pub no_sync: bool,
+
     /// SSH destination or dialed-in host name.
     #[arg(required = true)]
     pub host: Option<String>,
@@ -81,13 +98,6 @@ pub struct RunArgs {
 
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum Error {
-    #[error("not inside a Git working tree")]
-    #[diagnostic(
-        code(ovr::not_a_repository),
-        help("ovr syncs the repository around the current directory")
-    )]
-    NotARepository,
-
     #[error(transparent)]
     #[diagnostic(code(ovr::git))]
     Git(#[from] ovr_proto::git::Error),
@@ -135,8 +145,8 @@ pub enum Error {
 /// # Errors
 ///
 /// Returns an error when `ovr` itself fails, as opposed to the remote command.
-pub async fn run(cli: Cli) -> Result<i32, Error> {
-    match (cli.command, cli.run.host) {
+pub async fn run(mut cli: Cli) -> Result<i32, Error> {
+    match (cli.command, cli.run.host.take()) {
         (Some(Command::Hosts), _) => hosts().await,
         (Some(Command::Ps { host }), _) => ps(host).await,
         (Some(Command::Attach { host, run }), _) => attach(host, run, Mode::Drive).await,
@@ -147,13 +157,25 @@ pub async fn run(cli: Cli) -> Result<i32, Error> {
             Ok(0)
         }
         (Some(Command::Clean { hosts, all }), _) => clean(hosts, all).await,
-        (None, Some(host)) => run_on(host, cli.run.cmd, cli.run.detach).await,
+        (None, Some(host)) => run_on(host, cli.run).await,
         (None, None) => Err(Error::Host("no host given".to_owned())),
     }
 }
 
+/// How a run starts: by syncing a snapshot, or without, in this repository's checkout if there is one.
+enum Start {
+    Sync(Snapshot),
+    Enter(Option<Repository>),
+}
+
 #[tracing::instrument(level = "debug", skip_all, fields(%host))]
-async fn run_on(host: String, argv: Vec<String>, detach: bool) -> Result<i32, Error> {
+async fn run_on(host: String, run: RunArgs) -> Result<i32, Error> {
+    let RunArgs {
+        detach,
+        no_sync,
+        cmd: argv,
+        ..
+    } = run;
     let started = Instant::now();
     let cwd = std::env::current_dir()?;
     let open = async {
@@ -163,26 +185,51 @@ async fn run_on(host: String, argv: Vec<String>, detach: bool) -> Result<i32, Er
         }
         opened
     };
-    let (opened, snapshot) = tokio::join!(open, Snapshot::take(&cwd));
-    let snapshot = snapshot?;
+    // Outside a repository there is nothing to sync.
+    let prepare = async {
+        Ok::<_, Error>(match Repository::locate(&cwd).await? {
+            Some(repository) if !no_sync => Start::Sync(Snapshot::take(repository).await?),
+            repository => Start::Enter(repository),
+        })
+    };
+    let (opened, start) = tokio::join!(open, prepare);
+    let start = start?;
     let (stream, initiator) = opened?;
-    let delivery = snapshot.deliver_to(&host, &initiator).await?;
 
     let tty = terminal::is_interactive();
     let (cols, rows) = terminal::size();
-    let exec = Exec {
+    let mut exec = Exec {
         argv,
-        cwd: snapshot.prefix.clone(),
+        cwd: String::new(),
         tty,
         cols,
         rows,
     };
-    let (mut stream, position) =
-        session::start(stream, &delivery, &exec, &mut tokio::io::stderr()).await?;
+    let stderr = &mut tokio::io::stderr();
+    let (mut stream, position, checkout) = match start {
+        Start::Sync(snapshot) => {
+            let delivery = snapshot.deliver_to(&host, &initiator).await?;
+            exec.cwd.clone_from(&snapshot.repository.prefix);
+            let (stream, position) = session::start(stream, &delivery, &exec, stderr).await?;
+            (stream, position, Some(delivery.checkout))
+        }
+        Start::Enter(repository) => {
+            let checkout = repository.as_ref().map(|repo| repo.checkout(&initiator));
+            if let Some(repository) = repository {
+                exec.cwd = repository.prefix;
+            }
+            let enter = Enter {
+                initiator,
+                checkout: checkout.clone(),
+            };
+            let (stream, position) = session::enter(stream, &enter, &exec, stderr).await?;
+            (stream, position, checkout)
+        }
+    };
     tracing::debug!(
         elapsed = ?started.elapsed(),
         %host,
-        checkout = %delivery.checkout,
+        checkout = checkout.as_deref().unwrap_or_default(),
         run = position.run,
         "attached"
     );
@@ -387,7 +434,7 @@ fn print_runs(rows: &[(String, RunInfo)]) {
                 run.run.to_string(),
                 state,
                 age(now.saturating_sub(run.started)),
-                run.checkout.clone(),
+                run.checkout.clone().unwrap_or_else(|| "-".to_owned()),
                 command,
             ]
         })

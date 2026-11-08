@@ -1,7 +1,7 @@
 //! Removing what runs leave behind on a host: checkouts, finished runs, and uploaded agents of other versions.
 //!
-//! Checkouts claimed by a sync or an attached client are left, with their runs, as are runs still running or whose
-//! keeper is still serving them. A checkout is first moved into `<root>/.trash` and then deleted, so one that cannot be removed whole, for example
+//! Checkouts claimed by a sync are left, with their runs, as are runs still running, watched by a client, or whose
+//! keeper is still serving them, with their checkouts. A checkout is first moved into `<root>/.trash` and then deleted, so one that cannot be removed whole, for example
 //! because a leftover build server on Windows holds a file open, is left as it was and reported as in use.
 
 use std::io;
@@ -61,10 +61,10 @@ pub fn clean(config: &Config, initiator: Option<&str>) -> Result<Cleaned, Error>
         if initiator.is_some_and(|initiator| initiator != meta.initiator) {
             continue;
         }
-        // A finished run may still be serving its end to a client, or about to be attached to by the sync that
-        // started it.
+        // A finished run may still be serving its end to a client, being replayed to one, or about to be attached to
+        // by the sync that started it.
         let claimed = in_use.iter().any(|(dir, _)| meta.dir.starts_with(dir));
-        if claimed || run.kept()? || run.state()? == RunState::Running {
+        if claimed || run.kept()? || run.watched()? || run.state()? == RunState::Running {
             busy.push(meta.dir);
             continue;
         }
@@ -159,7 +159,7 @@ mod tests {
     fn meta(initiator: &str, dir: &Path) -> Meta {
         Meta {
             initiator: initiator.to_owned(),
-            checkout: String::new(),
+            checkout: Some(String::new()),
             dir: dir.to_owned(),
             cwd: dir.to_owned(),
             exec: Exec {
@@ -189,6 +189,7 @@ mod tests {
             root: dir.path().join("checkouts"),
             runs: dir.path().join("runs"),
             agents: dir.path().join("agents"),
+            base: dir.path().to_owned(),
             shell: Shell::new("/bin/sh"),
             keeper: None,
         };
@@ -245,6 +246,50 @@ mod tests {
             (3, 2, vec!["running".to_owned()])
         );
         assert!(running.exists() && !theirs.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runs_watched_by_a_client_are_kept_with_their_checkout() -> Result<(), Error> {
+        let dir = tempfile::tempdir()?;
+        let config = Config {
+            root: dir.path().join("checkouts"),
+            runs: dir.path().join("runs"),
+            agents: dir.path().join("agents"),
+            base: dir.path().to_owned(),
+            shell: Shell::new("/bin/sh"),
+            keeper: None,
+        };
+        let store = Store::new(config.runs.clone());
+        let idle = synced(&config, "me", "idle").await?;
+        let in_base = Meta {
+            checkout: None,
+            ..meta("me", &config.base)
+        };
+        let running = store.create(&in_base).await?;
+        store
+            .create(&in_base)
+            .await?
+            .end(&Ended::Exited { code: 0 })?;
+        let replayed = store.create(&in_base).await?;
+        replayed.end(&Ended::Exited { code: 0 })?;
+        let watching = replayed.watch().await?;
+        let followed = synced(&config, "me", "followed").await?;
+        let in_checkout = store.create(&meta("me", &followed)).await?;
+        in_checkout.end(&Ended::Exited { code: 0 })?;
+        let following = in_checkout.watch().await?;
+
+        let cleaned = clean(&config, Some("me"))?;
+        assert_eq!(
+            (cleaned.checkouts, cleaned.runs, cleaned.kept),
+            (1, 1, vec!["followed".to_owned()]),
+            "a run in the base directory keeps no checkout but its own"
+        );
+        assert!(!idle.exists() && running.dir.exists() && replayed.dir.exists());
+
+        drop((watching, following));
+        let cleaned = clean(&config, Some("me"))?;
+        assert_eq!((cleaned.checkouts, cleaned.runs), (1, 2));
         Ok(())
     }
 }

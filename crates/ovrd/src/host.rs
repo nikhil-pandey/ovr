@@ -115,9 +115,13 @@ async fn federated(
         return Ok(());
     }
     let identity = Identity::ephemeral()?;
-    let config = Arc::new(agent::Config::detect()?);
-    tracing::info!(%addr, provider = %federation.provider, "serving");
     let provider = federation.provider;
+    let mut config = agent::Config::detect()?;
+    if let Some(workspace) = provider.workspace() {
+        config.base = workspace;
+    }
+    let config = Arc::new(config);
+    tracing::info!(%addr, %provider, base = %config.base.display(), "serving");
     let workload = Workload {
         provider,
         label: match name {

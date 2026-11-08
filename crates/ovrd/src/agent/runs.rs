@@ -2,8 +2,9 @@
 //!
 //! | File | Written by | Holds |
 //! |---|---|---|
-//! | `run.json` | agent | the request: initiator, checkout, command, start time, snapshot synced |
+//! | `run.json` | agent | the request: initiator, checkout if any, command, start time, snapshot synced |
 //! | `lock` | keeper | locked for the keeper's whole life, so a free lock means no keeper |
+//! | `watch` | agent | locked shared while a client follows or replays the run, so cleaning leaves it |
 //! | `pid` | keeper | the command's process group, once it has started |
 //! | `out.*`, `err.*` | keeper | the output log; see [`super::log`] |
 //! | `exit.json` | keeper, or agent for a lost run | how the run ended |
@@ -31,15 +32,16 @@ const STARTING: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub initiator: String,
-    pub checkout: String,
-    /// Absolute: the checkout directory the command runs in, or below.
+    /// `None` for a run in the host's base directory.
+    pub checkout: Option<String>,
+    /// Absolute: the checkout directory the command runs in, or below, or the base directory.
     pub dir: PathBuf,
     pub cwd: PathBuf,
     pub exec: Exec,
     /// Seconds since the Unix epoch.
     pub started: u64,
     /// The snapshot checked out by the run's sync: the one it sent, or a newer one already applied. The checkout may
-    /// have moved on by the time the command started. `None` in records written before it was kept.
+    /// have moved on by the time the command started. `None` for a run without a sync.
     pub synced_snapshot: Option<String>,
 }
 
@@ -106,6 +108,24 @@ impl Run {
     pub fn started(&self, group: Option<u32>) -> io::Result<()> {
         let group = group.map(|group| group.to_string()).unwrap_or_default();
         write_private(&self.dir.join("pid"), group.as_bytes())
+    }
+
+    /// Marks the run as watched until the returned lock is dropped, so that cleaning leaves it alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lock cannot be taken.
+    pub async fn watch(&self) -> io::Result<Lock> {
+        Lock::shared(self.dir.join("watch")).await
+    }
+
+    /// Whether a client is following or replaying the run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lock cannot be checked.
+    pub fn watched(&self) -> io::Result<bool> {
+        Ok(Lock::try_exclusive(&self.dir.join("watch"))?.is_none())
     }
 
     #[must_use]
@@ -275,13 +295,14 @@ impl Store {
         }
     }
 
-    /// Removes runs that ended more than [`RETENTION`] ago.
+    /// Removes runs that ended more than [`RETENTION`] ago, unless a client is watching them.
     fn collect(&self) {
         let Ok(runs) = self.all() else { return };
         for run in runs {
             let ended =
                 std::fs::metadata(run.dir.join("exit.json")).and_then(|meta| meta.modified());
             if ended.is_ok_and(|ended| ended.elapsed().unwrap_or_default() > RETENTION)
+                && !run.watched().unwrap_or(true)
                 && let Err(err) = std::fs::remove_dir_all(&run.dir)
             {
                 tracing::warn!(%err, run = run.id, "cannot remove an old run");
@@ -322,7 +343,7 @@ mod tests {
     fn meta(initiator: &str) -> Meta {
         Meta {
             initiator: initiator.to_owned(),
-            checkout: "repo-1".to_owned(),
+            checkout: Some("repo-1".to_owned()),
             dir: PathBuf::from("/"),
             cwd: PathBuf::from("/"),
             exec: Exec {

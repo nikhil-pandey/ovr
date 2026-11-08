@@ -32,6 +32,7 @@ pub enum FrameKind {
     Kill = 8,
     Runs = 9,
     Clean = 10,
+    Enter = 11,
 
     // Agent to client.
     Welcome = 16,
@@ -62,9 +63,9 @@ impl TryFrom<u8> for FrameKind {
 
     fn try_from(byte: u8) -> Result<Self, Error> {
         use FrameKind::{
-            Accept, Attach, Attached, Banner, Clean, Cleaned, Consumed, Err, Error as Fail, Exec,
-            Exit, Federated, Hello, In, Interrupt, Kill, Out, Pack, Pair, PairOk, Request, Resize,
-            Response, RunList, Runs, Synced, Welcome,
+            Accept, Attach, Attached, Banner, Clean, Cleaned, Consumed, Enter, Err, Error as Fail,
+            Exec, Exit, Federated, Hello, In, Interrupt, Kill, Out, Pack, Pair, PairOk, Request,
+            Resize, Response, RunList, Runs, Synced, Welcome,
         };
         Ok(match byte {
             1 => Hello,
@@ -77,6 +78,7 @@ impl TryFrom<u8> for FrameKind {
             8 => Kill,
             9 => Runs,
             10 => Clean,
+            11 => Enter,
             16 => Welcome,
             17 => Synced,
             18 => Out,

@@ -1,5 +1,5 @@
-//! The client half of a stream: start a run by syncing the snapshot, or attach to one, then relay terminal I/O
-//! until it exits. Every offset is tracked, so a stream that breaks can be resumed on a new one.
+//! The client half of a stream: start a run by syncing the snapshot or without syncing, or attach to one, then relay
+//! terminal I/O until it exits. Every offset is tracked, so a stream that breaks can be resumed on a new one.
 
 use std::convert::Infallible;
 use std::future::poll_fn;
@@ -11,8 +11,8 @@ use bytes::{Bytes, BytesMut};
 use futures::{Sink, SinkExt, StreamExt};
 use ovr_proto::frame::{self, CHUNK, INPUT_WINDOW, Reader, Writer};
 use ovr_proto::msg::{
-    Attach, Attached, Clean, Cleaned, Consumed, Exec, Exit, Failure, Resize, RunInfo, RunList,
-    Runs, Welcome,
+    Attach, Attached, Clean, Cleaned, Consumed, Enter, Exec, Exit, Failure, Resize, RunInfo,
+    RunList, Runs, Welcome,
 };
 use ovr_proto::{Frame, FrameKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -162,10 +162,7 @@ where
                     tracing::debug!(elapsed = ?phase.elapsed(), "recorded the acknowledged bases");
                     phase = Instant::now();
                 }
-                FrameKind::Err => {
-                    stderr.write_all(&frame.payload).await?;
-                    stderr.flush().await?;
-                }
+                FrameKind::Err => warn(stderr, &frame.payload).await?,
                 FrameKind::Attached => {
                     let attached: Attached = frame.parse()?;
                     tracing::debug!(elapsed = ?phase.elapsed(), run = attached.run, "received ATTACHED");
@@ -181,6 +178,53 @@ where
         // The bases stay: the host may have applied the snapshot anyway, and the next run's HELLO finds out.
         Err(err) => Err(reason(&mut stream.frames, err).await),
     }
+}
+
+/// Starts `exec` without syncing, in the checkout `enter` names as the host has it, or in the host's base directory,
+/// and returns once the run has started, writing the host's warnings to `stderr`. One round trip: `EXEC` follows
+/// `ENTER` at once.
+///
+/// # Errors
+///
+/// Returns an error when the command cannot be started or the connection drops.
+pub async fn enter<S, E>(
+    stream: S,
+    enter: &Enter,
+    exec: &Exec,
+    stderr: &mut E,
+) -> Result<(Stream<S>, Position), Error>
+where
+    S: AsyncRead + AsyncWrite,
+    E: AsyncWrite + Unpin,
+{
+    let mut stream = Stream::new(stream);
+    let started = async {
+        stream
+            .writer
+            .feed(Frame::json(FrameKind::Enter, enter)?)
+            .await?;
+        stream.send(Frame::json(FrameKind::Exec, exec)?).await?;
+        loop {
+            let frame = next(&mut stream.frames).await?;
+            match frame.kind {
+                FrameKind::Err => warn(stderr, &frame.payload).await?,
+                FrameKind::Attached => return Ok(Position::new(frame.parse()?)),
+                kind => return Err(ovr_proto::Error::Unexpected(kind).into()),
+            }
+        }
+    }
+    .await;
+    match started {
+        Ok(position) => Ok((stream, position)),
+        Err(err) => Err(reason(&mut stream.frames, err).await),
+    }
+}
+
+/// Writes a warning from the host before the command's output.
+async fn warn<E: AsyncWrite + Unpin>(stderr: &mut E, warning: &[u8]) -> Result<(), Error> {
+    stderr.write_all(warning).await?;
+    stderr.flush().await?;
+    Ok(())
 }
 
 /// A host that fails stops reading and closes the stream right after saying why, so a write that failed meanwhile
@@ -555,9 +599,11 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::*;
-    use crate::snapshot::Snapshot;
+    use crate::snapshot::{Repository, Snapshot};
 
     struct Run {
+        /// The host's number for the run.
+        number: u64,
         code: i32,
         stdout: String,
         stderr: String,
@@ -583,7 +629,7 @@ mod tests {
         stdin: &[u8],
         signals: mpsc::Receiver<Signal>,
     ) -> Result<Run, Error> {
-        let snapshot = Snapshot::take(&repo.join(cwd)).await?;
+        let snapshot = Snapshot::take_at(&repo.join(cwd)).await?;
         run_snapshot(&snapshot, host_root, script, stdin, signals).await
     }
 
@@ -607,11 +653,26 @@ mod tests {
                 }
             }
         });
-        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let mut stderr = Vec::new();
         let exec = exec(snapshot, script);
-        let (mut stream, mut position) = start(client, &delivery, &exec, &mut stderr).await?;
+        let (stream, position) = start(client, &delivery, &exec, &mut stderr).await?;
+        let mut run = to_end(stream, position, stdin_rx, signals, stderr, agent).await?;
+        run.sent = sent.load(Ordering::Relaxed);
+        Ok(run)
+    }
+
+    /// Relays a started run until it exits, after `stderr` holds what the host said before the command's output.
+    async fn to_end(
+        mut stream: Stream<DuplexStream>,
+        mut position: Position,
+        stdin: mpsc::Receiver<Bytes>,
+        signals: mpsc::Receiver<Signal>,
+        mut stderr: Vec<u8>,
+        agent: JoinHandle<()>,
+    ) -> Result<Run, Error> {
+        let mut stdout = Vec::new();
         let mut io = Io {
-            stdin: stdin_rx,
+            stdin,
             signals,
             stdout: &mut stdout,
             stderr: &mut stderr,
@@ -623,10 +684,11 @@ mod tests {
             return Err(Error::Disconnected);
         };
         Ok(Run {
+            number: position.run,
             code,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
-            sent: sent.load(Ordering::Relaxed),
+            sent: 0,
         })
     }
 
@@ -674,7 +736,7 @@ mod tests {
     fn exec(snapshot: &Snapshot, script: &str) -> Exec {
         Exec {
             argv: vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
-            cwd: snapshot.prefix.clone(),
+            cwd: snapshot.repository.prefix.clone(),
             tty: false,
             cols: 80,
             rows: 24,
@@ -687,7 +749,7 @@ mod tests {
         host_root: &Path,
         script: &str,
     ) -> Result<(Stream<DuplexStream>, Position, JoinHandle<()>), Error> {
-        let snapshot = Snapshot::take(repo).await?;
+        let snapshot = Snapshot::take_at(repo).await?;
         let delivery = snapshot.deliver_to("box", "me").await?;
         let (client, agent) = agent(host_root);
         let exec = exec(&snapshot, script);
@@ -727,6 +789,7 @@ mod tests {
             root: host_root.to_owned(),
             runs: host_root.join(".runs"),
             agents: host_root.join(".agents"),
+            base: host_root.join(".base"),
             shell: Shell::new("/bin/sh"),
             keeper: None,
         }
@@ -846,7 +909,7 @@ mod tests {
         let repo = repo()?;
         let host = tempfile::tempdir()?;
         ovr(repo.path(), "", host.path(), "true", b"").await?;
-        let confirmed = Snapshot::take(repo.path()).await?.commit;
+        let confirmed = Snapshot::take_at(repo.path()).await?.commit;
         // A file where the checkout root should be.
         let blocked = host.path().join("blocker");
         std::fs::write(&blocked, "")?;
@@ -854,7 +917,7 @@ mod tests {
         std::fs::write(repo.path().join("src/main.rs"), "v2\n")?;
         let err = ovr(repo.path(), "", &blocked, "true", b"").await.err();
         assert!(matches!(err, Some(Error::Remote(_))), "{err:?}");
-        let snapshot = Snapshot::take(repo.path()).await?;
+        let snapshot = Snapshot::take_at(repo.path()).await?;
         let bases = snapshot.deliver_to("box", "me").await?.bases;
         assert_eq!(bases, [confirmed]);
 
@@ -862,7 +925,7 @@ mod tests {
         let failed = snapshot.deliver_to("box", "me").await?;
         std::fs::write(repo.path().join("src/main.rs"), "v3\n")?;
         ovr(repo.path(), "", host.path(), "true", b"").await?;
-        let newer = Snapshot::take(repo.path()).await?;
+        let newer = Snapshot::take_at(repo.path()).await?;
         let (client, agent) = agent(&blocked);
         assert!(
             start(
@@ -896,7 +959,7 @@ mod tests {
         // A base the host never received, as when it collected the base after a lost SYNCED.
         let main = repo.path().join("src/main.rs");
         std::fs::write(&main, "elsewhere\n")?;
-        let unknown = Snapshot::take(repo.path()).await?.commit;
+        let unknown = Snapshot::take_at(repo.path()).await?.commit;
         let host_ref = git(repo.path(), &["for-each-ref", "--format=%(refname)"]).await?;
         let lose_base = ["update-ref", host_ref.as_str(), unknown.as_str()];
 
@@ -973,7 +1036,7 @@ mod tests {
         let run = ovr(repo.path(), "", host.path(), "wc -c < big", b"").await?;
         assert_eq!(run.stdout.trim(), (1 << 20).to_string());
         assert_eq!(run.sent, 0, "a is still a base on both sides");
-        let snapshot = Snapshot::take(repo.path()).await?;
+        let snapshot = Snapshot::take_at(repo.path()).await?;
         let kept = ovr_proto::retained::read(&checkout, "refs/ovr/kept/").await?;
         assert_eq!(kept, snapshot.deliver_to("box", "me").await?.bases);
         assert_eq!(kept.len(), 2);
@@ -985,6 +1048,154 @@ mod tests {
         assert!(
             run.sent < first / 10,
             "the pack excludes objects from both bases"
+        );
+        Ok(())
+    }
+
+    /// Runs `script` without syncing, from `cwd` in `repo`, or outside a repository without one.
+    async fn unsynced(
+        repo: Option<&Path>,
+        cwd: &str,
+        host_root: &Path,
+        script: &str,
+    ) -> Result<Run, Error> {
+        let (checkout, prefix) = match repo {
+            Some(repo) => {
+                let repository = Repository::locate(&repo.join(cwd))
+                    .await?
+                    .ok_or_else(|| Error::Host("not a repository".to_owned()))?;
+                (Some(repository.checkout("me")), repository.prefix)
+            }
+            None => (None, String::new()),
+        };
+        let request = Enter {
+            initiator: "me".to_owned(),
+            checkout,
+        };
+        let exec = Exec {
+            argv: vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+            cwd: prefix,
+            tty: false,
+            cols: 80,
+            rows: 24,
+        };
+        let (client, agent) = agent(host_root);
+        let mut stderr = Vec::new();
+        let (stream, position) = enter(client, &request, &exec, &mut stderr).await?;
+        let (stdin, signals) = (mpsc::channel(1).1, mpsc::channel(1).1);
+        to_end(stream, position, stdin, signals, stderr, agent).await
+    }
+
+    /// The physical path of `dir`, as `pwd -P` prints it: temporary directories can be under a symlink, as on macOS.
+    fn physical(dir: &Path) -> Result<String, Error> {
+        Ok(std::fs::canonicalize(dir)?.to_string_lossy().into_owned())
+    }
+
+    #[tokio::test]
+    async fn without_syncing_runs_in_the_checkout_as_the_host_has_it() -> Result<(), Error> {
+        let repo = repo()?;
+        let host = tempfile::tempdir()?;
+        let script = "echo built > src/main.rs";
+        ovr(repo.path(), "", host.path(), script, b"").await?;
+        let checkout = std::fs::read_dir(host.path().join("me"))?
+            .next()
+            .ok_or_else(|| Error::Host("no checkout".to_owned()))??
+            .path();
+        let applied = std::fs::read(checkout.join(".git/ovr-applied"))?;
+
+        std::fs::write(repo.path().join("src/main.rs"), "local edit\n")?;
+        std::fs::write(repo.path().join("src/new.rs"), "never sent\n")?;
+        let script = "pwd -P; cat main.rs; ls";
+        let run = unsynced(Some(repo.path()), "src", host.path(), script).await?;
+        assert_eq!(
+            (run.code, run.stdout),
+            (
+                0,
+                format!("{}/src\nbuilt\ngone.rs\nmain.rs\n", physical(&checkout)?)
+            ),
+            "{}",
+            run.stderr
+        );
+        assert!(!run.stderr.contains("checkout"), "{}", run.stderr);
+        assert_eq!(
+            std::fs::read(checkout.join(".git/ovr-applied"))?,
+            applied,
+            "nothing is applied"
+        );
+        let runs = list(agent(host.path()).0, "me").await?;
+        let listed = runs.iter().find(|info| info.run == run.number);
+        assert_eq!(
+            listed.and_then(|info| info.checkout.clone()),
+            checkout
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        );
+
+        std::fs::create_dir(repo.path().join("docs"))?;
+        std::fs::write(repo.path().join("docs/new.md"), "new\n")?;
+        let missing = unsynced(Some(repo.path()), "docs", host.path(), "true").await;
+        assert!(
+            matches!(&missing, Err(Error::Remote(message))
+                if message == "docs is not in the host's checkout as it is; run without -n to sync it first"),
+            "{:?}",
+            missing.map(|run| run.stdout)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn without_a_checkout_runs_in_the_base_directory() -> Result<(), Error> {
+        let repo = repo()?;
+        let host = tempfile::tempdir()?;
+        let base = host.path().join(".base");
+        std::fs::create_dir_all(&base)?;
+        // The base directory may be a repository of the host user's; nothing must collect garbage there.
+        git(&base, &["init", "-q"]).await?;
+        let here = format!("{}\n", physical(&base)?);
+
+        let inside = unsynced(Some(repo.path()), "src", host.path(), "pwd -P").await?;
+        assert_eq!((inside.code, inside.stdout.as_str()), (0, here.as_str()));
+        let name = Repository::locate(repo.path())
+            .await?
+            .map(|repository| repository.checkout("me"))
+            .unwrap_or_default();
+        let warning = format!(
+            "ovr: this host has no checkout of {name} yet; running in {}, not in src\n",
+            base.display()
+        );
+        assert!(inside.stderr.starts_with(&warning), "{}", inside.stderr);
+        assert!(
+            !host.path().join("me").join(&name).exists(),
+            "no checkout is created"
+        );
+
+        let outside = unsynced(None, "", host.path(), "pwd -P").await?;
+        assert_eq!((outside.code, outside.stdout.as_str()), (0, here.as_str()));
+        assert!(!outside.stderr.contains("checkout"), "{}", outside.stderr);
+
+        let runs = list(agent(host.path()).0, "me").await?;
+        let checkouts: Vec<_> = runs
+            .iter()
+            .filter(|info| [inside.number, outside.number].contains(&info.run))
+            .map(|info| info.checkout.clone())
+            .collect();
+        assert_eq!(checkouts, [None, None]);
+        // A keeper lets go of its run only after it would have collected garbage.
+        for run in [inside.number, outside.number] {
+            let lock = host.path().join(".runs").join(run.to_string()).join("lock");
+            let mut released = false;
+            for _ in 0..400 {
+                if ovr_proto::lock::Lock::try_exclusive(&lock)?.is_some() {
+                    released = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(released, "the keeper of run {run} never finished");
+        }
+        assert!(
+            !base.join(".git/ovr-gc.lock").exists(),
+            "the keeper left the base directory alone"
         );
         Ok(())
     }
@@ -1125,11 +1336,11 @@ mod tests {
         let repo = repo()?;
         let host = tempfile::tempdir()?;
         let main = repo.path().join("src/main.rs");
-        let first = Snapshot::take(repo.path()).await?;
+        let first = Snapshot::take_at(repo.path()).await?;
         std::fs::write(&main, "v2\n")?;
-        let second = Snapshot::take(repo.path()).await?;
+        let second = Snapshot::take_at(repo.path()).await?;
         std::fs::write(&main, "v1\n")?;
-        let third = Snapshot::take(repo.path()).await?;
+        let third = Snapshot::take_at(repo.path()).await?;
         assert_eq!(third.commit, first.commit, "same tree, later snapshot");
 
         // The same tree arriving late must not lower the bar for the snapshot taken between them.
@@ -1262,14 +1473,14 @@ mod tests {
     #[tokio::test]
     async fn a_host_that_fails_mid_pack_is_heard_instead_of_waited_on() -> Result<(), Error> {
         let repo = repo()?;
-        let confirmed = Snapshot::take(repo.path()).await?;
+        let confirmed = Snapshot::take_at(repo.path()).await?;
         confirmed
             .deliver_to("box", "me")
             .await?
             .synced(None)
             .await?;
         std::fs::write(repo.path().join("noise"), noise(2 << 20))?;
-        let snapshot = Snapshot::take(repo.path()).await?;
+        let snapshot = Snapshot::take_at(repo.path()).await?;
         let delivery = snapshot.deliver_to("box", "me").await?;
 
         // A host that fails after the first pack frame, says why, and stops reading without closing the stream.

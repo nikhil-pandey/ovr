@@ -14,6 +14,12 @@ source of truth for behaviour; read it before changing anything user-visible.
 
 ## Principles
 
+- Think holistically. Before changing anything, understand how it fits the whole design, and shape the change to
+  leave the system coherent: the protocol, both binaries, the docs, and the tests. A narrow patch that only makes the
+  immediate case work is not wanted. If the right fix is a restructuring, do the restructuring.
+- There are no users yet. Breaking changes to the protocol, the CLI, or on-disk state are fine, and so are large
+  refactors, when they move the design in the right direction. Do not add compatibility shims, migrations, or
+  fallbacks for old behaviour.
 - Keep it minimal. No configuration files, no flags that a fixed default can replace, and no environment variables
   beyond the `OVR_*` directory overrides in `crates/ovr-proto/src/paths.rs` and those a CI provider sets for its
   jobs, such as GitHub Actions' token request variables.

@@ -58,6 +58,22 @@ impl Checkout {
         })
     }
 
+    /// The existing checkout `<root>/<owner>/<name>`, claimed until this is dropped, or `None` when there is none.
+    /// Unlike [`Checkout::open`], it never creates one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid initiator or name, or when the claim cannot be taken.
+    pub async fn find(root: &Path, initiator: &str, name: &str) -> Result<Option<Self>, Error> {
+        // Claimed first, so that a clean cannot remove it between looking and running.
+        let claim = claim(root, initiator, name).await?;
+        let dir = root.join(owner(initiator)?).join(name);
+        Ok(dir.join(".git").is_dir().then(|| Self {
+            dir,
+            claim: Some(claim),
+        }))
+    }
+
     /// Hands the checkout's claim over to a caller that needs it for longer.
     #[must_use]
     pub fn into_claim(self) -> Option<Lock> {
@@ -195,12 +211,13 @@ impl Checkout {
         }
     }
 
-    /// Resolves the client's working directory, given relative to the repository root.
+    /// Resolves the client's working directory, given relative to the repository root; `None` when it is not in the
+    /// checkout.
     ///
     /// # Errors
     ///
-    /// Returns an error when `prefix` escapes the checkout or does not exist in it.
-    pub fn cwd(&self, prefix: &str) -> Result<PathBuf, Error> {
+    /// Returns an error when `prefix` escapes the checkout.
+    pub fn cwd(&self, prefix: &str) -> Result<Option<PathBuf>, Error> {
         let parts: Vec<&str> = prefix.split('/').filter(|part| !part.is_empty()).collect();
         let valid = parts.iter().all(|part| {
             let mut components = Path::new(part).components();
@@ -217,13 +234,7 @@ impl Checkout {
         let cwd = parts
             .iter()
             .fold(self.dir.clone(), |dir, part| dir.join(part));
-        if cwd.is_dir() {
-            Ok(cwd)
-        } else {
-            Err(Error::Invalid(format!(
-                "{prefix} does not exist on the host because it holds no files that are sent"
-            )))
-        }
+        Ok(cwd.is_dir().then_some(cwd))
     }
 
     /// Repacks when Git thinks it is time, unless a sync or another collection is using the objects.

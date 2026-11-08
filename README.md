@@ -34,6 +34,7 @@ Any SSH host works as is; `ovr` uploads its agent on first use:
 ovr user@bigbox -- cargo build --release   # run against your working tree, exit with its code
 ovr bigbox                                 # a login shell in the synced checkout
 ovr -d bigbox -- cargo test                # in the background; prints the run number
+ovr -n bigbox -- cat Cargo.lock            # without syncing: the checkout as bigbox has it
 ovr ps                                     # runs on every connected host
 ovr logs bigbox 12                         # follow a run's output
 ovr attach bigbox 12                       # take a run's terminal back

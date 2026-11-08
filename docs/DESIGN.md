@@ -78,7 +78,9 @@ identical above the transport layer.
 ## Command surface
 
 ```
-ovr [-d] HOST [-- CMD...]   run CMD on HOST (no CMD: login shell in the synced checkout); -d: in the background
+ovr [-d] [-n] HOST [-- CMD...]
+                            run CMD on HOST (no CMD: login shell in the synced checkout); -d: in the background;
+                            -n: without syncing, in the checkout as the host has it
 ovr hosts                   list dialed-in hosts, their OS/arch, and a trusted host's run
 ovr ps [HOST]               list runs: running, and finished in the last 7 days
 ovr attach HOST RUN         reconnect a terminal to a run, as if it had been started here
@@ -105,6 +107,14 @@ ovrd connect ADDR github:FP in a GitHub Actions job: serve the initiator with fi
   else after `HOST` is an error that suggests `--`.
 - The remote command runs in the same directory relative to the repository root as your current directory, so
   `cd crates/engine && ovr box -- cargo test` does what you expect.
+- `-n` runs without syncing: no snapshot, no pack, no reset, no collection. The command runs in this repository's
+  checkout as the host has it, including whatever builds left there and tracked files the next sync would restore,
+  so `ovr -n box -- cat Cargo.lock` shows what the build rewrote. It does not lock the checkout against syncs from
+  other terminals. When the current directory is not in that checkout, the run fails and says to sync first.
+- Outside a Git repository there is nothing to sync, so `ovr HOST -- CMD` behaves as with `-n`, and the command runs
+  in the host's **base directory**: the host user's home, or the workspace of a [trusted
+  workload](#trusted-workloads). A `-n` run whose checkout the host does not have yet runs there too, after a warning
+  naming the base directory and, if any, the directory below the repository root that it does not apply there.
 - The remote command's exit code is returned unchanged; a command killed by a signal reports `128 + signal`.
   Failures in `ovr` itself exit with `125`, following the `docker run` convention.
 - `RUN` is the number the host gives each run, shown by `ovr ps`. `ovr -d` prints it and exits `0` once the command
@@ -192,7 +202,7 @@ For hosts that cannot accept SSH, including every Windows workstation:
   own reconnect backoff. At info level, only changes in the failure reason are logged; repeated identical failures
   are debug events. Pairing installs it to start at login as
   the logged-in user (Scheduled Task on Windows, a `launchd` agent on macOS, a `systemd --user` unit on Linux),
-  never as SYSTEM or root, and it works only inside its checkouts directory. Restarting the service leaves run
+  never as SYSTEM or root. Restarting the service leaves run
   keepers alone (`KillMode=process` on Linux). The service keeps the `PATH` and `OVR_*` directory variables it was
   installed from, so it finds tunnel CLIs wherever the user installed them and its files where the user moved them;
   a Scheduled Task reads the user's persistent environment instead. With `--foreground`, or where no service
@@ -340,6 +350,10 @@ jobs:
 
   `VERSION` is the release `ovrd trust` prints. Keep only the first use to reach the runner while the job runs, or
   only the second, gated on `failure() || runner.debug == '1'` as `ovrd trust` suggests, to connect just to debug.
+- **The job's tree.** On a trusted GitHub Actions host, runs without a checkout start in the job's
+  `GITHUB_WORKSPACE` instead of the home directory, so a held runner is one command from what the job left:
+  `ovr OWNER/REPO/ci/57/build -- cat test-results/report.txt` from outside a repository. Paired and SSH hosts use the
+  home directory, even when they happen to run on a CI runner.
 - **Reaching the initiator.** `ovrd trust` prints the open tunnel's address if there is one, the Dev Tunnel first,
   as it keeps its address; a Cloudflare quick tunnel's changes when it restarts. Storing the address and fingerprint
   as repository or organization variables keeps the step the same in every workflow.
@@ -435,6 +449,10 @@ orders them.
   The next run's `HELLO` lets the host tell. Concurrent runs read and rewrite the bases under a lock per host and checkout in
   the common Git directory's `ovr/bases/`, held only for that, and rewrite them in one ref transaction, so neither
   loses the other's. Cleaning uses the same locks, including when removing another worktree's bases.
+- **Without syncing.** `ovr -n`, or any run outside a repository, sends `ENTER{initiator, checkout?}` and `EXEC`
+  together, so it costs one round trip and, inside a repository, one `git rev-parse` to name the checkout. The agent
+  claims the checkout, if it exists, as `ATTACH` does, and never creates one; its warnings come as `ERR` frames before
+  `ATTACHED`, as a sync's do.
 - **Pipelined.** `EXEC` follows the pack on the same stream, so the agent starts the command the moment checkout
   finishes without another exchange.
 - **Connections outlive runs.** SSH agents stay up for ten minutes; dial-in connections stay up indefinitely. A
@@ -480,8 +498,9 @@ and `.git/ovr-applied` is replaced whole.
    removes it. Only Git's report that the lock file already exists counts, read with `LC_ALL=C`; other failures to
    create it, such as permissions or a read-only filesystem, fail the sync at once with Git's error.
 3. Reflogs are off in the checkout, so a snapshot becomes unreachable once it is neither checked out nor among the
-   four kept. After a command exits, its keeper runs `git gc --auto` unless a sync or another collection holds the
-   object lock. Collection stays under that lock until Git finishes, alongside draining clients; a new sync waits
+   four kept. After a command whose run synced exits, its keeper runs `git gc --auto` unless a sync or another
+   collection holds the object lock. Runs without a sync collect nothing: they leave the checkout alone, and the base
+   directory may be any repository of the host user's. Collection stays under that lock until Git finishes, alongside draining clients; a new sync waits
    for an already-running collection before validating its bases.
 
 The remote never runs `git clean`. The reset already removes files that left the snapshot, and anything the build
@@ -490,7 +509,7 @@ creates that is not tracked stays, exactly as it would locally.
 ### The wire
 
 - Frames are `len:u32le, kind:u8, payload`, where `len` covers the kind and payload, read and written with
-  `tokio-util`'s length-delimited codec. Control messages (`HELLO`, `WELCOME`, `EXEC`, `SYNCED`, `RESIZE`,
+  `tokio-util`'s length-delimited codec. Control messages (`HELLO`, `ENTER`, `WELCOME`, `EXEC`, `SYNCED`, `RESIZE`,
   `CONSUMED`, `EXIT`, `ATTACH`, `ATTACHED`, `KILL`, `RUNS`, `RUN_LIST`, `CLEAN`, `CLEANED`, and `BANNER`/`ACCEPT`/`PAIR` on connection
   setup) are small JSON.
   Data frames (`PACK`, `OUT`, `ERR`, `IN`) carry raw bytes, up to 64 KiB each, and are what the stream is made of.
@@ -527,11 +546,12 @@ a failed update is shown as a warning before the command runs. Git LFS content i
 Checkouts stay as a warm cache until removed; finished runs go after seven days. `ovr clean` removes them sooner and
 never touches what is in use:
 
-- A checkout being synced or watched is claimed: the stream holds a shared lock on
-  `<checkouts>/.locks/<owner>/<name>` from the start of a sync, and from an `ATTACH`, until it ends. Cleaning takes
-  that lock exclusively without waiting, so such a checkout is kept with its runs, and a sync that starts meanwhile
-  waits for the clean.
-- A run still running, or ended but with its keeper still serving the end to clients, is kept, with its checkout.
+- A checkout being synced is claimed: the stream holds a shared lock on `<checkouts>/.locks/<owner>/<name>` from the
+  start of a sync or an `ENTER` until its run is recorded and attached. Cleaning takes that lock exclusively without
+  waiting, so such a checkout is kept with its runs, and a sync that starts meanwhile waits for the clean.
+- A run is kept, with its checkout if it has one, while it is running, while its keeper is still serving the end to
+  clients, and while a client follows or replays it: the stream holds a shared lock on the run's `watch` file, which
+  cleaning and the seven-day expiry test without waiting.
 - A checkout is moved into `<checkouts>/.trash` before it is deleted, so one that cannot be removed whole, such as on
   Windows while a leftover build server holds a file open, stays intact and is reported as in use. Whatever could not
   be deleted from the trash is retried by the next clean.
@@ -549,7 +569,8 @@ are never removed.
 The agent is `ovrd` on the host, whether spawned over SSH or resident via `ovrd connect`. It syncs checkouts, starts
 runs, and relays their I/O; the commands themselves belong to [run keepers](#runs).
 
-- **Exec:** argument vector, working directory relative to the checkout, terminal size. No shell string, so no
+- **Exec:** argument vector, working directory relative to the checkout (ignored in the base directory), terminal
+  size. No shell string, so no
   quoting problems on any OS. On Unix the argument vector is run through the user's login shell
   (`$SHELL -l -c 'exec "$@"'`) so the host's `PATH` and toolchains are the ones the user sees. Nothing from the
   initiator's environment is forwarded; terminal runs get `TERM=xterm-256color`.
@@ -578,7 +599,7 @@ disconnect, not a stop.
   on Windows). A new agent finds running keepers through their directories. Keepers are a few megabytes, so under
   memory pressure the kernel's OOM killer picks the build over its keeper.
 - **Run directory.** `runs/<n>/` in the host's state directory (see [Files](#files)) holds the exec request, the
-  checkout, the snapshot its sync checked out, the initiator identity that started it, the start time, the output
+  checkout (none for a run in the base directory), the snapshot its sync checked out (none for a run without a sync), the initiator identity that started it, the start time, the output
   log (`out`, plus `err` for runs without a terminal), and, once the command ends, its exit code. The snapshot is the
   one the run sent or a newer one a concurrent run had already applied; the agent logs it with the run's number. It
   is diagnostic context only: another sync may change the checkout before the command starts, and the snapshot's
@@ -597,7 +618,7 @@ disconnect, not a stop.
   begins, input, resize, Ctrl-C, and the exit code. Any number of clients may attach; all see the output, input is
   interleaved, and the most recent to attach or resize sets the terminal size. `ovr logs` prints the log and
   follows it until the run ends, without input; Ctrl-C stops following and leaves the run alone.
-- **State.** `ovr ps` shows each run's host, number, checkout, command, age, and state: `running`, `exited CODE`,
+- **State.** `ovr ps` shows each run's host, number, checkout (`-` for none), command, age, and state: `running`, `exited CODE`,
   or `lost`. A run is lost when its keeper dies without recording an exit; the agent then kills the run's process
   group, and on Windows the Job Object has already ended it.
 - **Upgrades.** Run directories are plain files, so `ps` and `logs` work across `ovrd` versions. Attaching needs a
@@ -633,7 +654,7 @@ caches such as sccache or bazel-remote are a per-host concern and work unchanged
   admitted by a provider token for this initiator's audience that a trust rule matches. Anyone who can run a trusted
   workflow can make a host appear, but a host only receives work: a trusted host is named `OWNER/REPO/WORKFLOW/RUN/JOB`,
   never a paired host's name, and runs nothing until you send it something.
-- Dial-in agents run as a normal user, inside their checkouts directory only.
+- Dial-in agents run as a normal user. Commands run in a checkout or in the host user's base directory.
 - No environment is forwarded, so local tokens and keys cannot leak into the remote process.
 - `.gitignore`d files never leave the initiator, and neither does Git history: hosts hold only snapshots.
 - Commands travel as argument vectors and the SSH agent binary is uploaded over SFTP, so there is no shell
