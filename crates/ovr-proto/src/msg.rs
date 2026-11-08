@@ -212,6 +212,9 @@ pub struct HostStatus {
     pub name: String,
     /// Present while the host is connected.
     pub platform: Option<Platform>,
+    /// What a trusted host serves, such as its workflow run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
 }
 
 /// A tunnel provider, whose CLI `ovrd` runs to reach the initiator from networks that cannot.

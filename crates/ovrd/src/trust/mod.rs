@@ -230,7 +230,7 @@ impl Trust {
     }
 
     /// Checks `token` from `provider` for the initiator with `fingerprint` against the rules, and returns the
-    /// workload's name, which names the host.
+    /// workload's name, which names the host, and what tells which run of it the host serves.
     ///
     /// # Errors
     ///
@@ -240,7 +240,7 @@ impl Trust {
         provider: &str,
         token: &str,
         fingerprint: &str,
-    ) -> Result<String, String> {
+    ) -> Result<(String, String), String> {
         match provider.parse()? {
             Provider::Github => {
                 let claims = self.github.verify(token, &audience(fingerprint)).await?;
@@ -256,7 +256,9 @@ impl Trust {
                 })
                 .map_err(|err| format!("cannot read the trust rules: {err}"))?;
                 match admission {
-                    github::Admission::Yes | github::Admission::Pinned => Ok(claims.repository),
+                    github::Admission::Yes | github::Admission::Pinned => {
+                        Ok((claims.repository.clone(), claims.about()))
+                    }
                     github::Admission::Replaced => Err(format!(
                         "{} is not the account or repository that was trusted, which has been renamed or deleted",
                         claims.repository

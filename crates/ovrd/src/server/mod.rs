@@ -250,17 +250,11 @@ impl Server {
     fn hosts(&self) -> io::Result<Response> {
         let mut hosts: Vec<HostStatus> = state::hosts(&self.dir)?
             .into_iter()
-            .map(|host| HostStatus {
-                platform: self.dialed.platform(&host.name),
-                name: host.name,
-            })
+            .map(|host| self.dialed.status(host.name))
             .collect();
         for name in self.dialed.names() {
             if !hosts.iter().any(|host| host.name == name) {
-                hosts.push(HostStatus {
-                    platform: self.dialed.platform(&name),
-                    name,
-                });
+                hosts.push(self.dialed.status(name));
             }
         }
         Ok(Response::Hosts { hosts })
@@ -350,6 +344,7 @@ struct Dialed {
     fingerprint: String,
     mux: Mux,
     platform: Platform,
+    about: Option<String>,
     /// When the connection was removed; the name stays reserved for the host until [`RESERVE`] has passed.
     released: Option<Instant>,
 }
@@ -373,13 +368,21 @@ fn is_federated(host: &str) -> bool {
 
 impl Registry {
     /// Registers a connection, replacing any earlier one from the same host. Returns an id for [`Registry::remove`].
-    fn insert(&self, name: &str, fingerprint: &str, mux: Mux, platform: Platform) -> u64 {
+    fn insert(
+        &self,
+        name: &str,
+        fingerprint: &str,
+        mux: Mux,
+        platform: Platform,
+        about: Option<String>,
+    ) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let dialed = Dialed {
             id,
             fingerprint: fingerprint.to_owned(),
             mux,
             platform,
+            about,
             released: None,
         };
         let previous = self
@@ -443,12 +446,15 @@ impl Registry {
         names
     }
 
-    fn platform(&self, name: &str) -> Option<Platform> {
+    /// How the host `name` is: connected, with its platform and what it serves, or not.
+    fn status(&self, name: String) -> HostStatus {
         let hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
-        hosts
-            .get(name)
-            .filter(|dialed| dialed.live())
-            .map(|dialed| dialed.platform.clone())
+        let live = hosts.get(&name).filter(|dialed| dialed.live());
+        HostStatus {
+            platform: live.map(|dialed| dialed.platform.clone()),
+            about: live.and_then(|dialed| dialed.about.clone()),
+            name,
+        }
     }
 
     async fn wait_for(&self, name: &str, timeout: Duration) -> Option<Mux> {

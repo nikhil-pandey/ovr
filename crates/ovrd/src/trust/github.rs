@@ -124,13 +124,38 @@ pub enum Admission {
     Pinned,
 }
 
-/// The claims of a GitHub Actions token that trust rules look at. IDs are strings in GitHub's tokens.
+/// The claims of a GitHub Actions token that trust rules look at, and those that tell which run it is from. IDs are
+/// strings in GitHub's tokens.
 #[derive(Debug, Deserialize)]
 pub struct Claims {
     pub repository: String,
     pub repository_id: String,
     pub repository_owner: String,
     pub repository_owner_id: String,
+    #[serde(default)]
+    pub workflow: String,
+    #[serde(default, rename = "ref")]
+    pub git_ref: String,
+    #[serde(default)]
+    pub run_id: String,
+}
+
+impl Claims {
+    /// The workflow, the branch or other ref, and a link to the run, as in
+    /// `CI on main, https://github.com/OWNER/REPO/actions/runs/ID`. The workflow's name is the repository's to choose,
+    /// so control characters are dropped before it reaches a terminal.
+    #[must_use]
+    pub fn about(&self) -> String {
+        let git_ref = self
+            .git_ref
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&self.git_ref);
+        let about = format!(
+            "{} on {git_ref}, https://github.com/{}/actions/runs/{}",
+            self.workflow, self.repository, self.run_id
+        );
+        about.chars().filter(|c| !c.is_control()).collect()
+    }
 }
 
 /// Checks tokens against GitHub's signing keys, fetched when a token names one not seen yet.

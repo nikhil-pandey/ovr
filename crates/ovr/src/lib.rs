@@ -493,12 +493,15 @@ async fn hosts() -> Result<i32, Error> {
     }
     let width = hosts.iter().map(|host| host.name.len()).max().unwrap_or(0);
     for host in hosts {
-        match host.platform {
-            Some(platform) => println!(
-                "{:width$}  online   {}/{}",
-                host.name, platform.os, platform.arch
+        match (host.platform, host.about) {
+            (Some(platform), about) => println!(
+                "{:width$}  online   {}/{}{}",
+                host.name,
+                platform.os,
+                platform.arch,
+                about.map(|about| format!("  {about}")).unwrap_or_default()
             ),
-            None => println!("{:width$}  offline", host.name),
+            (None, _) => println!("{:width$}  offline", host.name),
         }
     }
     Ok(0)

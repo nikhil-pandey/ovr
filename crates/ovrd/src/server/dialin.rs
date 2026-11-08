@@ -170,9 +170,13 @@ where
     stream.send(Frame::empty(FrameKind::Accept)).await?;
 
     let mux = Mux::open_with_heartbeat(frame::resume(stream));
-    let id = server
-        .dialed
-        .insert(&paired.name, fingerprint, mux.clone(), banner.platform);
+    let id = server.dialed.insert(
+        &paired.name,
+        fingerprint,
+        mux.clone(),
+        banner.platform,
+        None,
+    );
     tracing::info!(
         name = paired.name,
         version = banner.version,
@@ -205,15 +209,15 @@ where
                 &server.identity.fingerprint,
             )
             .await
-            .and_then(|workload| federated_name(&workload, &request.label))
+            .and_then(|(workload, about)| Ok((federated_name(&workload, &request.label)?, about)))
     } else {
         Err(format!(
             "ovrd {} on this host is incompatible with the initiator; install the initiator's version",
             request.banner.version
         ))
     };
-    let base = match admitted {
-        Ok(base) => base,
+    let (base, about) = match admitted {
+        Ok(admitted) => admitted,
         Err(message) => {
             let failure = Failure {
                 message: message.clone(),
@@ -234,9 +238,13 @@ where
         )?)
         .await?;
     let mux = Mux::open_with_heartbeat(frame::resume(stream));
-    let id = server
-        .dialed
-        .insert(&name, fingerprint, mux.clone(), request.banner.platform);
+    let id = server.dialed.insert(
+        &name,
+        fingerprint,
+        mux.clone(),
+        request.banner.platform,
+        Some(about),
+    );
     drop(admitting);
     tracing::info!(
         name,

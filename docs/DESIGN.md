@@ -79,7 +79,7 @@ identical above the transport layer.
 
 ```
 ovr [-d] HOST [-- CMD...]   run CMD on HOST (no CMD: login shell in the synced checkout); -d: in the background
-ovr hosts                   list dialed-in hosts and their OS/arch
+ovr hosts                   list dialed-in hosts, their OS/arch, and a trusted host's run
 ovr ps [HOST]               list runs: running, and finished in the last 7 days
 ovr attach HOST RUN         reconnect a terminal to a run, as if it had been started here
 ovr logs HOST RUN           print a run's output, following it until the run ends
@@ -291,7 +291,8 @@ jobs:
   under the same identity gets its name back. The jobs of a matrix share an ID, so that numbering follows the order
   they connect; `ovrd connect ADDR github:FP --name NAME` names a host `OWNER/REPO/JOB/NAME` instead, as in
   `nikhil-pandey/ovr/build/windows`. The name contains `/`, so it can never be a paired host's or an SSH
-  destination's, and `ovr hosts` lists it only while it is connected.
+  destination's, and `ovr hosts` lists it only while it is connected, with its workflow, branch, and run from the
+  verified token, as in `CI on main, https://github.com/nikhil-pandey/ovr/actions/runs/ID`.
 - **In the background.** Without `--foreground`, `ovrd connect ADDR github:FP` starts itself again in the
   background, logging to `connect-github.log` in the log directory, and returns at once. It retries with the usual
   backoff for as long as the job runs; the runner ends it with the job. A missing `id-token: write` permission is
