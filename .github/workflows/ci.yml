@@ -1,18 +1,19 @@
 name: CI
 
-# Pull requests run the full checks. Pushes to main only refresh the caches pull requests restore from: Bazel runs
-# its tests too, because it caches test results; Cargo only compiles.
+# Pull requests run the full checks. A nightly run on main only refreshes the caches pull requests restore from:
+# Bazel runs its tests too, because it caches test results; Cargo only compiles. Merges run nothing here, so they never
+# queue behind each other or crowd out pull requests and releases.
 on:
-  push:
-    branches: [main]
   pull_request:
+  schedule:
+    - cron: "37 2 * * *"
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,7 +47,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - if: github.event_name == 'pull_request'
         run: cargo test --workspace --locked
-      - if: github.event_name == 'push'
+      - if: github.event_name == 'schedule'
         run: |
           cargo clippy --workspace --all-targets --locked
           cargo test --workspace --locked --no-run
