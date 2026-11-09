@@ -3,9 +3,10 @@ name: E2E
 # Checks that syncs and exit codes reach hosts on Linux, macOS, and Windows through a Cloudflare quick tunnel, both
 # paired hosts and trusted ones that connect with the job's OIDC token, as the action does; see tunnel.yml. Pull
 # requests from forks get no OIDC token, so they check paired hosts only. The nightly bench runs the same jobs on main,
-# which refreshes the caches pull requests restore from.
+# which refreshes the caches pull requests restore from. Pull requests that only change Markdown skip it.
 on:
   pull_request:
+    paths-ignore: ["**/*.md", LICENSE]
   workflow_dispatch:
 
 permissions:
