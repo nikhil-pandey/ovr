@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/nikhil-pandey/ovr/compare/v0.2.4...v0.2.5) - 2026-11-09
+
+### Added
+
+- copy files back from hosts with ovr get
+- run without syncing with -n, and outside a repository ([#15](https://github.com/nikhil-pandey/ovr/pull/15))
+
 ## [0.2.4](https://github.com/nikhil-pandey/ovr/compare/v0.2.3...v0.2.4) - 2026-11-08
 
 ### Added
