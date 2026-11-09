@@ -21,6 +21,7 @@ crossterm = "0.29.0"
 directories = "6.0.0"
 futures = "0.3.34"
 gethostname = "1.1.0"
+globset = { version = "0.4.21", default-features = false }
 libc = "0.2.191"
 miette = "7.6.0"
 nix = "0.31.3"
@@ -42,6 +43,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false }
 ureq = { version = "3.5.1", default-features = false }
 windows-sys = "0.61.2"
 yamux = "0.14.1"
+zstd = { version = "0.14.3", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -132,10 +132,81 @@ pub struct Resize {
     pub rows: u16,
 }
 
-/// `CONSUMED`: how much input, in total, the command has consumed or the agent has discarded, so the client may send more.
+/// `CONSUMED`: how much input, in total, the command has consumed or the agent has discarded, so the client may send
+/// more; or, from a client fetching files, how many `DATA` bytes in total it has written, so the agent may send more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Consumed {
     pub bytes: u64,
+}
+
+/// `GET`: first frame of a stream that copies files and trees from the host. `HAVE` frames follow at once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Get {
+    /// The initiator fetching, whose checkout relative sources are read from.
+    pub initiator: String,
+    /// This repository's checkout, `<repo>-<key>`, named as for [`Hello`]; `None` outside a repository.
+    pub checkout: Option<String>,
+    /// Directory relative to the checkout root, `/`-separated, that relative sources start from.
+    pub cwd: String,
+    /// The sources as given on the command line: host paths or globs.
+    pub sources: Vec<String>,
+}
+
+/// One file the client already has, in a `HAVE` frame: a JSON list of these, under the frame limit. An empty list
+/// ends the manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Have {
+    /// Index of the source in [`Get::sources`].
+    pub source: u32,
+    /// As in [`Entry::path`].
+    pub path: String,
+    pub size: u64,
+    pub mtime_ns: i64,
+}
+
+/// `ENTRY`: the next file, directory, or symlink of a source. A file's content follows as `DATA` frames, then an
+/// empty `DATA` frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entry {
+    /// Index of the source in [`Get::sources`].
+    pub source: u32,
+    /// `/`-separated and relative to the source itself, or to a glob's literal prefix; empty for the source itself.
+    pub path: String,
+    #[serde(flatten)]
+    pub kind: EntryKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EntryKind {
+    File {
+        size: u64,
+        /// Modification time in nanoseconds since the Unix epoch, which the client stamps on its copy.
+        mtime_ns: i64,
+        exec: bool,
+    },
+    Dir,
+    Symlink {
+        target: String,
+    },
+}
+
+/// `NOTE`: something of a source the host did not send. A note during a file means the file could not be read to
+/// the end: the client discards it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Note {
+    /// Index of the source in [`Get::sources`].
+    pub source: u32,
+    pub message: String,
+    /// It could not be read, as opposed to being skipped on purpose; the fetch then exits `1`.
+    pub failed: bool,
+}
+
+/// `DONE`: the last frame of a fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Done {
+    /// Files not sent because the client's copy has the same size and modification time.
+    pub unchanged: u64,
 }
 
 /// `EXIT`: the command finished; always the last frame of a successful run.

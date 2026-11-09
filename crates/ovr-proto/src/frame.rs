@@ -33,6 +33,8 @@ pub enum FrameKind {
     Runs = 9,
     Clean = 10,
     Enter = 11,
+    Get = 12,
+    Have = 13,
 
     // Agent to client.
     Welcome = 16,
@@ -45,6 +47,10 @@ pub enum FrameKind {
     Attached = 23,
     RunList = 24,
     Cleaned = 25,
+    Entry = 26,
+    Data = 27,
+    Note = 28,
+    Done = 29,
 
     // `ovr` to the local `ovrd`.
     Request = 32,
@@ -63,9 +69,9 @@ impl TryFrom<u8> for FrameKind {
 
     fn try_from(byte: u8) -> Result<Self, Error> {
         use FrameKind::{
-            Accept, Attach, Attached, Banner, Clean, Cleaned, Consumed, Enter, Err, Error as Fail,
-            Exec, Exit, Federated, Hello, In, Interrupt, Kill, Out, Pack, Pair, PairOk, Request,
-            Resize, Response, RunList, Runs, Synced, Welcome,
+            Accept, Attach, Attached, Banner, Clean, Cleaned, Consumed, Data, Done, Enter, Entry,
+            Err, Error as Fail, Exec, Exit, Federated, Get, Have, Hello, In, Interrupt, Kill, Note,
+            Out, Pack, Pair, PairOk, Request, Resize, Response, RunList, Runs, Synced, Welcome,
         };
         Ok(match byte {
             1 => Hello,
@@ -79,6 +85,8 @@ impl TryFrom<u8> for FrameKind {
             9 => Runs,
             10 => Clean,
             11 => Enter,
+            12 => Get,
+            13 => Have,
             16 => Welcome,
             17 => Synced,
             18 => Out,
@@ -89,6 +97,10 @@ impl TryFrom<u8> for FrameKind {
             23 => Attached,
             24 => RunList,
             25 => Cleaned,
+            26 => Entry,
+            27 => Data,
+            28 => Note,
+            29 => Done,
             32 => Request,
             33 => Response,
             48 => Banner,

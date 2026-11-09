@@ -218,6 +218,17 @@ impl Checkout {
     ///
     /// Returns an error when `prefix` escapes the checkout.
     pub fn cwd(&self, prefix: &str) -> Result<Option<PathBuf>, Error> {
+        let cwd = self.path(prefix)?;
+        Ok(cwd.is_dir().then_some(cwd))
+    }
+
+    /// Where the client's working directory, given relative to the repository root, is in the checkout, whether it
+    /// exists or not.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `prefix` escapes the checkout.
+    pub fn path(&self, prefix: &str) -> Result<PathBuf, Error> {
         let parts: Vec<&str> = prefix.split('/').filter(|part| !part.is_empty()).collect();
         let valid = parts.iter().all(|part| {
             let mut components = Path::new(part).components();
@@ -231,10 +242,9 @@ impl Checkout {
                 "invalid working directory {prefix:?}"
             )));
         }
-        let cwd = parts
+        Ok(parts
             .iter()
-            .fold(self.dir.clone(), |dir, part| dir.join(part));
-        Ok(cwd.is_dir().then_some(cwd))
+            .fold(self.dir.clone(), |dir, part| dir.join(part)))
     }
 
     /// Repacks when Git thinks it is time, unless a sync or another collection is using the objects.

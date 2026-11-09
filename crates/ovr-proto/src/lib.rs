@@ -3,6 +3,7 @@
 //! A stream is a sequence of frames: `len:u32le` covering the rest, `kind:u8`, then the payload. Control frames
 //! carry JSON; data frames carry raw bytes.
 
+pub mod fetch;
 pub mod frame;
 pub mod git;
 pub mod ipc;
@@ -19,7 +20,7 @@ pub use frame::{Frame, FrameKind};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Agent protocol version. Dial-in hosts may run an older `ovrd`; they are accepted while this matches.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// FNV-1a: a stable, dependency-free hash for short names derived from paths. Not for anything secret.
 #[must_use]

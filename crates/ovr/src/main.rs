@@ -6,15 +6,24 @@ fn main() {
         Ok(cli) => cli,
         Err(mut err) => {
             let code = if err.use_stderr() { ovr::FAILURE } else { 0 };
-            let subcommand = std::env::args()
-                .nth(1)
+            let first = std::env::args().nth(1);
+            let subcommand = first
+                .as_deref()
                 .is_some_and(|arg| ovr::Cli::command().find_subcommand(arg).is_some());
-            if err.kind() == ErrorKind::UnknownArgument && !subcommand {
+            let suggestion = match err.kind() {
+                ErrorKind::UnknownArgument if !subcommand => {
+                    Some("put `--` before the remote command: `ovr HOST -- CMD...`")
+                }
+                ErrorKind::MissingRequiredArgument if first.as_deref() == Some("get") => Some(
+                    "the last path is where files go on this machine: `ovr get HOST SRC... DEST`, \
+                     as in `ovr get box target/x.log .`",
+                ),
+                _ => None,
+            };
+            if let Some(suggestion) = suggestion {
                 err.insert(
                     ContextKind::Suggested,
-                    ContextValue::StyledStrs(vec![
-                        "put `--` before the remote command: `ovr HOST -- CMD...`".into(),
-                    ]),
+                    ContextValue::StyledStrs(vec![suggestion.into()]),
                 );
             }
             let _ = err.print();
