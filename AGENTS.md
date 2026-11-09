@@ -60,6 +60,9 @@ Across runners, `.github/workflows/tunnel.yml` (driven by `.github/e2e/e2e.py`) 
 dial an initiator through a quick tunnel, either paired or as trusted jobs with an OIDC token. `e2e.yml` checks
 syncs to both kinds on every pull request; `bench.yml` times real repositories on paired hosts nightly or on dispatch.
 
+Checks gate pull requests only. A merge to `main` runs just the release workflow; nightly runs of `ci.yml` and
+`bench.yml` on `main` refresh the caches pull requests restore from, since GitHub shares no other branch's caches.
+
 ## Release
 
 Use [Conventional Commits](https://www.conventionalcommits.org); release-plz turns them into a release PR that bumps

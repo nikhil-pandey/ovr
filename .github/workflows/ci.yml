@@ -1,18 +1,20 @@
 name: CI
 
-# Pull requests run the full checks. Pushes to main only refresh the caches pull requests restore from: Bazel runs
-# its tests too, because it caches test results; Cargo only compiles.
+# Pull requests run the full checks, unless they only change Markdown. A nightly run on main only refreshes the caches
+# pull requests restore from: Bazel runs its tests too, because it caches test results; Cargo only compiles. Merges run
+# nothing here, so they never queue behind each other or crowd out pull requests and releases.
 on:
-  push:
-    branches: [main]
   pull_request:
+    paths-ignore: ["**/*.md", LICENSE]
+  schedule:
+    - cron: "37 2 * * *"
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,7 +26,7 @@ env:
   GORELEASER_VERSION: v2.20.0
 
 # GitHub scopes caches saved by a pull request to that pull request, so only main's caches are shared, and a branch
-# cannot poison them.
+# cannot poison them. Pull requests only restore, so their copies do not push main's out of the repository's quota.
 jobs:
   # Every platform a release ships for, tested natively.
   cargo:
@@ -40,13 +42,14 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - if: github.event_name == 'pull_request' && matrix.os == 'ubuntu-26.04'
         run: cargo fmt --all --check
       - if: github.event_name == 'pull_request'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - if: github.event_name == 'pull_request'
         run: cargo test --workspace --locked
-      - if: github.event_name == 'push'
+      - if: github.event_name == 'schedule'
         run: |
           cargo clippy --workspace --all-targets --locked
           cargo test --workspace --locked --no-run
@@ -69,6 +72,7 @@ jobs:
         with:
           shared-key: zigbuild
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           version: ${{ env.GORELEASER_VERSION }}
@@ -133,13 +137,9 @@ jobs:
           "$PWD\bin" >> $env:GITHUB_PATH
       - run: ovr --version && ovrd --version
 
+  # Checks the Bazel build on one OS; the cargo jobs cover every platform, and macOS runners are scarce.
   bazel:
-    name: bazel (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-26.04, macos-26]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1

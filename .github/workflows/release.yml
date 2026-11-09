@@ -88,11 +88,11 @@ jobs:
       - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
         with:
           tool: cargo-zigbuild@${{ env.CARGO_ZIGBUILD_VERSION }}
-      # Restores the cache CI saved on main; a release never writes it.
+      # Shares the cache CI's nightly dist job keeps on main, so a release after a dependency change warms it for
+      # pull requests too.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: zigbuild
-          save-if: false
       - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           version: ${{ env.GORELEASER_VERSION }}
