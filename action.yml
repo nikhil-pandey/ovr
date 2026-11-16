@@ -62,7 +62,7 @@ runs:
             Linux-ARM64) target=aarch64-unknown-linux-musl ext=tar.gz ;;
             macOS-X64) target=x86_64-apple-darwin ext=tar.gz ;;
             macOS-ARM64) target=aarch64-apple-darwin ext=tar.gz ;;
-            Windows-X64) target=x86_64-pc-windows-gnu ext=zip ;;
+            Windows-X64) target=x86_64-pc-windows-gnullvm ext=zip ;;
             Windows-ARM64) target=aarch64-pc-windows-gnullvm ext=zip ;;
             *) warn "no ovr build for $RUNNER_OS on $RUNNER_ARCH" ;;
           esac

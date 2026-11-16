@@ -1,4 +1,17 @@
 exports_files([
     "Cargo.lock",
     "Cargo.toml",
+    "LICENSE",
+    "install.ps1",
+    "install.sh",
 ])
+
+# Cargo.toml owns the version, dependencies, and lint levels for both build systems. The workspace version reaches
+# rustc as CARGO_PKG_VERSION, as Cargo sets it.
+genrule(
+    name = "cargo_env",
+    srcs = ["Cargo.toml"],
+    outs = ["cargo.env"],
+    cmd = "sed -n '1,/^version = /s/^version = \"\\(.*\\)\"$$/CARGO_PKG_VERSION=\\1/p' $< > $@",
+    visibility = ["//visibility:public"],
+)

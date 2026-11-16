@@ -12,13 +12,13 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "Rust toolchain for rules_rust and the crate MSRV; rust-toolchain.toml is handled natively",
+      "description": "Rust toolchain for rules_rs and the crate MSRV; rust-toolchain.toml is handled natively",
       "managerFilePatterns": [
         "/^MODULE\\.bazel$/",
         "/^Cargo\\.toml$/"
       ],
       "matchStrings": [
-        "versions = \\[\"(?<currentValue>\\d+\\.\\d+\\.\\d+)\"\\]",
+        "toolchains\\.toolchain\\([^)]*\\bversion = \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\"",
         "rust-version = \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
       ],
       "depNameTemplate": "rust",

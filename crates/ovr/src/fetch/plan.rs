@@ -208,7 +208,7 @@ fn record(source: u32, path: String, meta: &Metadata) -> Have {
         source,
         path,
         size: meta.len(),
-        mtime_ns: meta.modified().map(rules::mtime_ns).unwrap_or_default(),
+        mtime_ns: meta.modified().map_or_default(rules::mtime_ns),
     }
 }
 

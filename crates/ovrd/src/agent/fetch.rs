@@ -489,7 +489,7 @@ fn unreadable(err: &io::Error, path: &Path) -> String {
 }
 
 fn modified(meta: &Metadata) -> i64 {
-    meta.modified().map(rules::mtime_ns).unwrap_or_default()
+    meta.modified().map_or_default(rules::mtime_ns)
 }
 
 #[cfg(unix)]
