@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6](https://github.com/nikhil-pandey/ovr/compare/v0.2.5...v0.2.6) - 2026-11-17
+
+### Other
+
+- move Bazel to rules_rs and ship releases from Bazel ([#19](https://github.com/nikhil-pandey/ovr/pull/19))
+
 ## [0.2.5](https://github.com/nikhil-pandey/ovr/compare/v0.2.4...v0.2.5) - 2026-11-09
 
 ### Added
