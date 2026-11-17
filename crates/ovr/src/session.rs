@@ -1157,8 +1157,7 @@ mod tests {
         assert_eq!((inside.code, inside.stdout.as_str()), (0, here.as_str()));
         let name = Repository::locate(repo.path())
             .await?
-            .map(|repository| repository.checkout("me"))
-            .unwrap_or_default();
+            .map_or_default(|repository| repository.checkout("me"));
         let warning = format!(
             "ovr: this host has no checkout of {name} yet; running in {}, not in src\n",
             base.display()

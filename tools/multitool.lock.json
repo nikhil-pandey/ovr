@@ -1,0 +1,39 @@
+{
+  "$schema": "https://raw.githubusercontent.com/bazel-contrib/rules_multitool/main/lockfile.schema.json",
+  "nfpm": {
+    "binaries": [
+      {
+        "kind": "archive",
+        "url": "https://github.com/goreleaser/nfpm/releases/download/v2.49.0/nfpm_2.49.0_Linux_x86_64.tar.gz",
+        "file": "nfpm",
+        "sha256": "2afaa5ffb5e3493402e31e7c67a5a1fb42133e3f66fc315ca0051934125561c7",
+        "os": "linux",
+        "cpu": "x86_64"
+      },
+      {
+        "kind": "archive",
+        "url": "https://github.com/goreleaser/nfpm/releases/download/v2.49.0/nfpm_2.49.0_Linux_arm64.tar.gz",
+        "file": "nfpm",
+        "sha256": "d4eee71839e92c68cbd3b101640bad32d2856fc551acae0635be9118e48c9d9c",
+        "os": "linux",
+        "cpu": "arm64"
+      },
+      {
+        "kind": "archive",
+        "url": "https://github.com/goreleaser/nfpm/releases/download/v2.49.0/nfpm_2.49.0_Darwin_x86_64.tar.gz",
+        "file": "nfpm",
+        "sha256": "182ba6c5ded85c87bf276dd80c0ecfd8a2f8b25f7db6ac5fb999557c5b4258ce",
+        "os": "macos",
+        "cpu": "x86_64"
+      },
+      {
+        "kind": "archive",
+        "url": "https://github.com/goreleaser/nfpm/releases/download/v2.49.0/nfpm_2.49.0_Darwin_arm64.tar.gz",
+        "file": "nfpm",
+        "sha256": "27728af45782962ab59a8ff13ae041c7d955fe51dd94ab7883d9c5966a233f5d",
+        "os": "macos",
+        "cpu": "arm64"
+      }
+    ]
+  }
+}

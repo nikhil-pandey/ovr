@@ -106,7 +106,7 @@ impl Run {
     ///
     /// Returns an error when the record cannot be written.
     pub fn started(&self, group: Option<u32>) -> io::Result<()> {
-        let group = group.map(|group| group.to_string()).unwrap_or_default();
+        let group = group.map_or_default(|group| group.to_string());
         write_private(&self.dir.join("pid"), group.as_bytes())
     }
 

@@ -1,27 +1,22 @@
-load("@crates//:defs.bzl", "aliases", "all_crate_deps")
-load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars")
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
-
-cargo_toml_env_vars(
-    name = "cargo_env",
-    src = "Cargo.toml",
-    workspace = "//:Cargo.toml",
-)
+load("@crates//ovr-proto:data.bzl", "all_crate_deps", "crate_data")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
 
 rust_library(
     name = "ovr-proto",
     srcs = glob(["src/**/*.rs"]),
-    aliases = aliases(),
-    proc_macro_deps = all_crate_deps(proc_macro = True),
-    rustc_env_files = [":cargo_env"],
+    lint_config = crate_data().get("lint_config"),
+    rustc_env_files = ["//:cargo_env"],
     visibility = ["//visibility:public"],
     deps = all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "test",
+    name = "ovr-proto-test",
     size = "small",
     crate = ":ovr-proto",
-    rustc_env_files = [":cargo_env"],
+    lint_config = crate_data().get("lint_config"),
+    rustc_env_files = ["//:cargo_env"],
+    visibility = ["//:__pkg__"],
     deps = all_crate_deps(normal_dev = True),
 )

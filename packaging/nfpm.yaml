@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://nfpm.goreleaser.com/static/schema.json
+# BUILD.bazel stages the binaries beside this file and substitutes the architecture; nfpm expands ${VERSION}.
+name: ovr
+version: ${VERSION}
+arch: ${ARCH}
+maintainer: Nikhil Pandey <nikhil-pandey@users.noreply.github.com>
+description: Run your builds over there.
+homepage: https://github.com/nikhil-pandey/ovr
+license: MIT
+contents:
+  - src: ovr
+    dst: /usr/bin/ovr
+    file_info:
+      mode: 0755
+  - src: ovrd
+    dst: /usr/bin/ovrd
+    file_info:
+      mode: 0755

@@ -1,6 +1,47 @@
+# Hermetic toolchains only: skip probing the machine for a C/C++ compiler or Xcode.
+common --repo_env=BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN=1
+common --repo_env=BAZEL_NO_APPLE_CPP_TOOLCHAIN=1
+
+# Reuse action outputs across checkouts, worktrees, and `bazel clean`, within a bounded size.
+common --disk_cache=~/.cache/bazel-disk-cache
+common --experimental_disk_cache_gc_max_size=20G
+common --nobuild_runfile_links
+
+# Share action outputs and test results through BuildBuddy's remote cache, and stream invocations to its results UI.
+# Without an API key, invocations are anonymous and publicly viewable; to use an organization, add
+# `common --remote_header=x-buildbuddy-api-key=<key>` to user.bazelrc (CI reads the BUILDBUDDY_API_KEY secret).
+build --bes_results_url=https://app.buildbuddy.io/invocation/
+build --bes_backend=grpcs://remote.buildbuddy.io
+common --remote_cache=grpcs://remote.buildbuddy.io
+common --remote_timeout=10m
+common --remote_cache_compression
+common --nolegacy_important_outputs
+
 common --enable_platform_specific_config
-build --incompatible_strict_action_env
-build -c opt
-test --test_output=errors
+common:windows --host_platform=//platforms:local_windows_msvc
+# cc-rs build scripts can't drive llvm-libtool-darwin.
+common --@rules_cc//cc/toolchains/args/archiver_flags:use_libtool_on_macos=False
+
+common --test_output=errors
+
+# `--config=lint` runs clippy (with Cargo.toml's lint levels) and rustfmt on every Rust target; `bazel test` always does.
+build:lint --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect,@rules_rust//rust:defs.bzl%rustfmt_aspect
+build:lint --output_groups=+clippy_checks,+rustfmt_checks
+test --config=lint
+common --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+
+# Release binaries: Cargo's release profile ([profile.release] in Cargo.toml).
+build:release --compilation_mode=opt
+build:release --@rules_rust//rust/settings:codegen_units=1
+build:release --@rules_rust//rust/settings:lto=thin
+build:release --@rules_rust//rust/settings:extra_rustc_flag=-Cstrip=symbols
+
+common:ci --color=yes
+common:ci --curses=no
+common:ci --keep_going
+common:ci --lockfile_mode=error
+common:ci --verbose_failures
+# CI runners are short-lived and share outputs through the remote cache instead.
+common:ci --disk_cache=
 
 try-import %workspace%/user.bazelrc

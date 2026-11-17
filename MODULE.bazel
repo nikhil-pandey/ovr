@@ -1,33 +1,57 @@
 module(name = "ovr")
 
-bazel_dep(name = "rules_rust", version = "0.75.0")
+bazel_dep(name = "bazel_lib", version = "3.8.0")
+bazel_dep(name = "llvm", version = "0.8.27")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_cc", version = "0.2.28")
+bazel_dep(name = "rules_multitool", version = "1.11.1")
+bazel_dep(name = "rules_pkg", version = "1.3.0")
+bazel_dep(name = "rules_rs", version = "0.2.4")
 
-rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
-rust.toolchain(
+# Hermetic Rust and C/C++ toolchains: every host builds every release target, and no action depends on a compiler
+# installed on the machine.
+toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
+toolchains.toolchain(
     edition = "2024",
-    versions = ["1.99.1"],
+    version = "1.100.0",
 )
-use_repo(rust, "rust_toolchains")
+use_repo(toolchains, "default_rust_toolchains")
 
-register_toolchains("@rust_toolchains//:all")
+register_toolchains(
+    "@default_rust_toolchains//...",
+    "@llvm//toolchain:all",
+)
 
-crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+# Lint and format aspects come from the rules_rust that rules_rs provides.
+rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
+use_repo(rules_rust, "rules_rust")
+
+# Dependencies, features, and lint levels come from the Cargo workspace and Cargo.lock.
+crate = use_extension("@rules_rs//rs:extensions.bzl", "crate")
 crate.from_cargo(
     name = "crates",
-    cargo_lockfile = "//:Cargo.lock",
-    manifests = [
-        "//:Cargo.toml",
-        "//crates/ovr:Cargo.toml",
-        "//crates/ovr-proto:Cargo.toml",
-        "//crates/ovrd:Cargo.toml",
-    ],
-    supported_platform_triples = [
+    cargo_lock = "//:Cargo.lock",
+    cargo_toml = "//:Cargo.toml",
+    generate_lint_config = True,
+    incompatible_no_root_alias_targets = True,
+    incompatible_no_root_crate_data = True,
+    # Linux, macOS, and Windows hosts, plus every release target.
+    platform_triples = [
         "aarch64-apple-darwin",
+        "aarch64-pc-windows-gnullvm",
         "aarch64-pc-windows-msvc",
         "aarch64-unknown-linux-gnu",
+        "aarch64-unknown-linux-musl",
         "x86_64-apple-darwin",
+        "x86_64-pc-windows-gnullvm",
         "x86_64-pc-windows-msvc",
         "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
     ],
 )
 use_repo(crate, "crates")
+
+# Prebuilt packaging tools (nfpm for deb and rpm), pinned by checksum.
+multitool = use_extension("@rules_multitool//multitool:extension.bzl", "multitool")
+multitool.hub(lockfile = "//tools:multitool.lock.json")
+use_repo(multitool, "multitool")

@@ -437,10 +437,7 @@ mod tests {
             matches!(&result, Err(Error::IndexLocked { .. })),
             "{result:?}"
         );
-        let message = result
-            .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
+        let message = result.err().map_or_default(|error| error.to_string());
         assert!(message.contains(&lock.display().to_string()), "{message}");
         assert_eq!(std::fs::read_to_string(&lock)?, "another writer");
         Ok(())

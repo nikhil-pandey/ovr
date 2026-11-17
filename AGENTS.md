@@ -31,9 +31,10 @@ source of truth for behaviour; read it before changing anything user-visible.
 
 - Clean, idiomatic Rust. Small modules, plain types, no clever abstractions before a second use exists.
 - Versions, lints, and dependency versions live in the root `Cargo.toml`; members use `workspace = true` and pick
-  features locally. Bazel reads the same manifests and `Cargo.lock` through `crate_universe`; never pin a crate in
-  Bazel files.
-- Cargo and Bazel both build everything. A new crate needs a `BUILD.bazel` modelled on an existing one.
+  features locally. Bazel reads the same manifests, `Cargo.lock`, and lint levels through rules_rs; never pin a crate
+  in Bazel files.
+- Cargo and Bazel both build everything, Bazel with hermetic Rust and LLVM toolchains. A new crate needs a
+  `BUILD.bazel` modelled on an existing one.
 - Errors are `thiserror` enums rendered with `miette`. No `unwrap`, `expect`, or `panic!` outside tests.
 - `main.rs` only parses arguments, renders errors, and picks the exit code. Behaviour lives in the library.
 - `ovr` exits with the remote command's code, or `125` for its own failures.
@@ -41,10 +42,10 @@ source of truth for behaviour; read it before changing anything user-visible.
 ## Validate
 
 ```sh
-cargo fmt --all --check
+bazel test //...            # every test, plus clippy (-D warnings) and rustfmt on every Rust target
+bazel run @rules_rust//:rustfmt  # format every Rust target
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-bazel test //...
 ```
 
 The client tests in `crates/ovr/src/session.rs` run a real `ovrd` agent in-process against temporary repositories
@@ -54,24 +55,31 @@ it builds `ovrd` itself, under Bazel it gets both binaries as data. Its ignored 
 `7420` through real Cloudflare quick tunnels and Dev Tunnels; after changing dial-in or tunnels, run
 `cargo test -p ovr --test e2e -- --ignored` with `cloudflared` installed and `devtunnel` logged in. They take a few
 minutes, mostly waiting for a new quick tunnel to resolve. Platform-specific code (Windows Job Objects,
-ConPTY, named pipes) is only compiled on its platform; CI checks every released OS.
+ConPTY, named pipes) is only compiled on its platform. CI cross-builds and lints every released OS and architecture
+with `bazel build --config=lint --platforms=@rules_rs//rs/platforms:<triple> //... //:rust-test-bundle`, and runs the
+bundled tests on that OS.
 
 Across runners, `.github/workflows/tunnel.yml` (driven by `.github/e2e/e2e.py`) has Linux, macOS, and Windows hosts
-dial an initiator through a quick tunnel, either paired or as trusted jobs with an OIDC token. `e2e.yml` checks
-syncs to both kinds on every pull request; `bench.yml` times real repositories on paired hosts nightly or on dispatch.
+dial an initiator through a quick tunnel, either paired or as trusted jobs with an OIDC token; every runner installs
+the Bazel release build. `e2e.yml` checks syncs to both kinds on every pull request; `bench.yml` times real
+repositories on paired hosts nightly or on dispatch.
 
-Checks gate pull requests only. A merge to `main` runs just the release workflow; nightly runs of `ci.yml` and
-`bench.yml` on `main` refresh the caches pull requests restore from, since GitHub shares no other branch's caches.
+Checks gate pull requests only. A merge to `main` runs just the release workflow; a weekly run of `ci.yml` on `main`
+refreshes the download caches pull requests restore from, since GitHub shares no other branch's caches.
+Bazel shares action outputs and test results through BuildBuddy (`.bazelrc`); CI authenticates with the
+`BUILDBUDDY_API_KEY` secret, and local builds anonymously unless `user.bazelrc` sets an API key header.
 
 ## Release
 
 Use [Conventional Commits](https://www.conventionalcommits.org); release-plz turns them into a release PR that bumps
-the version and `CHANGELOG.md`. Merging that PR tags `v<version>`, and GoReleaser (`.goreleaser.yaml`) cross-compiles
-every target with cargo-zigbuild and publishes archives, `.deb`/`.rpm` packages, and the install scripts. CI runs the
-same build as a snapshot and installs each artifact on its OS. Never bump versions by hand. The install scripts
-always fetch the latest release; keep them free of fallbacks and options.
+the version and `CHANGELOG.md`. Merging that PR tags `v<version>`, and the release workflow publishes
+`bazel build --config=release //packaging:dist`: every target cross-built from Linux, as archives and `.deb`/`.rpm`
+packages, with the install scripts and `SHA256SUMS`. CI runs the same build and installs each artifact on its OS.
+Never bump versions by hand. The install scripts always fetch the latest release; keep them free of fallbacks and
+options.
 
 ## Dependencies
 
-Renovate (`renovate.json`) updates every pinned version: crates, Bazel, `rules_rust`, the Rust toolchain, and
-GitHub Actions. Do not pin versions anywhere it cannot see.
+Renovate (`renovate.json`) updates every pinned version: crates, Bazel and its modules, the Rust toolchain, and
+GitHub Actions. `tools/multitool.lock.json` pins nfpm; update its URLs and checksums together. Do not pin versions
+anywhere else it cannot see.

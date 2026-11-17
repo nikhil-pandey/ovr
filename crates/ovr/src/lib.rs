@@ -600,7 +600,7 @@ async fn hosts() -> Result<i32, Error> {
                 host.name,
                 platform.os,
                 platform.arch,
-                about.map(|about| format!("  {about}")).unwrap_or_default()
+                about.map_or_default(|about| format!("  {about}"))
             ),
             (None, _) => println!("{:width$}  offline", host.name),
         }

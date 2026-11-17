@@ -1,7 +1,8 @@
 name: Release
 
 # release-plz keeps a release PR open with the next version and changelog. Merging it tags `v<version>`, and
-# GoReleaser publishes the binaries, packages, and install scripts to that tag's GitHub release.
+# Bazel cross-builds the binaries and packages, which are published with the install scripts to that tag's GitHub
+# release.
 on:
   push:
     branches: [main]
@@ -16,12 +17,6 @@ env:
   CARGO_TERM_COLOR: always
   # renovate: datasource=github-releases depName=release-plz/release-plz extractVersion=^release-plz-v(?<version>.*)$
   RELEASE_PLZ_VERSION: 0.4.3
-  # renovate: datasource=pypi depName=ziglang
-  ZIG_VERSION: 0.17.1
-  # renovate: datasource=crate depName=cargo-zigbuild
-  CARGO_ZIGBUILD_VERSION: 0.24.1
-  # renovate: datasource=github-releases depName=goreleaser/goreleaser
-  GORELEASER_VERSION: v2.20.0
 
 jobs:
   pr:
@@ -80,22 +75,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.tag.outputs.tag }}
-          fetch-depth: 0
-      - run: rustup toolchain install
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+      # Shares the cache CI's nightly dist job keeps on main.
+      - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
         with:
-          version: ${{ env.ZIG_VERSION }}
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2.90.2
-        with:
-          tool: cargo-zigbuild@${{ env.CARGO_ZIGBUILD_VERSION }}
-      # Shares the cache CI's nightly dist job keeps on main, so a release after a dependency change warms it for
-      # pull requests too.
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: zigbuild
-      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
-        with:
-          version: ${{ env.GORELEASER_VERSION }}
-          args: release --clean
+          bazelisk-cache: true
+          external-cache: true
+          repository-cache: true
+          # Action outputs go through BuildBuddy (.bazelrc). Without an API key, pull requests only read from it.
+          bazelrc: |
+            ${{ secrets.BUILDBUDDY_API_KEY && format('common --remote_header=x-buildbuddy-api-key={0}', secrets.BUILDBUDDY_API_KEY) || '' }}
+            ${{ !secrets.BUILDBUDDY_API_KEY && github.event_name == 'pull_request' && 'common --noremote_upload_local_results' || '' }}
+      - run: bazel build --config=ci --config=release //packaging:dist
+      - run: gh release create "$TAG" bazel-bin/packaging/dist/* --verify-tag --generate-notes --title "$TAG"
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.tag.outputs.tag }}

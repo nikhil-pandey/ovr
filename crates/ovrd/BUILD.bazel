@@ -1,12 +1,10 @@
-load("@crates//:defs.bzl", "aliases", "all_crate_deps")
-load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars")
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("@crates//ovrd:data.bzl", "all_crate_deps", "crate_data")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
 
-cargo_toml_env_vars(
-    name = "cargo_env",
-    src = "Cargo.toml",
-    workspace = "//:Cargo.toml",
-)
+# The binary owns the package's default label, so first-party dependencies are listed by label.
+LINT_CONFIG = crate_data().get("lint_config")
 
 rust_library(
     name = "lib",
@@ -14,30 +12,40 @@ rust_library(
         ["src/**/*.rs"],
         exclude = ["src/main.rs"],
     ),
-    aliases = aliases(),
     crate_name = "ovrd",
-    proc_macro_deps = all_crate_deps(proc_macro = True),
-    rustc_env_files = [":cargo_env"],
+    lint_config = LINT_CONFIG,
+    rustc_env_files = ["//:cargo_env"],
     visibility = ["//crates/ovr:__pkg__"],
-    deps = all_crate_deps(normal = True) + ["//crates/ovr-proto"],
+    deps = all_crate_deps(
+        cargo_only = True,
+        normal = True,
+    ) + ["//crates/ovr-proto"],
 )
 
 rust_binary(
     name = "ovrd",
     srcs = ["src/main.rs"],
-    aliases = aliases(),
-    rustc_env_files = [":cargo_env"],
+    lint_config = LINT_CONFIG,
+    rustc_env_files = ["//:cargo_env"],
     visibility = ["//visibility:public"],
-    deps = all_crate_deps(normal = True) + [
+    deps = all_crate_deps(
+        cargo_only = True,
+        normal = True,
+    ) + [
         ":lib",
         "//crates/ovr-proto",
     ],
 )
 
 rust_test(
-    name = "test",
+    name = "ovrd-test",
     size = "small",
     crate = ":lib",
-    rustc_env_files = [":cargo_env"],
-    deps = all_crate_deps(normal_dev = True),
+    lint_config = LINT_CONFIG,
+    rustc_env_files = ["//:cargo_env"],
+    visibility = ["//:__pkg__"],
+    deps = all_crate_deps(
+        cargo_only = True,
+        normal_dev = True,
+    ),
 )

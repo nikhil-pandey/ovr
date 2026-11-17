@@ -54,7 +54,7 @@ pub async fn get(host: String, sources: Vec<String>, dest: String) -> Result<i32
     let (stream, initiator) = opened?;
     let request = Get {
         checkout: repository.as_ref().map(|repo| repo.checkout(&initiator)),
-        cwd: repository.map(|repo| repo.prefix).unwrap_or_default(),
+        cwd: repository.map_or_default(|repo| repo.prefix),
         initiator,
         sources,
     };
