@@ -1,9 +1,15 @@
 name: Release
 
-# release-plz keeps a release PR open with the next version and changelog. Merging it tags `v<version>`, and
-# Bazel cross-builds the binaries and packages, which are published with the install scripts to that tag's GitHub
-# release.
+# release-plz keeps a release PR open with the next version and changelog. Merging it tags `v<version>`, and the
+# shared dist workflow publishes the Bazel-built binaries, packages, and install scripts to that tag's GitHub release.
+# Dispatching it with a `tag` publishes that existing tag again, for example after a failed publish.
 on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to publish; leave empty to prepare a release
+        type: string
+        default: ''
   push:
     branches: [main]
 
@@ -20,7 +26,7 @@ env:
 
 jobs:
   pr:
-    if: github.repository_owner == 'nikhil-pandey'
+    if: github.repository_owner == 'nikhil-pandey' && !inputs.tag
     runs-on: ubuntu-26.04
     permissions:
       contents: write
@@ -39,7 +45,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   tag:
-    if: github.repository_owner == 'nikhil-pandey'
+    if: github.repository_owner == 'nikhil-pandey' && !inputs.tag
     runs-on: ubuntu-26.04
     permissions:
       contents: write
@@ -67,25 +73,14 @@ jobs:
 
   publish:
     needs: tag
-    if: needs.tag.outputs.tag != ''
-    runs-on: ubuntu-26.04
+    if: >-
+      !cancelled() && github.repository_owner == 'nikhil-pandey' &&
+      (needs.tag.outputs.tag != '' || inputs.tag != '')
     permissions:
       contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.tag.outputs.tag }}
-      - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
-        with:
-          bazelisk-cache: true
-          external-cache: true
-          repository-cache: true
-          # Action outputs go through BuildBuddy (.bazelrc). Without an API key, pull requests only read from it.
-          bazelrc: |
-            ${{ secrets.BUILDBUDDY_API_KEY && format('common --remote_header=x-buildbuddy-api-key={0}', secrets.BUILDBUDDY_API_KEY) || '' }}
-            ${{ !secrets.BUILDBUDDY_API_KEY && github.event_name == 'pull_request' && 'common --noremote_upload_local_results' || '' }}
-      - run: bazel build --config=ci --config=release //packaging:dist
-      - run: gh release create "$TAG" bazel-bin/packaging/dist/* --verify-tag --generate-notes --title "$TAG"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.tag.outputs.tag }}
+    uses: ./.github/workflows/dist.yml
+    secrets:
+      BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+    with:
+      ref: ${{ inputs.tag || needs.tag.outputs.tag }}
+      publish: true

@@ -1,0 +1,53 @@
+name: Build distribution
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: ''
+      publish:
+        type: boolean
+        default: false
+    secrets:
+      BUILDBUDDY_API_KEY:
+        description: Authenticates the build to the BuildBuddy remote cache
+        required: false
+
+# Shared by CI and releases: Bazel cross-builds every target from one Linux runner with its hermetic Rust and LLVM
+# toolchains, then packages the archives, Linux packages, install scripts, and checksums (//packaging:dist).
+jobs:
+  dist:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: bazel-contrib/setup-bazel@f34d6a05eae3c24acab7fa54587492daeaeffdab # 0.19.2
+        with:
+          bazelisk-cache: true
+          external-cache: true
+          repository-cache: true
+          cache-save: ${{ github.event_name != 'pull_request' }}
+          # Action outputs go through BuildBuddy (.bazelrc). Without an API key, pull requests only read from it.
+          bazelrc: |
+            ${{ secrets.BUILDBUDDY_API_KEY && format('common --remote_header=x-buildbuddy-api-key={0}', secrets.BUILDBUDDY_API_KEY) || '' }}
+            ${{ !secrets.BUILDBUDDY_API_KEY && github.event_name == 'pull_request' && 'common --noremote_upload_local_results' || '' }}
+      - run: bazel build --config=ci --config=release //packaging:dist
+      - run: |
+          mkdir dist
+          cp bazel-bin/packaging/dist/* dist/
+          ls -l dist
+      - if: inputs.publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.ref }}
+        run: gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$TAG"
+      - if: ${{ !inputs.publish && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          retention-days: 3
