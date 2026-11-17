@@ -18,8 +18,8 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# GitHub scopes caches saved by a pull request to that pull request, so only main's caches are shared, and a branch
-# cannot poison them. Pull requests only restore, so their copies do not push main's out of the repository's quota.
+# Bazel shares action outputs and test results through BuildBuddy (.bazelrc) across all runs. GitHub's caches of
+# downloads are scoped to the pull request that saves them, so only main's are shared; pull requests only restore them.
 jobs:
   # Platform-specific code: Linux cross-builds and lints every target for each OS and architecture, then that runner
   # runs the Rust tests from the bundle.
@@ -42,10 +42,13 @@ jobs:
       - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
         with:
           bazelisk-cache: true
-          disk-cache: cross-${{ matrix.target }}
           external-cache: true
           repository-cache: true
           cache-save: ${{ github.event_name != 'pull_request' }}
+          # Action outputs go through BuildBuddy (.bazelrc). Without an API key, pull requests only read from it.
+          bazelrc: |
+            ${{ secrets.BUILDBUDDY_API_KEY && format('common --remote_header=x-buildbuddy-api-key={0}', secrets.BUILDBUDDY_API_KEY) || '' }}
+            ${{ !secrets.BUILDBUDDY_API_KEY && github.event_name == 'pull_request' && 'common --noremote_upload_local_results' || '' }}
       - run: >-
           bazel build --config=ci --config=lint --platforms=@rules_rs//rs/platforms:${{ matrix.target }}
           //... //:rust-test-bundle
@@ -100,10 +103,13 @@ jobs:
       - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
         with:
           bazelisk-cache: true
-          disk-cache: dist
           external-cache: true
           repository-cache: true
           cache-save: ${{ github.event_name != 'pull_request' }}
+          # Action outputs go through BuildBuddy (.bazelrc). Without an API key, pull requests only read from it.
+          bazelrc: |
+            ${{ secrets.BUILDBUDDY_API_KEY && format('common --remote_header=x-buildbuddy-api-key={0}', secrets.BUILDBUDDY_API_KEY) || '' }}
+            ${{ !secrets.BUILDBUDDY_API_KEY && github.event_name == 'pull_request' && 'common --noremote_upload_local_results' || '' }}
       - run: bazel build --config=ci --config=release //packaging:dist
       - run: mkdir dist && cp bazel-bin/packaging/dist/* dist/
       - if: github.event_name == 'pull_request'
@@ -177,8 +183,11 @@ jobs:
       - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
         with:
           bazelisk-cache: true
-          disk-cache: test
           external-cache: true
           repository-cache: true
           cache-save: ${{ github.event_name != 'pull_request' }}
+          # Action outputs go through BuildBuddy (.bazelrc). Without an API key, pull requests only read from it.
+          bazelrc: |
+            ${{ secrets.BUILDBUDDY_API_KEY && format('common --remote_header=x-buildbuddy-api-key={0}', secrets.BUILDBUDDY_API_KEY) || '' }}
+            ${{ !secrets.BUILDBUDDY_API_KEY && github.event_name == 'pull_request' && 'common --noremote_upload_local_results' || '' }}
       - run: bazel test --config=ci //...

@@ -7,6 +7,16 @@ common --disk_cache=~/.cache/bazel-disk-cache
 common --experimental_disk_cache_gc_max_size=20G
 common --nobuild_runfile_links
 
+# Share action outputs and test results through BuildBuddy's remote cache, and stream invocations to its results UI.
+# Without an API key, invocations are anonymous and publicly viewable; to use an organization, add
+# `common --remote_header=x-buildbuddy-api-key=<key>` to user.bazelrc (CI reads the BUILDBUDDY_API_KEY secret).
+build --bes_results_url=https://app.buildbuddy.io/invocation/
+build --bes_backend=grpcs://remote.buildbuddy.io
+common --remote_cache=grpcs://remote.buildbuddy.io
+common --remote_timeout=10m
+common --remote_cache_compression
+common --nolegacy_important_outputs
+
 common --enable_platform_specific_config
 common:windows --host_platform=//platforms:local_windows_msvc
 # cc-rs build scripts can't drive llvm-libtool-darwin.
@@ -31,8 +41,7 @@ common:ci --curses=no
 common:ci --keep_going
 common:ci --lockfile_mode=error
 common:ci --verbose_failures
-# CI runners are short-lived: collect garbage as soon as the build goes idle.
-common:ci --experimental_disk_cache_gc_idle_delay=0
-common:ci --experimental_disk_cache_gc_max_size=4G
+# CI runners are short-lived and share outputs through the remote cache instead.
+common:ci --disk_cache=
 
 try-import %workspace%/user.bazelrc

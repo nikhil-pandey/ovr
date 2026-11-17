@@ -65,6 +65,8 @@ syncs to both kinds on every pull request; `bench.yml` times real repositories o
 
 Checks gate pull requests only. A merge to `main` runs just the release workflow; nightly runs of `ci.yml` and
 `bench.yml` on `main` refresh the caches pull requests restore from, since GitHub shares no other branch's caches.
+Bazel shares action outputs and test results through BuildBuddy (`.bazelrc`); CI authenticates with the
+`BUILDBUDDY_API_KEY` secret, and local builds anonymously unless `user.bazelrc` sets an API key header.
 
 ## Release
 

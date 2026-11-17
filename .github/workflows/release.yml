@@ -79,9 +79,12 @@ jobs:
       - uses: bazel-contrib/setup-bazel@104e3eea9447cdaa4b00d0fb46191a3985d26ab3 # 0.19.1
         with:
           bazelisk-cache: true
-          disk-cache: dist
           external-cache: true
           repository-cache: true
+          # Action outputs go through BuildBuddy (.bazelrc). Without an API key, pull requests only read from it.
+          bazelrc: |
+            ${{ secrets.BUILDBUDDY_API_KEY && format('common --remote_header=x-buildbuddy-api-key={0}', secrets.BUILDBUDDY_API_KEY) || '' }}
+            ${{ !secrets.BUILDBUDDY_API_KEY && github.event_name == 'pull_request' && 'common --noremote_upload_local_results' || '' }}
       - run: bazel build --config=ci --config=release //packaging:dist
       - run: gh release create "$TAG" bazel-bin/packaging/dist/* --verify-tag --generate-notes --title "$TAG"
         env:
