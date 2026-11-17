@@ -2,14 +2,15 @@ name: CI
 
 # Pull requests run the full checks, unless they only change Markdown. Bazel tests and lints on Linux, and cross-builds
 # and lints for every other released OS and architecture, whose runners then run the Rust tests from a bundle with no
-# toolchain of their own. A nightly run on main only refreshes the caches pull requests restore from: Bazel builds,
-# tests, and cross-builds there too, because it caches actions and test results. Merges run nothing here, so they never
-# queue behind each other or crowd out pull requests and releases.
+# toolchain of their own. Pull requests write Bazel's action outputs and test results to BuildBuddy; a weekly run on main
+# only refreshes the GitHub caches of downloads that pull requests restore. Merges run nothing here, so they never queue
+# behind each other or crowd out pull requests and releases.
 on:
   pull_request:
     paths-ignore: ["**/*.md", LICENSE]
   schedule:
-    - cron: "37 2 * * *"
+    # Caches unused for 7 days are evicted.
+    - cron: "37 2 * * 1"
 
 permissions:
   contents: read
@@ -172,7 +173,7 @@ jobs:
           "$PWD\bin" >> $env:GITHUB_PATH
       - run: ovr --version && ovrd --version
 
-  # Every test on Linux, plus clippy and rustfmt on every Rust target. Bazel caches test results, so nightly runs also
+  # Every test on Linux, plus clippy and rustfmt on every Rust target. Bazel caches test results, so weekly runs also
   # test, and pull requests rerun only what changed.
   bazel:
     runs-on: ubuntu-26.04

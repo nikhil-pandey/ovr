@@ -28,6 +28,8 @@ concurrency:
 jobs:
   bench:
     uses: ./.github/workflows/tunnel.yml
+    secrets:
+      BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
     with:
       kinds: '["paired"]'
       mode: bench

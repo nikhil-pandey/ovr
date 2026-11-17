@@ -60,11 +60,12 @@ with `bazel build --config=lint --platforms=@rules_rs//rs/platforms:<triple> //.
 bundled tests on that OS.
 
 Across runners, `.github/workflows/tunnel.yml` (driven by `.github/e2e/e2e.py`) has Linux, macOS, and Windows hosts
-dial an initiator through a quick tunnel, either paired or as trusted jobs with an OIDC token. `e2e.yml` checks
-syncs to both kinds on every pull request; `bench.yml` times real repositories on paired hosts nightly or on dispatch.
+dial an initiator through a quick tunnel, either paired or as trusted jobs with an OIDC token; every runner installs
+the Bazel release build. `e2e.yml` checks syncs to both kinds on every pull request; `bench.yml` times real
+repositories on paired hosts nightly or on dispatch.
 
-Checks gate pull requests only. A merge to `main` runs just the release workflow; nightly runs of `ci.yml` and
-`bench.yml` on `main` refresh the caches pull requests restore from, since GitHub shares no other branch's caches.
+Checks gate pull requests only. A merge to `main` runs just the release workflow; a weekly run of `ci.yml` on `main`
+refreshes the download caches pull requests restore from, since GitHub shares no other branch's caches.
 Bazel shares action outputs and test results through BuildBuddy (`.bazelrc`); CI authenticates with the
 `BUILDBUDDY_API_KEY` secret, and local builds anonymously unless `user.bazelrc` sets an API key header.
 

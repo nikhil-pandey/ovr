@@ -1,27 +1,35 @@
 name: e2e setup
-description: Builds ovr's binaries onto PATH and installs uv and cloudflared, at the versions the calling workflow sets.
-inputs:
-  packages:
-    description: The Cargo packages to build, such as `-p ovr -p ovrd`
-    required: true
+description: Puts the release build of ovr's binaries on PATH and installs uv and cloudflared, at the versions the calling workflow sets.
 runs:
   using: composite
   steps:
     - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       with:
         version: ${{ env.UV_VERSION }}
-    - shell: bash
-      run: rustup toolchain install
-    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+    - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       with:
-        cache-on-failure: true
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        name: e2e-dist
+        path: ${{ runner.temp }}/e2e-dist
+    # This runner's release archive from the `build` job, onto PATH.
     - shell: bash
-      env:
-        PACKAGES: ${{ inputs.packages }}
       run: |
-        cargo build --release --locked $PACKAGES
-        echo "$GITHUB_WORKSPACE/target/release" >>"$GITHUB_PATH"
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+        Linux-X64) archive=ovr-x86_64-unknown-linux-musl.tar.gz ;;
+        Linux-ARM64) archive=ovr-aarch64-unknown-linux-musl.tar.gz ;;
+        macOS-X64) archive=ovr-x86_64-apple-darwin.tar.gz ;;
+        macOS-ARM64) archive=ovr-aarch64-apple-darwin.tar.gz ;;
+        Windows-X64) archive=ovr-x86_64-pc-windows-gnullvm.zip ;;
+        Windows-ARM64) archive=ovr-aarch64-pc-windows-gnullvm.zip ;;
+        *) echo "::error::no release archive for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
+        esac
+        bin="$RUNNER_TEMP/ovr-bin"
+        mkdir -p "$bin"
+        if [[ "$archive" == *.zip ]]; then
+          pwsh -NoProfile -Command "Expand-Archive -Force -LiteralPath '$RUNNER_TEMP/e2e-dist/$archive' -DestinationPath '$bin'"
+        else
+          tar -xzf "$RUNNER_TEMP/e2e-dist/$archive" -C "$bin"
+        fi
+        echo "$bin" >>"$GITHUB_PATH"
     - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ runner.temp }}/cloudflared
