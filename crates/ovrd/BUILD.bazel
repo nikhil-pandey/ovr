@@ -38,11 +38,12 @@ rust_binary(
 )
 
 rust_test(
-    name = "test",
+    name = "ovrd-test",
     size = "small",
     crate = ":lib",
     lint_config = LINT_CONFIG,
     rustc_env_files = ["//:cargo_env"],
+    visibility = ["//:__pkg__"],
     deps = all_crate_deps(
         cargo_only = True,
         normal_dev = True,

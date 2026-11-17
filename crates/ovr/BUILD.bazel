@@ -49,11 +49,12 @@ rust_binary(
 )
 
 rust_test(
-    name = "test",
+    name = "ovr-test",
     size = "small",
     crate = ":lib",
     lint_config = LINT_CONFIG,
     rustc_env_files = ["//:cargo_env"],
+    visibility = ["//:__pkg__"],
     deps = all_crate_deps(
         cargo_only = True,
         normal_dev = True,
@@ -62,7 +63,7 @@ rust_test(
 
 # Cargo's integration test, run against both release binaries.
 rust_test(
-    name = "e2e",
+    name = "ovr-e2e-test",
     size = "medium",
     srcs = ["tests/e2e.rs"],
     data = [
@@ -75,6 +76,7 @@ rust_test(
         "OVRD": "$(rootpath //crates/ovrd)",
     },
     rustc_env_files = ["//:cargo_env"],
+    visibility = ["//:__pkg__"],
     deps = all_crate_deps(
         cargo_only = True,
         normal = True,

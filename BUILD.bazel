@@ -1,3 +1,5 @@
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+
 exports_files([
     "Cargo.lock",
     "Cargo.toml",
@@ -14,4 +16,21 @@ genrule(
     outs = ["cargo.env"],
     cmd = "sed -n '1,/^version = /s/^version = \"\\(.*\\)\"$$/CARGO_PKG_VERSION=\\1/p' $< > $@",
     visibility = ["//visibility:public"],
+)
+
+# The Rust tests with their runfiles, for running on another OS without Bazel: CI cross-builds this on Linux
+# (`bazel build --platforms=@rules_rs//rs/platforms:<triple> //:rust-test-bundle`) and runs each test on the target
+# OS.
+pkg_tar(
+    name = "rust-test-bundle",
+    testonly = True,
+    srcs = [
+        "//crates/ovr:ovr-e2e-test",
+        "//crates/ovr:ovr-test",
+        "//crates/ovr-proto:ovr-proto-test",
+        "//crates/ovrd:ovrd-test",
+    ],
+    extension = "tar.gz",
+    include_runfiles = True,
+    tags = ["manual"],
 )

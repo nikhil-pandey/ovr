@@ -55,7 +55,9 @@ it builds `ovrd` itself, under Bazel it gets both binaries as data. Its ignored 
 `7420` through real Cloudflare quick tunnels and Dev Tunnels; after changing dial-in or tunnels, run
 `cargo test -p ovr --test e2e -- --ignored` with `cloudflared` installed and `devtunnel` logged in. They take a few
 minutes, mostly waiting for a new quick tunnel to resolve. Platform-specific code (Windows Job Objects,
-ConPTY, named pipes) is only compiled on its platform; CI checks every released OS.
+ConPTY, named pipes) is only compiled on its platform. CI cross-builds and lints every released OS and architecture
+with `bazel build --config=lint --platforms=@rules_rs//rs/platforms:<triple> //... //:rust-test-bundle`, and runs the
+bundled tests on that OS.
 
 Across runners, `.github/workflows/tunnel.yml` (driven by `.github/e2e/e2e.py`) has Linux, macOS, and Windows hosts
 dial an initiator through a quick tunnel, either paired or as trusted jobs with an OIDC token. `e2e.yml` checks

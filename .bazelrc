@@ -14,9 +14,10 @@ common --@rules_cc//cc/toolchains/args/archiver_flags:use_libtool_on_macos=False
 
 common --test_output=errors
 
-# `bazel test` also runs clippy (with Cargo.toml's lint levels) and rustfmt on every Rust target.
-test --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect,@rules_rust//rust:defs.bzl%rustfmt_aspect
-test --output_groups=+clippy_checks,+rustfmt_checks
+# `--config=lint` runs clippy (with Cargo.toml's lint levels) and rustfmt on every Rust target; `bazel test` always does.
+build:lint --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect,@rules_rust//rust:defs.bzl%rustfmt_aspect
+build:lint --output_groups=+clippy_checks,+rustfmt_checks
+test --config=lint
 common --@rules_rust//rust/settings:clippy_flag=-Dwarnings
 
 # Release binaries: Cargo's release profile ([profile.release] in Cargo.toml).
