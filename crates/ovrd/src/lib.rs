@@ -35,7 +35,7 @@ pub struct Cli {
 pub enum Command {
     /// Print a one-shot command for a host that must dial in, through a tunnel from PROVIDER if given.
     Pair {
-        /// `cloudflare` or `devtunnel`: open a tunnel with that provider's CLI unless one is open.
+        /// `cloudflare`, `devtunnel` or `tailcat`: open a tunnel with that provider's CLI unless one is open.
         provider: Option<Provider>,
     },
     /// List open tunnels and the command that points a paired host at each.
@@ -57,7 +57,7 @@ pub enum Command {
     /// On a host: pair with the initiator at ADDR, then keep serving it. Without a code, move a paired host to ADDR.
     /// Without arguments, serve the paired initiator.
     Connect {
-        /// `host:port`, `cloudflare:HOSTNAME`, or `devtunnel:ID`, as printed by `ovrd pair` or `ovrd tunnel`.
+        /// `host:port`, `cloudflare:HOSTNAME`, `devtunnel:ID`, or `tailcat:ADDRESS`, as printed by `ovrd pair` or `ovrd tunnel`.
         addr: Option<tunnel::Addr>,
         /// Pairing code printed by `ovrd pair`, or `github:FINGERPRINT` printed by `ovrd trust` to serve as this
         /// GitHub Actions job, in the background until the job ends.
@@ -260,7 +260,7 @@ async fn trust(op: Op) -> Result<(), Error> {
                  hold: 30m\n\n\
                  or run `ovrd connect {addr} github:{initiator}` in any step"
             );
-            if !addr.starts_with(Provider::Devtunnel.name()) {
+            if !addr.starts_with("devtunnel:") && !addr.starts_with("tailcat:") {
                 println!(
                     "\nGitHub-hosted runners reach {addr} only through a tunnel or your tailnet; \
                      `ovrd pair devtunnel` opens a tunnel whose address stays the same"

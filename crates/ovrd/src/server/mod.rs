@@ -279,7 +279,7 @@ impl Server {
             .map(ToString::to_string)
             .collect();
         let tunnels = self.tunnels.list();
-        let addr = [Provider::Devtunnel, Provider::Cloudflare]
+        let addr = [Provider::Devtunnel, Provider::Tailcat, Provider::Cloudflare]
             .into_iter()
             .find_map(|provider| {
                 tunnels

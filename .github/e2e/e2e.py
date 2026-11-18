@@ -3,7 +3,7 @@
 # requires-python = ">=3.13"
 # dependencies = ["rich==15.0.0", "psutil==7.2.2"]
 # ///
-"""Cross-runner e2e for ovr through a Cloudflare quick tunnel.
+"""Cross-runner e2e for ovr through a tunnel.
 
 Hosts are an OS and a kind, such as `linux-paired`. A paired host dials in with a code the initiator issues through
 this run's artifacts and serves with `ovrd connect --foreground`; a trusted host uses the action, which dials in as
@@ -37,6 +37,8 @@ from rich.table import Table
 
 console = Console(force_terminal=True, width=200, highlight=False, soft_wrap=True)
 OSES = ("linux", "macos", "windows")
+PROVIDER = os.environ.get("TUNNEL_PROVIDER", "cloudflare")
+TUNNEL_CLI = {"cloudflare": "cloudflared", "tailcat": "tailcat"}[PROVIDER]
 KINDS = tuple(os.environ.get("KINDS", "paired").split())
 HOSTS = tuple(f"{os_name}-{kind}" for kind in KINDS for os_name in OSES)
 COLORS = {"linux": "cyan", "macos": "magenta", "windows": "yellow", "initiator": "green"}
@@ -110,13 +112,14 @@ def run(args: list[str], cwd: Path | None = None, check: bool = True) -> str:
     return result.stdout.strip()
 
 
-async def arun(args: list[str], cwd: Path | None = None) -> str:
+async def arun(args: list[str], cwd: Path | None = None, *, private_output: bool = False) -> str:
     child = await asyncio.create_subprocess_exec(
         *args, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
     )
     out, _ = await child.communicate()
     if child.returncode != 0:
-        raise SystemExit(f"{' '.join(args)} failed ({child.returncode}):\n{out.decode(errors='replace')}")
+        detail = "" if private_output else f":\n{out.decode(errors='replace')}"
+        raise SystemExit(f"{' '.join(args)} failed ({child.returncode}){detail}")
     return out.decode(errors="replace").strip()
 
 
@@ -188,7 +191,7 @@ def cmd_specs(args: argparse.Namespace) -> None:
     disk = Path(args.disk)
     probe = next(p for p in (disk, *disk.parents) if p.exists())
     tools = {}
-    for tool in ("git", "cargo", "bazel", "cloudflared"):
+    for tool in ("git", "cargo", "bazel", TUNNEL_CLI):
         try:
             tools[tool] = run([tool, "--version"]).splitlines()[0]
         except (OSError, SystemExit, IndexError):
@@ -267,10 +270,10 @@ def cmd_pair(args: argparse.Namespace) -> None:
         out.mkdir(parents=True, exist_ok=True)
         # One after another: `ovrd pair` opens the tunnel once and reuses it.
         for host in (host for host in HOSTS if host.endswith("-paired")):
-            printed = await arun(["ovrd", "pair", "cloudflare"])
+            printed = await arun(["ovrd", "pair", PROVIDER], private_output=True)
             found = re.search(r"^\s*ovrd connect (\S+) (\S+)\s*$", printed, re.MULTILINE)
             if not found:
-                raise SystemExit(f"ovrd pair printed no connect command:\n{printed}")
+                raise SystemExit("ovrd pair printed no recognizable connect command")
             addr, code = found.groups()
             say("initiator", f"pairing {tag(host)} through {addr}")
             await asyncio.to_thread(
@@ -294,7 +297,7 @@ def cmd_pair(args: argparse.Namespace) -> None:
             # Trusted jobs need no pairing, and the address and fingerprint they dial are not secret. Trusting before
             # any pairing would leave the tunnel unopened, so it opens one first.
             if "paired" not in KINDS:
-                await arun(["ovrd", "pair", "cloudflare"])
+                await arun(["ovrd", "pair", PROVIDER], private_output=True)
             printed = await arun(["ovrd", "trust", f"github:{os.environ['GITHUB_REPOSITORY']}"])
             values = dict(re.findall(r"gh variable set (OVR_ADDR|OVR_INITIATOR) .*--body (\S+)", printed))
             if len(values) != 2:
@@ -919,7 +922,7 @@ def cmd_report(args: argparse.Namespace) -> None:
         "",
         (
             f"An initiator runner synced each repository to every host ({', '.join(HOSTS)}) at once through one "
-            "Cloudflare quick tunnel. A first sync covers snapshotting, packing, the transfer, indexing, and the "
+            f"{PROVIDER} tunnel. A first sync covers snapshotting, packing, the transfer, indexing, and the "
             "checkout; its rate is the pack's size over that whole time, so it understates the link. Later syncs "
             "send only what changed."
         ),
@@ -941,7 +944,7 @@ def cmd_report(args: argparse.Namespace) -> None:
             ("git", lambda s: s["tools"]["git"]),
             ("cargo", lambda s: s["tools"]["cargo"]),
             ("bazel", lambda s: s["tools"]["bazel"]),
-            ("cloudflared", lambda s: s["tools"]["cloudflared"]),
+            (TUNNEL_CLI, lambda s: s["tools"][TUNNEL_CLI]),
         ]
         for label, get in rows:
             md.append(f"| {label} | " + " | ".join(str(get(s)) for s in specs.values()) + " |")
@@ -1043,7 +1046,7 @@ def main() -> None:
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_specs)
 
-    p = sub.add_parser("pair", help="initiator: let every host dial in through a quick tunnel")
+    p = sub.add_parser("pair", help="initiator: let every host dial in through the selected tunnel")
     p.add_argument("--specs", default="specs", help="where hosts' keys and specs are downloaded")
     p.add_argument("--out", default="pairs")
     p.add_argument("--timeout", type=float, default=3600)

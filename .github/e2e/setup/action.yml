@@ -1,5 +1,9 @@
 name: e2e setup
-description: Puts the release build of ovr's binaries on PATH and installs uv and cloudflared, at the versions the calling workflow sets.
+description: Install the release build and the tools used by the cross-runner tests.
+inputs:
+  provider:
+    description: Tunnel CLI to install. Trusted hosts install theirs through the public action.
+    default: ""
 runs:
   using: composite
   steps:
@@ -13,26 +17,19 @@ runs:
     # This runner's release archive from the `build` job, onto PATH.
     - shell: bash
       run: |
-        case "$RUNNER_OS-$RUNNER_ARCH" in
-        Linux-X64) archive=ovr-x86_64-unknown-linux-musl.tar.gz ;;
-        Linux-ARM64) archive=ovr-aarch64-unknown-linux-musl.tar.gz ;;
-        macOS-X64) archive=ovr-x86_64-apple-darwin.tar.gz ;;
-        macOS-ARM64) archive=ovr-aarch64-apple-darwin.tar.gz ;;
-        Windows-X64) archive=ovr-x86_64-pc-windows-gnullvm.zip ;;
-        Windows-ARM64) archive=ovr-aarch64-pc-windows-gnullvm.zip ;;
-        *) echo "::error::no release archive for $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
-        esac
         bin="$RUNNER_TEMP/ovr-bin"
-        mkdir -p "$bin"
-        if [[ "$archive" == *.zip ]]; then
-          pwsh -NoProfile -Command "Expand-Archive -Force -LiteralPath '$RUNNER_TEMP/e2e-dist/$archive' -DestinationPath '$bin'"
-        else
-          tar -xzf "$RUNNER_TEMP/e2e-dist/$archive" -C "$bin"
-        fi
+        bash .github/scripts/install-ovr.sh "$bin" "$RUNNER_TEMP/e2e-dist"
         echo "$bin" >>"$GITHUB_PATH"
-    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+    - if: inputs.provider != '' && !(inputs.provider == 'tailcat' && runner.os == 'macOS')
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: ${{ runner.temp }}/cloudflared
-        key: cloudflared-${{ runner.os }}-${{ env.CLOUDFLARED_VERSION }}
-    - shell: bash
-      run: .github/e2e/install-cloudflared.sh
+        path: ${{ runner.temp }}/tunnel-bin
+        key: tunnel-${{ inputs.provider }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/scripts/install-tunnel.sh') }}
+    - if: inputs.provider != ''
+      shell: bash
+      env:
+        PROVIDER: ${{ inputs.provider }}
+      run: |
+        bin="$RUNNER_TEMP/tunnel-bin"
+        bash .github/scripts/install-tunnel.sh "$PROVIDER" "$bin"
+        echo "$bin" >>"$GITHUB_PATH"

@@ -3,11 +3,17 @@ name: E2E
 # Checks that syncs and exit codes reach hosts on Linux, macOS, and Windows through a Cloudflare quick tunnel, both
 # paired hosts and trusted ones that connect with the job's OIDC token, as the action does; see tunnel.yml. Pull
 # requests from forks get no OIDC token, so they check paired hosts only. Every runner installs the Bazel release build
-# of ovr (tunnel.yml's `build` job). Pull requests that only change Markdown skip it.
+# of ovr (tunnel.yml's `build` job). Dispatch to exercise Tailcat. Pull requests that only change Markdown skip it.
 on:
   pull_request:
     paths-ignore: ["**/*.md", LICENSE]
   workflow_dispatch:
+    inputs:
+      provider:
+        description: Tunnel provider for all hosts
+        type: choice
+        options: [tailcat, cloudflare]
+        default: tailcat
 
 permissions:
   contents: read
@@ -26,3 +32,4 @@ jobs:
     with:
       kinds: ${{ github.event.pull_request.head.repo.fork && '["paired"]' || '["paired", "trusted"]' }}
       mode: check
+      provider: ${{ inputs.provider || 'cloudflare' }}

@@ -127,9 +127,9 @@ ovrd connect ADDR github:FP in a GitHub Actions job: serve the initiator with fi
   other versions. `--all` does both, for every host with an open connection. See [Cleaning up](#cleaning-up).
 - `ovr get` exits `0` when everything was fetched, `1` when something could not be, and `125` when `ovr` itself
   fails. See [Copying files back](#copying-files-back).
-- `ADDR` is `host:port`, or a tunnel: `cloudflare:HOSTNAME` or `devtunnel:ID`. `PROVIDER` is `cloudflare` or
-  `devtunnel`. `ovrd connect ADDR CODE --foreground` pairs and serves without installing anything at login, for CI
-  runners and other short-lived hosts.
+- `ADDR` is `host:port`, or a tunnel: `cloudflare:HOSTNAME`, `devtunnel:ID`, or `tailcat:ADDRESS`. `PROVIDER` is
+  `cloudflare`, `devtunnel`, or `tailcat`. `ovrd connect ADDR CODE --foreground` pairs and serves without installing anything
+  at login, for CI runners and other short-lived hosts.
 
 ## Architecture
 
@@ -223,8 +223,8 @@ For hosts that cannot accept SSH, including every Windows workstation:
 ### Tunnels
 
 When no network path reaches the initiator, as for a CI runner or a machine on another network without an overlay,
-`ovrd` opens one with a tunnel provider's CLI: `cloudflared` for Cloudflare quick tunnels, or `devtunnel` for
-Microsoft Dev Tunnels.
+`ovrd` opens one with a tunnel provider's CLI: `cloudflared` for Cloudflare quick tunnels, `devtunnel` for
+Microsoft Dev Tunnels, or `tailcat` for Tailcat.
 
 ```
  initiator$ ovrd pair cloudflare
@@ -249,6 +249,12 @@ Microsoft Dev Tunnels.
 - **The host's `ovrd connect` owns the forwarder.** Given a tunnel address, it starts the provider's local forwarder
   on a free port, dials through it, and restarts it on every reconnect. The forwarder lives and dies with
   `ovrd connect`, so the one printed command is all a host needs, whether it serves at login or in a CI job.
+- **Tailcat.** The initiator generates a private Tailcat key in the ovr data directory and fixes the relay region
+  at creation. Its address survives restarts. Closing the tunnel deletes the key. Tailcat serves only the TCP
+  dial-in port. Hosts use ephemeral Tailcat keys and a forwarder on an OS-assigned loopback port. Traffic can
+  take a direct WireGuard path or use a DERP relay. Both sides need the Tailcat CLI. Neither needs an account.
+  ovr disables Tailcat's optional pre-shared key so the printed address contains only public connection details.
+  Pairing and pinned TLS authenticate the peers.
 - **Addresses.** A Dev Tunnel keeps its ID across restarts, so paired hosts reconnect on their own; it suits hosts
   that stay. Should the provider lose it, as when it expires unused, `ovrd` creates a new one in its place. A Cloudflare quick tunnel gets a new hostname whenever it restarts, for example when the initiator
   reboots; it suits short-lived hosts such as CI runners. `ovrd tunnel` shows each tunnel's current address with the
@@ -358,8 +364,8 @@ jobs:
   `ovr OWNER/REPO/ci/57/build -- cat test-results/report.txt` from outside a repository. Paired and SSH hosts use the
   home directory, even when they happen to run on a CI runner.
 - **Reaching the initiator.** `ovrd trust` prints the open tunnel's address if there is one, the Dev Tunnel first,
-  as it keeps its address; a Cloudflare quick tunnel's changes when it restarts. Storing the address and fingerprint
-  as repository or organization variables keeps the step the same in every workflow.
+  then Tailcat, as both keep their addresses; a Cloudflare quick tunnel gets a new address when it restarts. Repository or
+  organization variables let workflows share the address and fingerprint.
 
 Nothing about the initiator-side `ovrd` is tied to a laptop; the same server can run on an always-on VM later
 (see Milestones). It usually runs on your laptop because that needs no additional machine.
@@ -772,7 +778,7 @@ before `ovrd` runs.
   (signals), `windows-sys` (ConPTY Job Objects, console control). File locks are `std::fs::File::lock`, unlocked
   explicitly before the file is closed: a process another thread is spawning shares the open file until it execs, so
   closing alone could leave the lock held for that long.
-- Uses the system `ssh`, `git`, and tunnel CLIs (`cloudflared`, `devtunnel`); reimplements none of them.
+- Uses the system `ssh`, `git`, and tunnel CLIs (`cloudflared`, `devtunnel`, `tailcat`); reimplements none of them.
 - Prebuilt binaries for macOS, Linux, and Windows on arm64 and x86-64.
 
 ## Milestones
@@ -783,7 +789,7 @@ before `ovrd` runs.
    exit-code passthrough on Linux and macOS.
 3. **Dial-in.** `ovrd pair` / `ovrd connect`, pairing, mutual TLS, reconnect, `ovr hosts`.
 4. **Windows.** Windows agent (Job Objects, ConPTY, paths, Scheduled Task install) and Windows initiator.
-5. **Tunnels.** `ovrd pair PROVIDER` with Cloudflare quick tunnels and Dev Tunnels, tunnel addresses and
+5. **Tunnels.** `ovrd pair PROVIDER` with Cloudflare quick tunnels, Dev Tunnels, and Tailcat, tunnel addresses and
    `--foreground` for `ovrd connect`, and heartbeats on dial-in connections.
 6. **Trusted workloads.** `ovrd trust` with GitHub Actions OIDC, `ovrd connect ADDR github:FP` in the background,
    and the GitHub action.

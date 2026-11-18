@@ -5,8 +5,10 @@
 //! a host runs the client side (`cloudflared access tcp`, `devtunnel connect`), a local forwarder it dials through.
 
 use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -22,6 +24,8 @@ use crate::server::PORT;
 
 /// How long a provider's CLI may take to report that it is ready.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+const TAILCAT_KEY: &str = "tailcat.private.json";
 
 /// Output lines kept for error messages.
 const TAIL: usize = 12;
@@ -42,10 +46,14 @@ impl FromStr for Addr {
             // `cloudflare:7420` is a host named cloudflare.
             && !name.bytes().all(|byte| byte.is_ascii_digit())
         {
-            let valid = !name.starts_with(['-', '.'])
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'));
+            let valid = if provider == Provider::Tailcat {
+                tailcat_address(name)
+            } else {
+                !name.starts_with(['-', '.'])
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.'))
+            };
             return if valid {
                 Ok(Self::Tunnel {
                     provider,
@@ -100,7 +108,7 @@ impl Running {
 /// Returns an error when the CLI is missing, not logged in, or fails.
 pub async fn create(provider: Provider) -> Result<Option<String>, Error> {
     match provider {
-        Provider::Cloudflare => Ok(None),
+        Provider::Cloudflare | Provider::Tailcat => Ok(None),
         Provider::Devtunnel => {
             let created = output(
                 "devtunnel",
@@ -137,6 +145,12 @@ pub async fn create(provider: Provider) -> Result<Option<String>, Error> {
 /// Returns an error when the CLI fails.
 pub async fn delete(provider: Provider, id: Option<&str>) -> Result<(), Error> {
     match (provider, id) {
+        (Provider::Tailcat, _) => {
+            match std::fs::remove_file(ovr_proto::paths::data_dir()?.join(TAILCAT_KEY)) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                result => Ok(result?),
+            }
+        }
         (Provider::Devtunnel, Some(id)) => {
             match output("devtunnel", &["delete", id, "--force"]).await {
                 Ok(_) | Err(Failure::NotFound) => Ok(()),
@@ -170,6 +184,44 @@ pub async fn exists(provider: Provider, id: Option<&str>) -> Result<bool, Error>
 /// Returns an error when the CLI is missing, fails, or does not become ready.
 pub async fn serve(provider: Provider, id: Option<&str>) -> Result<(Running, Addr), Error> {
     match (provider, id) {
+        (Provider::Tailcat, _) => {
+            let dir = ovr_proto::paths::data_dir()?;
+            let key = dir.join(TAILCAT_KEY);
+            if !key.try_exists()? {
+                // Publish only a fully written key, even if genkey fails halfway through.
+                let pending = tempfile::NamedTempFile::new_in(&dir)?.into_temp_path();
+                output(
+                    "tailcat",
+                    &[
+                        "genkey".into(),
+                        key_arg(&pending),
+                        "--force".into(),
+                        "--fixed-region".into(),
+                        "--psk=false".into(),
+                    ],
+                )
+                .await
+                .map_err(Error::from)?;
+                pending.persist(&key).map_err(|err| err.error)?;
+            }
+            let (running, name) = start(
+                "tailcat",
+                &[
+                    "--json".into(),
+                    key_arg(&key),
+                    "serve".into(),
+                    "--psk=false".into(),
+                    PORT.to_string().into(),
+                ],
+                |line| {
+                    let json: serde_json::Value = serde_json::from_str(line).ok()?;
+                    let name = json.get("listenAddr")?.as_str()?;
+                    tailcat_address(name).then(|| name.to_owned())
+                },
+            )
+            .await?;
+            Ok((running, Addr::Tunnel { provider, name }))
+        }
         (Provider::Cloudflare, _) => {
             let url = format!("tcp://127.0.0.1:{PORT}");
             let (mut hostname, mut registered) = (None, false);
@@ -210,6 +262,23 @@ pub async fn serve(provider: Provider, id: Option<&str>) -> Result<(Running, Add
 /// Returns an error when the CLI is missing, fails, or does not start forwarding.
 pub async fn forward(provider: Provider, name: &str) -> Result<(Running, SocketAddr), Error> {
     match provider {
+        Provider::Tailcat => {
+            let mapping = format!("0:{PORT}");
+            let target = format!(" -> remote localhost:{PORT}");
+            start(
+                "tailcat",
+                &["--key=new", "forward", name, &mapping],
+                |line| {
+                    let port = line
+                        .strip_prefix("# forwarding 127.0.0.1:")?
+                        .strip_suffix(&target)?
+                        .parse()
+                        .ok()?;
+                    Some(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+                },
+            )
+            .await
+        }
         Provider::Cloudflare => {
             let local = SocketAddr::from((
                 Ipv4Addr::LOCALHOST,
@@ -242,7 +311,7 @@ pub async fn forward(provider: Provider, name: &str) -> Result<(Running, SocketA
 /// Starts `program`, collecting its output until `ready` finds what it is waiting for.
 async fn start<T>(
     program: &'static str,
-    args: &[&str],
+    args: &[impl AsRef<OsStr>],
     mut ready: impl FnMut(&str) -> Option<T>,
 ) -> Result<(Running, T), Error> {
     let mut child = command(program)
@@ -338,7 +407,11 @@ impl From<Failure> for Error {
 }
 
 /// Runs `program` to completion, returning its standard output.
-async fn output(program: &'static str, args: &[&str]) -> Result<String, Failure> {
+async fn output(program: &'static str, args: &[impl AsRef<OsStr>]) -> Result<String, Failure> {
+    let operation = args
+        .first()
+        .map_or(OsStr::new(""), AsRef::as_ref)
+        .to_string_lossy();
     let output = tokio::time::timeout(
         READY_TIMEOUT,
         command(program)
@@ -348,12 +421,7 @@ async fn output(program: &'static str, args: &[&str]) -> Result<String, Failure>
             .output(),
     )
     .await
-    .map_err(|_| {
-        Failure::Other(Error::Host(format!(
-            "{program} {} timed out",
-            args.join(" ")
-        )))
-    })?
+    .map_err(|_| Failure::Other(Error::Host(format!("{program} {operation} timed out"))))?
     .map_err(|err| Failure::Other(missing(program, &err)))?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -363,8 +431,7 @@ async fn output(program: &'static str, args: &[&str]) -> Result<String, Failure>
         Err(Failure::NotFound)
     } else {
         Err(Failure::Other(Error::Host(format!(
-            "{program} {} failed ({}): {} {}",
-            args.first().copied().unwrap_or_default(),
+            "{program} {operation} failed ({}): {} {}",
             output.status,
             stdout.trim(),
             stderr.trim()
@@ -408,6 +475,20 @@ fn joined(tail: &Mutex<VecDeque<String>>) -> String {
         .map(String::as_str)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn key_arg(path: &Path) -> OsString {
+    let mut arg = OsString::from("--key=");
+    arg.push(path);
+    arg
+}
+
+fn tailcat_address(name: &str) -> bool {
+    name.strip_prefix("tc").is_some_and(|s| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    })
 }
 
 /// The hostname in `cloudflared`'s announcement of a quick tunnel.

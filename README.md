@@ -54,7 +54,7 @@ ovr winbox -- dotnet build
 When the host cannot reach your machine, pair through a tunnel; Cloudflare's needs no account:
 
 ```sh
-ovrd pair cloudflare    # or devtunnel
+ovrd pair cloudflare    # or devtunnel or tailcat
 ovrd tunnel             # open tunnels; `ovrd tunnel close cloudflare` closes one
 ```
 

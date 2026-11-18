@@ -85,7 +85,7 @@ impl World {
         // tests; the host's is anonymous.
         let host_bin = dir.path().join("host-bin");
         std::fs::create_dir_all(&host_bin)?;
-        for tool in ["cloudflared", "devtunnel"] {
+        for tool in ["cloudflared", "devtunnel", "tailcat"] {
             let Some(real) = resolve(tool, &inherited) else {
                 continue;
             };
@@ -244,9 +244,9 @@ impl World {
     }
 }
 
-impl Drop for World {
+impl World {
     /// Asks the initiator's `ovrd` to make way, as a client of another version would, so that it exits.
-    fn drop(&mut self) {
+    fn stop_server(&self) {
         #[cfg(target_os = "macos")]
         let socket = self
             .file("initiator")
@@ -273,6 +273,12 @@ impl Drop for World {
                 let _ = stream.next().await;
             }
         });
+    }
+}
+
+impl Drop for World {
+    fn drop(&mut self) {
+        self.stop_server();
     }
 }
 
@@ -318,10 +324,10 @@ fn pairing(printed: &str) -> Result<(String, String)> {
     let line = printed
         .lines()
         .find_map(|line| line.trim().strip_prefix("ovrd connect "))
-        .ok_or_else(|| format!("no command in {printed:?}"))?;
+        .ok_or("pair printed no connect command")?;
     let (addr, code) = line
         .split_once(' ')
-        .ok_or_else(|| format!("no code in {line:?}"))?;
+        .ok_or("connect command has no pairing code")?;
     Ok((addr.to_owned(), code.to_owned()))
 }
 
@@ -826,5 +832,63 @@ fn dial_in_hosts_pair_through_a_dev_tunnel() -> Result {
         .stderr(Stdio::null())
         .status()?;
     assert!(!show.success(), "the dev tunnel was deleted");
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs the dial-in port, the network, and tailcat"]
+fn tailcat_hosts_reconnect_after_restart_and_close_rotates_the_address() -> Result {
+    let _port = dial_in();
+    let world = World::new()?;
+    // Record the PID before exec so we can stop this test's listener without touching other tunnels.
+    let launcher = world.file("bin/tailcat");
+    std::fs::rename(&launcher, launcher.with_extension("real"))?;
+    std::fs::write(
+        &launcher,
+        "#!/bin/sh\necho $$ > \"$0.pid\"\nexec \"$0.real\" \"$@\"\n",
+    )?;
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
+    let _tunnel = Tunnel(&world, "tailcat");
+    let (addr, code) = pairing(&world.ovrd(&["pair", "tailcat"])?)?;
+    let public = addr
+        .strip_prefix("tailcat:")
+        .ok_or("missing tailcat prefix")?;
+    let parsed = Command::new("tailcat").args(["parse", public]).output()?;
+    assert!(parsed.status.success());
+    let fields = text(&parsed.stdout);
+    assert!(fields.contains("\"ServerPublic\""));
+    assert!(
+        !fields.contains("\"PresharedKey\""),
+        "published address contains a credential"
+    );
+    let pid_path = launcher.with_extension("pid");
+    let pid = std::fs::read_to_string(&pid_path)?;
+    assert!(signal(&pid, "-KILL")?);
+    wait_for("the replacement Tailcat listener", || {
+        std::fs::read_to_string(&pid_path).is_ok_and(|new| !new.trim().is_empty() && new != pid)
+    })?;
+    assert_eq!(pairing(&world.ovrd(&["pair", "tailcat"])?)?.0, addr);
+
+    let host = world.connect(&[&addr, &code])?;
+    world.cat(&host.name)?;
+
+    world.stop_server();
+    let (restored, _) = pairing(&world.ovrd(&["pair", "tailcat"])?)?;
+    assert_eq!(restored, addr);
+    world.cat(&host.name)?;
+    std::fs::write(world.file("repo/msg.txt"), "after restart\n")?;
+    let changed = world.run(&[&host.name, "--", "cat", "msg.txt"])?;
+    assert!(changed.status.success());
+    assert_eq!(text(&changed.stdout), "after restart\n");
+    drop(host);
+
+    world.ovrd(&["tunnel", "close", "tailcat"])?;
+    assert!(world.ovrd(&["tunnel"])?.contains("no tunnels are open"));
+    let (fresh, _) = pairing(&world.ovrd(&["pair", "tailcat"])?)?;
+    assert_ne!(fresh, addr);
+    let stale = Command::new("tailcat")
+        .args(["--key=new", "ping", "--timeout=5s", public])
+        .output()?;
+    assert!(!stale.status.success(), "the closed address still responds");
     Ok(())
 }

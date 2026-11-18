@@ -12,6 +12,12 @@
   "customManagers": [
     {
       "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/scripts/install-tunnel\\.sh$/"],
+      "matchStrings": ["# renovate: datasource=github-releases depName=(?<depName>[^\\s]+)\\s+version=(?<currentValue>v?[0-9.]+)"],
+      "datasourceTemplate": "github-releases"
+    },
+    {
+      "customType": "regex",
       "description": "Rust toolchain for rules_rs and the crate MSRV; rust-toolchain.toml is handled natively",
       "managerFilePatterns": [
         "/^MODULE\\.bazel$/",
