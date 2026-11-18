@@ -307,10 +307,12 @@ pub enum Provider {
     Cloudflare,
     /// Microsoft Dev Tunnels, through `devtunnel`.
     Devtunnel,
+    /// Tailcat, through `tailcat serve` and `tailcat forward`.
+    Tailcat,
 }
 
 impl Provider {
-    pub const ALL: [Self; 2] = [Self::Cloudflare, Self::Devtunnel];
+    pub const ALL: [Self; 3] = [Self::Cloudflare, Self::Devtunnel, Self::Tailcat];
 
     /// The name used in commands and addresses, as in `cloudflare:HOSTNAME`.
     #[must_use]
@@ -318,6 +320,7 @@ impl Provider {
         match self {
             Self::Cloudflare => "cloudflare",
             Self::Devtunnel => "devtunnel",
+            Self::Tailcat => "tailcat",
         }
     }
 }
@@ -335,7 +338,9 @@ impl std::str::FromStr for Provider {
         Self::ALL
             .into_iter()
             .find(|provider| provider.name() == name)
-            .ok_or_else(|| format!("unknown tunnel provider {name:?}; use cloudflare or devtunnel"))
+            .ok_or_else(|| {
+                format!("unknown tunnel provider {name:?}; use cloudflare, devtunnel or tailcat")
+            })
     }
 }
 

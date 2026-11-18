@@ -52,16 +52,16 @@ The client tests in `crates/ovr/src/session.rs` run a real `ovrd` agent in-proce
 and need `git` on `PATH`. `crates/ovr/tests/e2e.rs` runs the real `ovr` and `ovrd` binaries on Unix, with a stand-in
 `ssh` that serves a second home directory as the host, so runs are kept by real `ovrd keep` processes; under Cargo
 it builds `ovrd` itself, under Bazel it gets both binaries as data. Its ignored tests dial in on the fixed port
-`7420` through real Cloudflare quick tunnels and Dev Tunnels; after changing dial-in or tunnels, run
-`cargo test -p ovr --test e2e -- --ignored` with `cloudflared` installed and `devtunnel` logged in. They take a few
-minutes, mostly waiting for a new quick tunnel to resolve. Platform-specific code (Windows Job Objects,
-ConPTY, named pipes) is only compiled on its platform. CI cross-builds and lints every released OS and architecture
+`7420` through real Cloudflare quick tunnels, Dev Tunnels, and Tailcat; after changing dial-in or tunnels, run
+`cargo test -p ovr --test e2e -- --ignored` with `cloudflared` and `tailcat` installed and
+`devtunnel` logged in. They take a few minutes, mostly waiting for a new quick tunnel to resolve. Platform-specific code
+(Windows Job Objects, ConPTY, named pipes) is only compiled on its platform. CI cross-builds and lints every released OS and architecture
 with `bazel build --config=lint --platforms=@rules_rs//rs/platforms:<triple> //... //:rust-test-bundle`, and runs the
 bundled tests on that OS.
 
 Across runners, `.github/workflows/tunnel.yml` (driven by `.github/e2e/e2e.py`) has Linux, macOS, and Windows hosts
-dial an initiator through a quick tunnel, either paired or as trusted jobs with an OIDC token; every runner installs
-the Bazel release build. `e2e.yml` checks syncs to both kinds on every pull request; `bench.yml` times real
+dial an initiator through Cloudflare or Tailcat, either paired or as trusted jobs with an OIDC token. Select the
+provider when dispatching E2E. Every runner installs the Bazel release build. `e2e.yml` checks syncs to both kinds on every pull request; `bench.yml` times real
 repositories on paired hosts nightly or on dispatch.
 
 Checks gate pull requests only. A merge to `main` runs just the release workflow; a weekly run of `ci.yml` on `main`
