@@ -1,6 +1,9 @@
 name: e2e setup
 description: Install the release build and the tools used by the cross-runner tests.
 inputs:
+  build-workloads:
+    description: Install the repository Rust toolchain for benchmark builds on this host.
+    default: "false"
   provider:
     description: Tunnel CLI to install. Trusted hosts install theirs through the public action.
     default: ""
@@ -10,6 +13,13 @@ runs:
     - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       with:
         version: ${{ env.UV_VERSION }}
+    - if: inputs.build-workloads == 'true'
+      shell: bash
+      run: |
+        rustup toolchain install
+        # The remote checkouts live outside this repository's toolchain override.
+        toolchain=$(rustup show active-toolchain)
+        rustup default "${toolchain%% *}"
     - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
       with:
         name: e2e-dist
