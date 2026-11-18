@@ -1,10 +1,16 @@
 name: Bench
+run-name: Bench (${{ inputs.provider || 'cloudflare' }}, ${{ inputs.tier || 'standard' }})
 
-# Syncs real repositories through a Cloudflare quick tunnel to paired hosts on Linux, macOS, and Windows at once,
+# Syncs real repositories through the selected tunnel to paired hosts on Linux, macOS, and Windows at once,
 # builds them there, and reports every step's time; see tunnel.yml.
 on:
   workflow_dispatch:
     inputs:
+      provider:
+        description: Tunnel used by every host
+        type: choice
+        options: [cloudflare, tailcat]
+        default: cloudflare
       tier:
         description: "standard: four repositories, built on each host. large: adds llvm-project, chromium, and a generated repository, synced and checked on each host."
         type: choice
@@ -22,7 +28,7 @@ permissions:
   id-token: write # tunnel.yml's hosts may connect as trusted jobs
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.tier || 'standard' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.provider || 'cloudflare' }}-${{ inputs.tier || 'standard' }}
   cancel-in-progress: true
 
 jobs:
@@ -33,5 +39,6 @@ jobs:
     with:
       kinds: '["paired"]'
       mode: bench
+      provider: ${{ inputs.provider || 'cloudflare' }}
       tier: ${{ inputs.tier || 'standard' }}
       synthetic-gib: ${{ inputs.synthetic-gib || '10' }}
