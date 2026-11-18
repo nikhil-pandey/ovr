@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7](https://github.com/nikhil-pandey/ovr/compare/v0.2.6...v0.2.7) - 2026-11-18
+
+### Added
+
+- add Tailcat as a persistent tunnel provider ([#21](https://github.com/nikhil-pandey/ovr/pull/21))
+
 ## [0.2.6](https://github.com/nikhil-pandey/ovr/compare/v0.2.5...v0.2.6) - 2026-11-17
 
 ### Other
