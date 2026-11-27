@@ -99,6 +99,21 @@ pub struct Cleaned {
     pub kept: Vec<String>,
 }
 
+/// What was removed, as in `removed 1 checkout, 2 runs, 0 agents; freed 1.5 GiB`.
+impl std::fmt::Display for Cleaned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = |n: u64, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+        write!(
+            f,
+            "removed {}, {}, {}; freed {}",
+            count(self.checkouts, "checkout"),
+            count(self.runs, "run"),
+            count(self.agents, "agent"),
+            crate::format_bytes(self.bytes)
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunInfo {
     pub run: u64,
@@ -244,8 +259,8 @@ pub enum Op {
     Tunnels,
     /// Close the tunnel from `provider` and delete what `ovrd` created there.
     CloseTunnel { provider: Provider },
-    /// Remove every checkout and finished run on this machine, and downloaded and uploaded agents of other versions.
-    Clean,
+    /// Remove agents downloaded for other versions.
+    CleanDownloads,
     /// Trust workloads matching `rule`, as in `github:OWNER/REPO`, to dial in without pairing; without one, list the
     /// rules.
     Trust { rule: Option<String> },
@@ -275,7 +290,11 @@ pub enum Response {
         tunnels: Vec<TunnelStatus>,
     },
     TunnelClosed,
-    Cleaned(Cleaned),
+    /// How many downloaded agents were removed, and the bytes they held.
+    DownloadsCleaned {
+        agents: u64,
+        bytes: u64,
+    },
     /// The trust rules, this initiator's fingerprint, and the address trusted workloads should dial.
     Trust {
         rules: Vec<String>,

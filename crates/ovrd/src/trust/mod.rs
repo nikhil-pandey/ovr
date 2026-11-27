@@ -119,7 +119,7 @@ impl FromStr for Federation {
         let initiator = initiator.to_ascii_lowercase();
         if initiator.len() != 64 || !initiator.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(format!(
-                "{initiator:?} is not an initiator fingerprint; `ovrd trust` prints it"
+                "{initiator:?} is not an initiator fingerprint; `ovr trust` prints it"
             ));
         }
         Ok(Self {
@@ -273,7 +273,7 @@ impl Trust {
                         claims.repository
                     )),
                     github::Admission::No => Err(format!(
-                        "this initiator does not trust {}; run `ovrd trust github:{}` there",
+                        "this initiator does not trust {}; run `ovr trust github:{}` there",
                         claims.repository, claims.repository
                     )),
                 }

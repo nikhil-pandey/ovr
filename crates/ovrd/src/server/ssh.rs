@@ -255,7 +255,7 @@ async fn install(host: &str) -> Result<(), Error> {
     let uname = ssh_output(host, "uname -sm").await?;
     let target = target::from_uname(&uname).ok_or_else(|| {
         Error::Host(format!(
-            "{host} runs {}, which ovr cannot reach over SSH; dial in instead with `ovrd pair`",
+            "{host} runs {}, which ovr cannot reach over SSH; dial in instead with `ovr pair`",
             uname.trim()
         ))
     })?;

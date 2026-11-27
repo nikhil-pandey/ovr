@@ -107,7 +107,7 @@ where
         .unwrap_or_else(PoisonError::into_inner)
         .redeem(|code| proof.verify(code, &request.mac));
     let Some(code) = code else {
-        let message = "the pairing code is wrong or has expired; run `ovrd pair` again".to_owned();
+        let message = "the pairing code is wrong or has expired; run `ovr pair` again".to_owned();
         stream
             .send(Frame::json(FrameKind::Error, &Failure { message })?)
             .await?;
@@ -149,7 +149,7 @@ where
         .find(|host| host.fingerprint == fingerprint);
     let refusal = match &paired {
         None => Some(
-            "this host is not paired with the initiator; pair again with `ovrd pair`".to_owned(),
+            "this host is not paired with the initiator; pair again with `ovr pair`".to_owned(),
         ),
         Some(_) if banner.protocol != PROTOCOL_VERSION => Some(format!(
             "ovrd {} on this host is incompatible with the initiator; install the initiator's version",

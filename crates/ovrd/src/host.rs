@@ -198,7 +198,7 @@ async fn move_to(addr: &Addr) -> Result<(), Error> {
 fn paired(dir: &std::path::Path) -> Result<Initiator, Error> {
     state::initiator(dir)?.ok_or_else(|| {
         Error::Invalid(
-            "not paired; run the `ovrd connect ADDR CODE` command `ovrd pair` prints".to_owned(),
+            "not paired; run the `ovrd connect ADDR CODE` command `ovr pair` prints".to_owned(),
         )
     })
 }
@@ -292,7 +292,7 @@ async fn attach(
         return Err(Error::Pairing(match workload {
             Some(_) => format!(
                 "{addr} presented a different identity than the fingerprint this host was given; check it with \
-                 `ovrd trust` on the initiator"
+                 `ovr trust` on the initiator"
             ),
             None => format!(
                 "{addr} presented a different identity than when paired; pair again if the initiator was reset"

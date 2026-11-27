@@ -1,12 +1,21 @@
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser};
 use ovrd::{Cli, Command};
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let service = matches!(cli.command, Some(Command::Connect { service: true, .. }));
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // Bare `ovrd` prints help, as `ovrd --help` does.
+        Err(err) if err.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            let _ = Cli::command().print_help();
+            return ExitCode::SUCCESS;
+        }
+        Err(err) => err.exit(),
+    };
+    let service = matches!(cli.command, Command::Connect { service: true, .. });
     if let Err(err) = logging(service) {
         eprintln!("cannot set up logging: {err}");
         return ExitCode::FAILURE;

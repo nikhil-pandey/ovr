@@ -18,7 +18,7 @@ const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 const LEN: usize = 8;
 
-/// Codes issued by `ovrd pair` and not yet used.
+/// Codes issued by `ovr pair` and not yet used.
 #[derive(Default)]
 pub struct Codes {
     issued: Vec<(String, Instant)>,

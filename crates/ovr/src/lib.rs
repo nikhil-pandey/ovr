@@ -2,6 +2,7 @@
 
 mod daemon;
 mod fetch;
+mod manage;
 mod session;
 mod snapshot;
 mod terminal;
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 use ovr_proto::frame::Resumed;
 use ovr_proto::ipc::ClientStream;
-use ovr_proto::msg::{Attach, Cleaned, Enter, Exec, Op, Resize, Response, RunInfo, RunState};
+use ovr_proto::msg::{Attach, Enter, Exec, Op, Provider, Resize, Response, RunInfo, RunState};
 use ovr_proto::{Frame, FrameKind};
 
 use crate::session::{End, Io, Mode, Position, Signal, Stream};
@@ -43,16 +44,61 @@ Exits 0 when everything was fetched, 1 when something could not be, and 125 when
 
 const EXAMPLES: &str = "\
 Examples:
-  ovr bigbox -- cargo test          sync this working tree to bigbox, run there, exit with its code
-  ovr bigbox                        a login shell in the synced checkout
-  ovr -d bigbox -- cargo build      in the background; prints the run number for logs, attach, and kill
-  ovr -n bigbox -- cat Cargo.lock   without syncing: in the checkout as bigbox has it
-  ovr get bigbox target/doc out/    copy files back: out/doc/..., skipping what is unchanged
-  ovr ps                            runs on every connected host
+  ovr bigbox -- cargo test                  sync this working tree to bigbox, run there, exit with its code
+  ovr bigbox                                a login shell in the synced checkout
+  ovr --detach bigbox -- cargo build        in the background; prints the run number for logs, attach, and kill
+  ovr --no-sync bigbox -- cat Cargo.lock    without syncing: in the checkout as bigbox has it
+  ovr get bigbox target/doc out/            copy files back: out/doc/..., skipping what is unchanged
+  ovr ps                                    runs on every connected host
 
 Commands run in the same directory relative to the repository root as here. Outside a Git repository
 nothing is synced, and commands run in the host's base directory: its home, or a trusted CI job's workspace.
-HOST is an SSH destination, or a host that dialed in: see `ovrd pair` and `ovrd trust`.";
+HOST is an SSH destination, or a host that dialed in: see `ovr pair` and `ovr trust`.";
+
+const HOSTS_HELP: &str = "\
+Example:
+  ovr hosts    NAME, STATE, and PLATFORM of each paired host, and of trusted hosts while connected";
+
+const PS_HELP: &str = "\
+Examples:
+  ovr ps           runs on every host with an open connection
+  ovr ps bigbox    runs on bigbox, connecting to it if needed";
+
+const ATTACH_HELP: &str = "\
+Example:
+  ovr attach bigbox 12    take run 12's terminal back, as if it had been started here";
+
+const LOGS_HELP: &str = "\
+Example:
+  ovr logs bigbox 12 && deploy    follow run 12's output, and exit with its code";
+
+const KILL_HELP: &str = "\
+Example:
+  ovr kill bigbox 12    kill run 12 and every process it started";
+
+const CLEAN_HELP: &str = "\
+Examples:
+  ovr clean bigbox winbox    this initiator's checkouts and finished runs on bigbox and winbox
+  ovr clean                  agents downloaded here for other versions
+  ovr clean --all            both, on every host with an open connection
+
+On a host, `ovrd clean` removes every initiator's checkouts and finished runs.";
+
+const PAIR_HELP: &str = "\
+Examples:
+  ovr pair               prints `ovrd connect ADDR CODE` to run on the host within 10 minutes
+  ovr pair cloudflare    the same, through a Cloudflare quick tunnel; or devtunnel, or tailcat";
+
+const TRUST_HELP: &str = "\
+Examples:
+  ovr trust github:nikhil-pandey/ovr    trust the jobs of one repository
+  ovr trust github:nikhil-pandey       trust the jobs of every repository of an owner
+  ovr trust                            list the rules, and how a job dials in";
+
+const TUNNEL_HELP: &str = "\
+Examples:
+  ovr tunnel                     open tunnels, and the command that moves a paired host to each
+  ovr tunnel close cloudflare    close a tunnel and delete what was created for it";
 
 /// Longest wait between attempts to reach a host again.
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
@@ -62,6 +108,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 #[command(
     name = "ovr",
     version,
+    arg_required_else_help = true,
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
     after_help = EXAMPLES
@@ -76,19 +123,39 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// List dialed-in hosts.
+    /// List paired hosts, and trusted hosts while connected.
+    #[command(after_help = HOSTS_HELP)]
     Hosts,
     /// List this initiator's runs: running, and finished in the last 7 days.
+    #[command(after_help = PS_HELP)]
     Ps {
-        /// Only this host; otherwise every host with an open connection.
+        /// SSH destination or dialed-in host name; otherwise every host with an open connection.
         host: Option<String>,
     },
     /// Reconnect this terminal to a run, as if it had been started here.
-    Attach { host: String, run: u64 },
+    #[command(after_help = ATTACH_HELP)]
+    Attach {
+        /// SSH destination or dialed-in host name.
+        host: String,
+        /// Run number, as `ovr -d` prints and `ovr ps` lists.
+        run: u64,
+    },
     /// Print a run's output, following it until the run ends.
-    Logs { host: String, run: u64 },
+    #[command(after_help = LOGS_HELP)]
+    Logs {
+        /// SSH destination or dialed-in host name.
+        host: String,
+        /// Run number, as `ovr -d` prints and `ovr ps` lists.
+        run: u64,
+    },
     /// Kill a run's whole process tree.
-    Kill { host: String, run: u64 },
+    #[command(after_help = KILL_HELP)]
+    Kill {
+        /// SSH destination or dialed-in host name.
+        host: String,
+        /// Run number, as `ovr -d` prints and `ovr ps` lists.
+        run: u64,
+    },
     /// Copy files and trees from HOST to DEST on this machine, skipping files already there.
     #[command(after_help = GET_HELP)]
     Get {
@@ -100,24 +167,66 @@ pub enum Command {
         /// Where they go on this machine.
         dest: String,
     },
-    /// Remove checkouts and finished runs, keeping those in use, and agents of other versions.
+    /// Remove this initiator's checkouts and finished runs from hosts, keeping those in use.
+    ///
+    /// Without HOST, remove what this machine keeps as an initiator: agents downloaded for other versions.
+    #[command(after_help = CLEAN_HELP)]
     Clean {
-        /// Remove this initiator's from these hosts; otherwise everyone's from this machine.
+        /// SSH destination or dialed-in host name.
+        #[arg(value_name = "HOST")]
         hosts: Vec<String>,
-        /// This machine, and this initiator's from every host with an open connection.
+        /// Clean this machine, and yours on every host with an open connection.
         #[arg(long, conflicts_with = "hosts")]
         all: bool,
+    },
+    /// Print a one-shot command for a host to dial in and pair.
+    ///
+    /// The host runs the printed `ovrd connect ADDR CODE` within 10 minutes. With PROVIDER, ADDR is a tunnel from
+    /// that provider, opened unless one is open; it stays open until `ovr tunnel close PROVIDER`.
+    #[command(after_help = PAIR_HELP)]
+    Pair {
+        /// `cloudflare`, `devtunnel` or `tailcat`: open a tunnel with that provider's CLI unless one is open.
+        provider: Option<Provider>,
+    },
+    /// Trust workloads matching RULE to dial in without pairing; without RULE, list the rules.
+    ///
+    /// Trusted workloads, such as the GitHub Actions jobs of a repository, dial in with a token from their identity
+    /// provider instead of a pairing code. Either way, print what a trusted workload needs to dial in.
+    #[command(after_help = TRUST_HELP)]
+    Trust {
+        /// `github:OWNER/REPO`, or `github:OWNER` for every repository of OWNER.
+        rule: Option<String>,
+    },
+    /// Stop trusting workloads matching RULE.
+    Untrust {
+        /// A rule as `ovr trust` lists it.
+        rule: String,
+    },
+    /// List open tunnels and the command that points a paired host at each.
+    #[command(after_help = TUNNEL_HELP)]
+    Tunnel {
+        #[command(subcommand)]
+        command: Option<TunnelCommand>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TunnelCommand {
+    /// Close the tunnel `ovr pair PROVIDER` opened, and delete what was created for it at the provider.
+    Close {
+        /// `cloudflare`, `devtunnel` or `tailcat`.
+        provider: Provider,
     },
 }
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
     /// Start the command in the background and print its run number.
-    #[arg(short = 'd')]
+    #[arg(short = 'd', long)]
     pub detach: bool,
 
     /// Do not sync: run in the checkout as the host has it, or in the host's base directory when it has none yet.
-    #[arg(short = 'n')]
+    #[arg(short = 'n', long)]
     pub no_sync: bool,
 
     /// SSH destination or dialed-in host name.
@@ -203,6 +312,16 @@ pub async fn run(mut cli: Cli) -> Result<i32, Error> {
             Ok(0)
         }
         (Some(Command::Clean { hosts, all }), _) => clean(hosts, all).await,
+        (Some(Command::Pair { provider }), _) => manage::pair(provider).await,
+        (Some(Command::Trust { rule }), _) => manage::trust(Op::Trust { rule }).await,
+        (Some(Command::Untrust { rule }), _) => manage::trust(Op::Untrust { rule }).await,
+        (Some(Command::Tunnel { command: None }), _) => manage::tunnels().await,
+        (
+            Some(Command::Tunnel {
+                command: Some(TunnelCommand::Close { provider }),
+            }),
+            _,
+        ) => manage::close_tunnel(provider).await,
         (
             Some(Command::Get {
                 host,
@@ -522,8 +641,12 @@ fn age(seconds: u64) -> String {
 async fn clean(hosts: Vec<String>, all: bool) -> Result<i32, Error> {
     let mut code = 0;
     if all || hosts.is_empty() {
-        match daemon::request(Op::Clean).await? {
-            (_, Response::Cleaned(cleaned)) => report("this machine", &cleaned),
+        match daemon::request(Op::CleanDownloads).await? {
+            (_, Response::DownloadsCleaned { agents, bytes }) => println!(
+                "this machine: removed {agents} downloaded agent{}; freed {}",
+                if agents == 1 { "" } else { "s" },
+                ovr_proto::format_bytes(bytes)
+            ),
             (_, other) => {
                 eprintln!("ovr: this machine: {}", daemon::unexpected(other));
                 code = FAILURE;
@@ -544,7 +667,10 @@ async fn clean(hosts: Vec<String>, all: bool) -> Result<i32, Error> {
         match cleaned.await {
             Ok(cleaned) => {
                 snapshot::forget_host(&cwd, &host).await;
-                report(&host, &cleaned);
+                println!("{host}: {cleaned}");
+                for checkout in &cleaned.kept {
+                    println!("{host}: kept {checkout}: in use");
+                }
             }
             Err(err) => {
                 eprintln!("ovr: {host}: {err}");
@@ -555,44 +681,20 @@ async fn clean(hosts: Vec<String>, all: bool) -> Result<i32, Error> {
     Ok(code)
 }
 
-fn report(target: &str, cleaned: &Cleaned) {
-    let count = |n: u64, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
-    println!(
-        "{target}: removed {}, {}, {}; freed {}",
-        count(cleaned.checkouts, "checkout"),
-        count(cleaned.runs, "run"),
-        count(cleaned.agents, "agent"),
-        bytes(cleaned.bytes)
-    );
-    for checkout in &cleaned.kept {
-        println!("{target}: kept {checkout}: in use");
-    }
-}
-
-#[allow(clippy::cast_precision_loss)]
-pub(crate) fn bytes(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64 / 1024.0;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
-}
-
 async fn hosts() -> Result<i32, Error> {
     let hosts = match daemon::request(Op::Hosts).await? {
         (_, Response::Hosts { hosts }) => hosts,
         (_, other) => return Err(daemon::unexpected(other)),
     };
     if hosts.is_empty() {
-        eprintln!("no dialed-in hosts; run `ovrd pair` to add one");
+        eprintln!("no dialed-in hosts; run `ovr pair` to add one");
+        return Ok(0);
     }
-    let width = hosts.iter().map(|host| host.name.len()).max().unwrap_or(0);
+    let width = hosts
+        .iter()
+        .map(|host| host.name.len())
+        .fold("NAME".len(), usize::max);
+    println!("{:width$}  STATE    PLATFORM", "NAME");
     for host in hosts {
         match (host.platform, host.about) {
             (Some(platform), about) => println!(
@@ -602,7 +704,7 @@ async fn hosts() -> Result<i32, Error> {
                 platform.arch,
                 about.map_or_default(|about| format!("  {about}"))
             ),
-            (None, _) => println!("{:width$}  offline", host.name),
+            (None, _) => println!("{:width$}  offline  -", host.name),
         }
     }
     Ok(0)

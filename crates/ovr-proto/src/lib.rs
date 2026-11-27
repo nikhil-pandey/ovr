@@ -30,6 +30,23 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
+/// `bytes` for people: `512 B`, `1.5 KiB`, `12.3 GiB`.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("unknown frame kind {0}")]

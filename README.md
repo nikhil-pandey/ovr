@@ -33,8 +33,8 @@ Any SSH host works as is; `ovr` uploads its agent on first use:
 ```sh
 ovr user@bigbox -- cargo build --release   # run against your working tree, exit with its code
 ovr bigbox                                 # a login shell in the synced checkout
-ovr -d bigbox -- cargo test                # in the background; prints the run number
-ovr -n bigbox -- cat Cargo.lock            # without syncing: the checkout as bigbox has it
+ovr --detach bigbox -- cargo test          # in the background (-d); prints the run number
+ovr --no-sync bigbox -- cat Cargo.lock     # without syncing (-n): the checkout as bigbox has it
 ovr ps                                     # runs on every connected host
 ovr logs bigbox 12                         # follow a run's output
 ovr attach bigbox 12                       # take a run's terminal back
@@ -42,10 +42,10 @@ ovr kill bigbox 12
 ovr get bigbox target/doc out/             # copy files back: out/doc/..., skipping unchanged ones
 ```
 
-Hosts you cannot SSH to dial in instead. Pair one by running the command `ovrd pair` prints on it:
+Hosts you cannot SSH to dial in instead. Pair one by running the command `ovr pair` prints on it:
 
 ```sh
-ovrd pair               # on your machine: prints `ovrd connect ADDR CODE`
+ovr pair                # on your machine: prints `ovrd connect ADDR CODE`
 ovrd connect ADDR CODE  # on the host: pairs, and serves from then on, at login too
 ovr hosts               # dialed-in hosts, online or not
 ovr winbox -- dotnet build
@@ -54,15 +54,16 @@ ovr winbox -- dotnet build
 When the host cannot reach your machine, pair through a tunnel; Cloudflare's needs no account:
 
 ```sh
-ovrd pair cloudflare    # or devtunnel or tailcat
-ovrd tunnel             # open tunnels; `ovrd tunnel close cloudflare` closes one
+ovr pair cloudflare     # or devtunnel or tailcat
+ovr tunnel              # open tunnels; `ovr tunnel close cloudflare` closes one
 ```
 
 GitHub Actions jobs of repositories you trust dial in without pairing, through
 [the action](docs/DESIGN.md#trusted-workloads):
 
 ```sh
-ovrd trust github:OWNER/REPO   # on your machine: prints the variables and the step to add
+ovr trust github:OWNER/REPO    # on your machine: prints the variables and the step to add
+ovr untrust github:OWNER/REPO  # stop trusting them
 ovr OWNER/REPO/WORKFLOW/RUN/JOB -- make test
 ```
 
@@ -70,8 +71,8 @@ Remove checkouts and finished runs, keeping anything in use:
 
 ```sh
 ovr clean bigbox        # yours on bigbox
-ovr clean               # everything on this machine
-ovr clean --all         # this machine, and yours on every connected host
+ovr clean --all         # yours on every connected host, and old agents downloaded here
+ovrd clean              # on a host: every initiator's
 ```
 
 ## License

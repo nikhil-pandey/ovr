@@ -268,12 +268,12 @@ def cmd_pair(args: argparse.Namespace) -> None:
         )
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=True)
-        # One after another: `ovrd pair` opens the tunnel once and reuses it.
+        # One after another: `ovr pair` opens the tunnel once and reuses it.
         for host in (host for host in HOSTS if host.endswith("-paired")):
-            printed = await arun(["ovrd", "pair", PROVIDER], private_output=True)
+            printed = await arun(["ovr", "pair", PROVIDER], private_output=True)
             found = re.search(r"^\s*ovrd connect (\S+) (\S+)\s*$", printed, re.MULTILINE)
             if not found:
-                raise SystemExit("ovrd pair printed no recognizable connect command")
+                raise SystemExit("ovr pair printed no recognizable connect command")
             addr, code = found.groups()
             say("initiator", f"pairing {tag(host)} through {addr}")
             await asyncio.to_thread(
@@ -297,11 +297,11 @@ def cmd_pair(args: argparse.Namespace) -> None:
             # Trusted jobs need no pairing, and the address and fingerprint they dial are not secret. Trusting before
             # any pairing would leave the tunnel unopened, so it opens one first.
             if "paired" not in KINDS:
-                await arun(["ovrd", "pair", PROVIDER], private_output=True)
-            printed = await arun(["ovrd", "trust", f"github:{os.environ['GITHUB_REPOSITORY']}"])
+                await arun(["ovr", "pair", PROVIDER], private_output=True)
+            printed = await arun(["ovr", "trust", f"github:{os.environ['GITHUB_REPOSITORY']}"])
             values = dict(re.findall(r"gh variable set (OVR_ADDR|OVR_INITIATOR) .*--body (\S+)", printed))
             if len(values) != 2:
-                raise SystemExit(f"ovrd trust printed no address and fingerprint:\n{printed}")
+                raise SystemExit(f"ovr trust printed no address and fingerprint:\n{printed}")
             (out / "trust").write_text(f"{values['OVR_ADDR']} {values['OVR_INITIATOR']}\n")
             say("initiator", f"trusting this repository's jobs through {values['OVR_ADDR']}")
 

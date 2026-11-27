@@ -23,7 +23,7 @@ pub struct Initiator {
     pub fingerprint: String,
 }
 
-/// A tunnel the initiator keeps open, as recorded by `ovrd pair PROVIDER`.
+/// A tunnel the initiator keeps open, as recorded by `ovr pair PROVIDER`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tunnel {
     pub provider: Provider,

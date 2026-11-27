@@ -39,7 +39,7 @@ Constraints that shape the design:
 ## Principles
 
 - **No configuration.** No project file and no user file. The only state is what `ssh` already has, the pairing
-  and tunnel records created by `ovrd pair`, and the trust rules added by `ovrd trust`. A few environment variables
+  and tunnel records created by `ovr pair`, and the trust rules added by `ovr trust`. A few environment variables
   move where files live (see [Files](#files)); none is needed.
 - **No environment forwarding.** The remote command sees the remote user's login environment, nothing from the
   initiator. Credentials never leave the machine by accident.
@@ -69,8 +69,11 @@ commands.
 
 | Binary | Where it runs | Job |
 |---|---|---|
-| `ovr` | initiator | The CLI. Snapshots the tree and hands the run to the local `ovrd` over a Unix socket (named pipe on Windows). Starts `ovrd` on demand if it is not running. |
-| `ovrd` | initiator **and** every host | The server. On the initiator it owns connections to hosts and runs jobs through them. On a host it is the agent: kept running over an SSH session, or dialing out to the initiator. |
+| `ovr` | initiator | The CLI: every command you type on your own machine. Snapshots the tree and hands the run to the local `ovrd` over a Unix socket (named pipe on Windows). Starts `ovrd serve` on demand if it is not running. |
+| `ovrd` | initiator **and** every host | The server. On the initiator it owns connections to hosts and runs jobs through them. On a host it is the agent: kept running over an SSH session, or dialing out to the initiator; it is also every command you type on a host. |
+
+The split is by role: `ovr` is everything you type on your own machine, `ovrd` everything you type on a host. A
+command for one role never starts the other role's server.
 
 The CLI knows nothing about transports. The server knows nothing about Git working trees. Hosts of both kinds look
 identical above the transport layer.
@@ -78,27 +81,37 @@ identical above the transport layer.
 ## Command surface
 
 ```
-ovr [-d] [-n] HOST [-- CMD...]
-                            run CMD on HOST (no CMD: login shell in the synced checkout); -d: in the background;
-                            -n: without syncing, in the checkout as the host has it
+# On your machine, the initiator
+ovr [-d|--detach] [-n|--no-sync] HOST [-- CMD...]
+                            run CMD on HOST (no CMD: login shell in the synced checkout); --detach: in the
+                            background; --no-sync: without syncing, in the checkout as the host has it
 ovr hosts                   list dialed-in hosts, their OS/arch, and a trusted host's run
 ovr ps [HOST]               list runs: running, and finished in the last 7 days
 ovr attach HOST RUN         reconnect a terminal to a run, as if it had been started here
 ovr logs HOST RUN           print a run's output, following it until the run ends
 ovr kill HOST RUN           kill a run's whole process tree
 ovr get HOST SRC... DEST    copy files and trees from HOST to DEST on this machine; see Copying files back
-ovr clean [HOST...|--all]   remove checkouts and finished runs not in use: this machine's, or yours on HOSTs
+ovr clean [HOST...|--all]   remove yours not in use on HOSTs; without HOST, agents downloaded here for other versions
+ovr pair [PROVIDER]         print a one-shot command for a host that must dial in; PROVIDER opens a tunnel first
+ovr tunnel                  list open tunnels and the command that points a paired host at each
+ovr tunnel close PROVIDER   close a tunnel that `ovr pair` opened
+ovr trust [RULE]            trust workloads matching RULE to dial in without pairing; list the rules and how to dial
+ovr untrust RULE            stop trusting workloads matching RULE
 
-ovrd                        the initiator server; started automatically by ovr, or by launchd/systemd --user
-ovrd pair [PROVIDER]        print a one-shot command for a host that must dial in; PROVIDER opens a tunnel first
-ovrd tunnel                 list open tunnels and the command that points a paired host at each
-ovrd tunnel close PROVIDER  close a tunnel that `ovrd pair` opened
-ovrd trust [RULE]           trust workloads matching RULE to dial in without pairing; list the rules and how to dial
-ovrd untrust RULE           stop trusting workloads matching RULE
-ovrd connect ADDR CODE      on a host: pair with the initiator at ADDR and keep serving it (printed by `pair`)
-ovrd connect [ADDR]         on a host: keep serving the initiator it paired with, at ADDR from now on if given
+# On a host
+ovrd connect ADDR CODE      pair with the initiator at ADDR and keep serving it (printed by `ovr pair`)
+ovrd connect [ADDR]         keep serving the initiator it paired with, at ADDR from now on if given
 ovrd connect ADDR github:FP in a GitHub Actions job: serve the initiator with fingerprint FP while the job runs
+ovrd clean                  remove every initiator's checkouts and finished runs not in use on this machine
+
+# Internal, hidden from help
+ovrd serve                  the initiator server; started by `ovr`
+ovrd agent                  the agent over SSH; started by the initiator server
+ovrd keep DIR               a run's keeper; started by the agent
 ```
+
+`ovr` and `ovrd` without arguments print their help, and their `--help` and that of most subcommands end with
+examples.
 
 - `HOST` is a dialed-in host's name (its hostname, as shown by `ovr hosts`) or an SSH destination: an alias from
   `~/.ssh/config`, `user@hostname`, or a hostname. Dialed-in names win if both match. Subcommand names win over host
@@ -108,23 +121,27 @@ ovrd connect ADDR github:FP in a GitHub Actions job: serve the initiator with fi
   else after `HOST` is an error that suggests `--`.
 - The remote command runs in the same directory relative to the repository root as your current directory, so
   `cd crates/engine && ovr box -- cargo test` does what you expect.
-- `-n` runs without syncing: no snapshot, no pack, no reset, no collection. The command runs in this repository's
-  checkout as the host has it, including whatever builds left there and tracked files the next sync would restore,
-  so `ovr -n box -- cat Cargo.lock` shows what the build rewrote. It does not lock the checkout against syncs from
-  other terminals. When the current directory is not in that checkout, the run fails and says to sync first.
-- Outside a Git repository there is nothing to sync, so `ovr HOST -- CMD` behaves as with `-n`, and the command runs
-  in the host's **base directory**: the host user's home, or the workspace of a [trusted
-  workload](#trusted-workloads). A `-n` run whose checkout the host does not have yet runs there too, after a warning
-  naming the base directory and, if any, the directory below the repository root that it does not apply there.
+- `-n` (`--no-sync`) runs without syncing: no snapshot, no pack, no reset, no collection. The command runs in this
+  repository's checkout as the host has it, including whatever builds left there and tracked files the next sync
+  would restore, so `ovr -n box -- cat Cargo.lock` shows what the build rewrote. It does not lock the checkout
+  against syncs from other terminals. When the current directory is not in that checkout, the run fails and says to
+  sync first.
+- Outside a Git repository there is nothing to sync, so `ovr HOST -- CMD` behaves as with `--no-sync`, and the
+  command runs in the host's **base directory**: the host user's home, or the workspace of a [trusted
+  workload](#trusted-workloads). A `--no-sync` run whose checkout the host does not have yet runs there too, after a
+  warning naming the base directory and, if any, the directory below the repository root that it does not apply there.
 - The remote command's exit code is returned unchanged; a command killed by a signal reports `128 + signal`.
   Failures in `ovr` itself exit with `125`, following the `docker run` convention.
-- `RUN` is the number the host gives each run, shown by `ovr ps`. `ovr -d` prints it and exits `0` once the command
-  has started. `attach` and `logs` exit with the run's code once it ends, so `ovr logs box 12 && deploy` works.
+- `RUN` is the number the host gives each run, shown by `ovr ps`. `ovr -d` (`--detach`) prints it and exits `0` once
+  the command has started. `attach` and `logs` exit with the run's code once it ends, so `ovr logs box 12 && deploy`
+  works.
 - Runs belong to the initiator that started them: `ovr ps` lists only this initiator's runs. Without `HOST` it asks
   every dialed-in host and every SSH host with an open connection.
 - `ovr clean HOST...` removes this initiator's checkouts and finished runs from each host, and agents of other
-  versions. Without `HOST` it cleans this machine: every initiator's checkouts and runs, and downloaded agents of
-  other versions. `--all` does both, for every host with an open connection. See [Cleaning up](#cleaning-up).
+  versions uploaded there. Without `HOST` it cleans what this machine keeps as an initiator: agents downloaded for
+  other versions. `--all` does both, for every host with an open connection. On a host, `ovrd clean` removes every
+  initiator's checkouts and finished runs there, and agents of other versions uploaded to it, without contacting
+  or starting an initiator server. See [Cleaning up](#cleaning-up).
 - `ovr get` exits `0` when everything was fetched, `1` when something could not be, and `125` when `ovr` itself
   fails. See [Copying files back](#copying-files-back).
 - `ADDR` is `host:port`, or a tunnel: `cloudflare:HOSTNAME`, `devtunnel:ID`, or `tailcat:ADDRESS`. `PROVIDER` is
@@ -179,7 +196,7 @@ initiator gets the same warm path. SSH's `ServerAliveInterval` probes notice a v
 For hosts that cannot accept SSH, including every Windows workstation:
 
 ```
- initiator$ ovrd pair
+ initiator$ ovr pair
  run this on the host within 10 minutes:
    ovrd connect 100.64.0.10:7420 7KQX-M4RT
 
@@ -227,7 +244,7 @@ When no network path reaches the initiator, as for a CI runner or a machine on a
 Microsoft Dev Tunnels, or `tailcat` for Tailcat.
 
 ```
- initiator$ ovrd pair cloudflare
+ initiator$ ovr pair cloudflare
  run this on the host within 10 minutes:
    ovrd connect cloudflare:quiet-river-delta.trycloudflare.com 7KQX-M4RT
 
@@ -240,10 +257,10 @@ Microsoft Dev Tunnels, or `tailcat` for Tailcat.
   stranger on the same LAN. Tunnels are therefore opened for anonymous access: no account, token, or other
   credential appears in any printed command or log, and `ovr` never handles a provider login. The initiator needs
   the provider's CLI installed, and for Dev Tunnels logged in; the host needs the CLI installed.
-- **The initiator's `ovrd` owns the tunnel.** `ovrd pair PROVIDER` opens a tunnel to `:7420` unless one for that
+- **The initiator's `ovrd` owns the tunnel.** `ovr pair PROVIDER` opens a tunnel to `:7420` unless one for that
   provider is already open, then prints the host's command with the tunnel's address. From then on `ovrd` restarts
   the provider's CLI when it exits and reopens the tunnel whenever `ovrd` starts, so the tunnel outlives the
-  terminal that asked for it. Only `ovrd tunnel close PROVIDER` closes it, which also deletes what `ovrd` created at
+  terminal that asked for it. Only `ovr tunnel close PROVIDER` closes it, which also deletes what `ovrd` created at
   the provider; if that deletion fails, the tunnel stays open. Open tunnels are recorded in the data directory as
   soon as they are created at the provider, so none is forgotten.
 - **The host's `ovrd connect` owns the forwarder.** Given a tunnel address, it starts the provider's local forwarder
@@ -257,7 +274,7 @@ Microsoft Dev Tunnels, or `tailcat` for Tailcat.
   Pairing and pinned TLS authenticate the peers.
 - **Addresses.** A Dev Tunnel keeps its ID across restarts, so paired hosts reconnect on their own; it suits hosts
   that stay. Should the provider lose it, as when it expires unused, `ovrd` creates a new one in its place. A Cloudflare quick tunnel gets a new hostname whenever it restarts, for example when the initiator
-  reboots; it suits short-lived hosts such as CI runners. `ovrd tunnel` shows each tunnel's current address with the
+  reboots; it suits short-lived hosts such as CI runners. `ovr tunnel` shows each tunnel's current address with the
   `ovrd connect ADDR` command that moves a paired host to it.
 - **CI runners.** `--foreground` serves for as long as the job runs and installs nothing. When the job ends, its
   runs end with it. A runner that should connect on every run, without a fresh code each time, is a
@@ -270,7 +287,7 @@ next, so CI runners would need a fresh code every time. Instead, the initiator c
 identity provider vouches for. GitHub Actions is the only provider so far.
 
 ```
- initiator$ ovrd trust github:nikhil-pandey/ovr
+ initiator$ ovr trust github:nikhil-pandey/ovr
  trusting github:nikhil-pandey/ovr
  ...
    gh variable set OVR_ADDR --repo nikhil-pandey/ovr --body devtunnel:quiet-river-x1y2z3
@@ -284,15 +301,15 @@ jobs:
       id-token: write
     steps:
       - if: failure() || runner.debug == '1'
-        uses: nikhil-pandey/ovr@vX.Y.Z   # as `ovrd trust` prints it
+        uses: nikhil-pandey/ovr@vX.Y.Z   # as `ovr trust` prints it
         with:
           addr: ${{ vars.OVR_ADDR }}
           initiator: ${{ vars.OVR_INITIATOR }}
           hold: 30m
 ```
 
-- **Rules.** `ovrd trust github:OWNER/REPO` trusts the jobs of one repository, and `github:OWNER` those of every
-  repository of an owner; `ovrd untrust` removes a rule. Rules live in `trust.json` in the data directory. Names
+- **Rules.** `ovr trust github:OWNER/REPO` trusts the jobs of one repository, and `github:OWNER` those of every
+  repository of an owner; `ovr untrust` removes a rule. Rules live in `trust.json` in the data directory. Names
   match without regard to case, as on GitHub, and the first token a rule admits records the owner's and
   repository's IDs, so that an account or repository created later under a released name is refused.
 - **Tokens.** On every connection, the host asks the runner for a fresh OIDC token whose audience is
@@ -357,13 +374,13 @@ jobs:
             hold: 30m
   ```
 
-  `VERSION` is the release `ovrd trust` prints. Keep only the first use to reach the runner while the job runs, or
-  only the second, gated on `failure() || runner.debug == '1'` as `ovrd trust` suggests, to connect just to debug.
+  `VERSION` is the release `ovr trust` prints. Keep only the first use to reach the runner while the job runs, or
+  only the second, gated on `failure() || runner.debug == '1'` as `ovr trust` suggests, to connect just to debug.
 - **The job's tree.** On a trusted GitHub Actions host, runs without a checkout start in the job's
   `GITHUB_WORKSPACE` instead of the home directory, so a held runner is one command from what the job left:
   `ovr OWNER/REPO/ci/57/build -- cat test-results/report.txt` from outside a repository. Paired and SSH hosts use the
   home directory, even when they happen to run on a CI runner.
-- **Reaching the initiator.** `ovrd trust` prints the open tunnel's address if there is one, the Dev Tunnel first,
+- **Reaching the initiator.** `ovr trust` prints the open tunnel's address if there is one, the Dev Tunnel first,
   then Tailcat, as both keep their addresses; a Cloudflare quick tunnel gets a new address when it restarts. Repository or
   organization variables let workflows share the address and fingerprint.
 
@@ -553,8 +570,8 @@ a failed update is shown as a warning before the command runs. Git LFS content i
 
 ### Cleaning up
 
-Checkouts stay as a warm cache until removed; finished runs go after seven days. `ovr clean` removes them sooner and
-never touches what is in use:
+Checkouts stay as a warm cache until removed; finished runs go after seven days. `ovr clean HOST` removes yours from a
+host sooner, and `ovrd clean` on a host everyone's. Neither touches what is in use:
 
 - A checkout being synced is claimed: the stream holds a shared lock on `<checkouts>/.locks/<owner>/<name>` from the
   start of a sync or an `ENTER` until its run is recorded and attached. Cleaning takes that lock exclusively without
@@ -565,8 +582,8 @@ never touches what is in use:
 - A checkout is moved into `<checkouts>/.trash` before it is deleted, so one that cannot be removed whole, such as on
   Windows while a leftover build server holds a file open, stays intact and is reported as in use. Whatever could not
   be deleted from the trash is retried by the next clean.
-- Agents uploaded over SSH for other versions are removed from `~/.cache/ovr/bin`, and on the initiator, agents
-  downloaded for other versions.
+- Agents uploaded over SSH for other versions are removed from the host's `~/.cache/ovr/bin`. On the initiator,
+  `ovr clean` without `HOST` removes agents downloaded for other versions.
 - For each host cleaned, `ovr` forgets the bases it recorded for that host in the current repository, so the next
   run sends everything without guessing first, including when some checkouts were kept because they were in use.
   Other repositories find out from the host's `WELCOME`.
@@ -674,7 +691,8 @@ disconnect, not a stop.
   one the run sent or a newer one a concurrent run had already applied; the agent logs it with the run's number. It
   is diagnostic context only: another sync may change the checkout before the command starts, and the snapshot's
   objects are not retained for replay. Logs keep the last 32 to 64 MiB of each stream; offsets count from the start
-  of the run, so a client always knows what it missed. Finished runs are removed after seven days, or by `ovr clean`.
+  of the run, so a client always knows what it missed. Finished runs are removed after seven days, or by
+  `ovr clean HOST` from the initiator or `ovrd clean` on the host.
 - **Reconnect.** When a run's stream breaks, `ovr` says so on stderr, reconnects with backoff, and sends
   `ATTACH{run, out, err}` with the byte offsets it already has; the keeper replays the rest and continues live. A
   terminal run gets the current window size. Input typed while disconnected is dropped rather than replayed late.
@@ -764,9 +782,10 @@ They are read where the files are: on a host by its `ovrd`. Set them where that 
 `ovrd connect`, which records them in the login service; as user environment variables on Windows; and for SSH hosts
 where a non-interactive `ssh HOST env` shows them. `ovr` and the local `ovrd` must see the same values.
 
-Checkouts can be deleted at any time, by hand or with `ovr clean`; the next run sends everything again. Some build tools reject paths with spaces,
-which macOS's default has, and MSBuild still trips on Windows paths beyond 260 characters; `OVR_CHECKOUTS` moves
-checkouts to a short path for those. SSH hosts keep the agent at `~/.cache/ovr/bin/`, resolved by the host's own shell
+Checkouts can be deleted at any time, by hand, with `ovr clean HOST` from the initiator, or with `ovrd clean` on the
+host; the next run sends everything again. Some build tools reject paths with spaces, which macOS's default has, and
+MSBuild still trips on Windows paths beyond 260 characters; `OVR_CHECKOUTS` moves checkouts to a short path for
+those. SSH hosts keep the agent at `~/.cache/ovr/bin/`, resolved by the host's own shell
 before `ovrd` runs.
 
 ## Implementation
@@ -787,11 +806,11 @@ before `ovrd` runs.
    Linux host, to measure bytes and latency per run.
 2. **Core.** `ovr` + `ovrd` on the initiator, agent protocol over SSH with SFTP bootstrap, delta sync, PTY and
    exit-code passthrough on Linux and macOS.
-3. **Dial-in.** `ovrd pair` / `ovrd connect`, pairing, mutual TLS, reconnect, `ovr hosts`.
+3. **Dial-in.** `ovr pair` / `ovrd connect`, pairing, mutual TLS, reconnect, `ovr hosts`.
 4. **Windows.** Windows agent (Job Objects, ConPTY, paths, Scheduled Task install) and Windows initiator.
-5. **Tunnels.** `ovrd pair PROVIDER` with Cloudflare quick tunnels, Dev Tunnels, and Tailcat, tunnel addresses and
+5. **Tunnels.** `ovr pair PROVIDER` with Cloudflare quick tunnels, Dev Tunnels, and Tailcat, tunnel addresses and
    `--foreground` for `ovrd connect`, and heartbeats on dial-in connections.
-6. **Trusted workloads.** `ovrd trust` with GitHub Actions OIDC, `ovrd connect ADDR github:FP` in the background,
+6. **Trusted workloads.** `ovr trust` with GitHub Actions OIDC, `ovrd connect ADDR github:FP` in the background,
    and the GitHub action.
 7. **Copying files back.** `ovr get` with the quick check, one zstd stream, pacing, and safe writes.
 8. **Later, only if needed.** `ovrd` on an always-on VM shared by several people's machines, sending only the new end

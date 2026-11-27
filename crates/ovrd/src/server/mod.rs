@@ -177,7 +177,7 @@ async fn handle(server: Arc<Server>, stream: ipc::ServerStream, restart: Arc<Not
                 message: err.to_string(),
             },
         },
-        Op::Clean => clean().await.unwrap_or_else(|err| Response::Failed {
+        Op::CleanDownloads => clean_downloads().unwrap_or_else(|err| Response::Failed {
             message: err.to_string(),
         }),
         Op::Trust { rule } => server
@@ -192,17 +192,10 @@ async fn handle(server: Arc<Server>, stream: ipc::ServerStream, restart: Arc<Not
     }
 }
 
-/// Cleans this machine: every initiator's checkouts and finished runs, and agents of other versions.
-async fn clean() -> Result<Response, Error> {
-    let config = crate::agent::Config::detect()?;
-    let mut cleaned =
-        tokio::task::spawn_blocking(move || crate::agent::clean::clean(&config, None))
-            .await
-            .map_err(std::io::Error::from)??;
+/// Cleans what this machine keeps as an initiator: agents downloaded for other versions.
+fn clean_downloads() -> Result<Response, Error> {
     let (agents, bytes) = ssh::clean_downloads()?;
-    cleaned.agents += agents;
-    cleaned.bytes += bytes;
-    Ok(Response::Cleaned(cleaned))
+    Ok(Response::DownloadsCleaned { agents, bytes })
 }
 
 async fn respond(
