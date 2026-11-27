@@ -279,8 +279,8 @@ For hosts that cannot accept SSH, including every Windows workstation:
 - The host is addressable by the name it paired under, which `ovrd connect` prints and `ovrd status` shows: its
   hostname, or while another paired host has that name, the first free of `NAME-2`, `NAME-3`, and so on, as in
   `ovr winbox -- dotnet test`. Pairing the same host again, as known by its key, keeps its name whatever it is
-  called now. `ovr hosts` lists it as `paired`, online with its platform and for how long, or offline and when it was last seen
-  while `ovrd` has been running.
+  called now. `ovr hosts` lists it as `paired`, online with its platform and for how long, or offline and when it was
+  last seen while `ovrd` has been running.
 - While it serves, `ovrd connect` records whether it is connected, since when, and the last failure in
   `connect.json` beside `connect.log`, and removes it when it stops; `ovrd status` shows it, and ignores a record
   left by an `ovrd connect` that no longer holds its lock.
@@ -320,8 +320,8 @@ Microsoft Dev Tunnels, or `tailcat` for Tailcat.
   pose as either side, and like whoever finds the public address can do no more than a stranger on the same LAN.
   Tunnels are therefore opened for anonymous access: no provider account, token, or other credential appears in any
   printed command or log, and `ovr` never handles a provider login. The pairing code in the printed command is a
-  secret until it is redeemed or expires; `ovrd connect` never echoes it in an error. The initiator needs the provider's CLI installed, and for
-  Dev Tunnels logged in; the host needs the CLI installed.
+  secret until it is redeemed or expires; `ovrd connect` never echoes it in an error. The initiator needs the
+  provider's CLI installed, and for Dev Tunnels logged in; the host needs the CLI installed.
 - **The initiator's `ovrd` owns the tunnel.** `ovr pair PROVIDER` opens a tunnel to `:7420` unless one for that
   provider is already open, then prints the host's command with the tunnel's address. From then on `ovrd` restarts
   the provider's CLI when it exits and reopens the tunnel whenever `ovrd` starts, once it holds `:7420`, so the
