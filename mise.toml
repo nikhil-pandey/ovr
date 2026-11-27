@@ -1,0 +1,3 @@
+[settings]
+# Use the Bazel pin already maintained in .bazelversion.
+idiomatic_version_file_enable_tools = ["bazel"]
