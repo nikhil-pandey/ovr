@@ -36,9 +36,9 @@ ovr bigbox                                 # a login shell in the synced checkou
 ovr --detach bigbox -- cargo test          # in the background (-d); prints the run number
 ovr --no-sync bigbox -- cat Cargo.lock     # without syncing (-n): the checkout as bigbox has it
 ovr ps                                     # runs on every connected host
-ovr logs bigbox 12                         # follow a run's output
-ovr attach bigbox 12                       # take a run's terminal back
-ovr kill bigbox 12
+ovr logs bigbox                            # follow the latest run's output; or name one: ovr logs bigbox 12
+ovr attach bigbox                          # take the latest running run's terminal back
+ovr kill bigbox 12 14
 ovr get bigbox target/doc out/             # copy files back: out/doc/..., skipping unchanged ones
 ```
 
@@ -47,7 +47,7 @@ Hosts you cannot SSH to dial in instead. Pair one by running the command `ovr pa
 ```sh
 ovr pair                # on your machine: prints `ovrd connect ADDR CODE`
 ovrd connect ADDR CODE  # on the host: pairs, and serves from then on, at login too
-ovr hosts               # dialed-in hosts, online or not
+ovr hosts               # every host: paired, trusted, and SSH, with state and platform
 ovr winbox -- dotnet build
 ovr unpair winbox       # forget it; it is refused from then on
 ovr status              # on your machine: fingerprint, listening address, tunnels, hosts, files

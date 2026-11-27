@@ -135,6 +135,7 @@ where
                 fingerprint: host.to_owned(),
             },
         )?;
+        server.dialed.forget_seen(&name);
     }
     let mac = pairing::Proof::initiator(initiator, host).sign(&code);
     stream

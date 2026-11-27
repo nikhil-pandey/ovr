@@ -261,10 +261,8 @@ pub struct Request {
 pub enum Op {
     /// Open a stream to `host`'s agent. After [`Response::Opened`] the socket carries it verbatim.
     Open { host: String },
-    /// List paired hosts.
+    /// List paired hosts, and trusted and SSH hosts while connected.
     Hosts,
-    /// List hosts with an open connection: dialed-in hosts that are online and SSH hosts in use.
-    Connected,
     /// Issue a pairing code, for an address through a tunnel from `tunnel` if given, which is opened first.
     Pair { tunnel: Option<Provider> },
     /// Forget the paired host `host` and close its connection; it is refused when it reconnects.
@@ -292,11 +290,9 @@ pub enum Response {
     Opened {
         initiator: String,
     },
+    /// Sorted by kind, then name.
     Hosts {
         hosts: Vec<HostStatus>,
-    },
-    Connected {
-        hosts: Vec<String>,
     },
     Pair {
         addr: String,
@@ -329,13 +325,8 @@ pub enum Response {
         listening: Option<String>,
         tunnels: Vec<TunnelStatus>,
         rules: Vec<String>,
-        /// Paired hosts, and how many of them are connected.
-        paired: usize,
-        online: usize,
-        /// Trusted workloads connected now.
-        trusted_online: usize,
-        /// SSH hosts with an open connection.
-        ssh_connected: usize,
+        /// As [`Response::Hosts`] lists them.
+        hosts: Vec<HostStatus>,
         /// The data, cache, and state directories, and `ovrd.log`.
         paths: Vec<Location>,
     },
@@ -380,11 +371,38 @@ impl std::fmt::Display for Location {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostStatus {
     pub name: String,
+    pub kind: HostKind,
     /// Present while the host is connected.
     pub platform: Option<Platform>,
+    /// Seconds since the Unix epoch: when the host connected, or for an offline paired host, when it was last
+    /// connected, if since `ovrd` started.
+    pub since: Option<u64>,
     /// What a trusted host serves, such as its workflow run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub about: Option<String>,
+}
+
+/// How the initiator reaches a host. Ordered as `ovr hosts` lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostKind {
+    /// Dials in, paired with a code.
+    Paired,
+    /// Dials in with a token a trust rule admits.
+    Trusted,
+    /// Reached over SSH.
+    Ssh,
+}
+
+/// As `ovr hosts` lists it: `paired`, `trusted`, or `ssh`.
+impl std::fmt::Display for HostKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Paired => "paired",
+            Self::Trusted => "trusted",
+            Self::Ssh => "ssh",
+        })
+    }
 }
 
 /// A tunnel provider, whose CLI `ovrd` runs to reach the initiator from networks that cannot.

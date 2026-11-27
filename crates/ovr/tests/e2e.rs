@@ -492,11 +492,13 @@ fn runs_in_the_foreground_and_the_background() -> Result {
     );
 
     assert_eq!(world.run(&["kill", "box", &run])?.status.code(), Some(0));
-    let logs = world.run(&["logs", "box", &run])?;
+    // Without RUN, the latest run.
+    let logs = world.run(&["logs", "box"])?;
     assert_eq!(
         (logs.status.code(), text(&logs.stdout).as_str()),
         (Some(128 + 9), "begun\n")
     );
+    assert!(text(&logs.stderr).contains(&format!("ovr: run {run} on box")));
     let ps = text(&world.run(&["ps"])?.stdout);
     assert_eq!(row(&ps, "sleep 30"), Some((run, "exited 137".to_owned())));
     Ok(())

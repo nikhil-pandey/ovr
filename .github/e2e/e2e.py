@@ -653,15 +653,15 @@ def cmd_hosts(args: argparse.Namespace) -> None:
         hosts = {}
         for line in listing.splitlines():
             parts = line.split()
-            if len(parts) < 3 or parts[1] != "online":
+            if len(parts) < 4 or parts[2] != "online":
                 continue
-            name, os_name = parts[0], parts[2].split("/")[0]
-            if name.startswith(f"{job}/"):
+            name, kind, os_name = parts[0], parts[1], parts[3].split("/")[0]
+            if kind == "trusted" and name.startswith(f"{job}/"):
                 if not line.endswith(f"/actions/runs/{os.environ['GITHUB_RUN_ID']}"):
                     raise SystemExit(f"{name} does not show this run:\n{listing}")
                 # A trusted job names itself after its OS; any other name means it dialed in twice.
                 hosts[f"{os_name}-trusted" if name == f"{job}/{os_name}" else name] = name
-            elif "/" not in name:
+            elif kind == "paired":
                 hosts[f"{os_name}-paired"] = name
         if extra := set(hosts) - set(HOSTS):
             raise SystemExit(f"unexpected hosts {', '.join(sorted(extra))}:\n{listing}")

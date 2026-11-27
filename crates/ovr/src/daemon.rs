@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use ovr_proto::frame::{self, Resumed};
 use ovr_proto::ipc::{self, ClientStream};
-use ovr_proto::msg::{Op, Request, Response};
+use ovr_proto::msg::{HostStatus, Op, Request, Response};
 use ovr_proto::{Frame, FrameKind, VERSION};
 
 use crate::Error;
@@ -82,16 +82,30 @@ pub async fn open(host: &str) -> Result<(Resumed<ClientStream>, String), Error> 
     }
 }
 
+/// Paired hosts, and trusted and SSH hosts while connected, as `ovr hosts` lists them.
+///
+/// # Errors
+///
+/// Returns an error when `ovrd` cannot be reached.
+pub async fn hosts() -> Result<Vec<HostStatus>, Error> {
+    match request(Op::Hosts).await? {
+        (_, Response::Hosts { hosts }) => Ok(hosts),
+        (_, other) => Err(unexpected(other)),
+    }
+}
+
 /// Hosts with an open connection.
 ///
 /// # Errors
 ///
 /// Returns an error when `ovrd` cannot be reached.
 pub async fn connected() -> Result<Vec<String>, Error> {
-    match request(Op::Connected).await? {
-        (_, Response::Connected { hosts }) => Ok(hosts),
-        (_, other) => Err(unexpected(other)),
-    }
+    let hosts = hosts().await?;
+    Ok(hosts
+        .into_iter()
+        .filter(|host| host.platform.is_some())
+        .map(|host| host.name)
+        .collect())
 }
 
 /// The error for a response other than the one asked for: `ovrd`'s failure, or a confused `ovrd`.

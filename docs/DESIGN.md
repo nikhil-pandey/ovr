@@ -85,11 +85,11 @@ identical above the transport layer.
 ovr [-d|--detach] [-n|--no-sync] HOST [-- CMD...]
                             run CMD on HOST (no CMD: login shell in the synced checkout); --detach: in the
                             background; --no-sync: without syncing, in the checkout as the host has it
-ovr hosts                   list dialed-in hosts, their OS/arch, and a trusted host's run
+ovr hosts                   list every host: paired, and trusted and SSH hosts while connected
 ovr ps [HOST]               list runs: running, and finished in the last 7 days
-ovr attach HOST RUN         reconnect a terminal to a run, as if it had been started here
-ovr logs HOST RUN           print a run's output, following it until the run ends
-ovr kill HOST RUN           kill a run's whole process tree
+ovr attach HOST [RUN]       reconnect a terminal to a run (default: the latest running), as if started here
+ovr logs HOST [RUN]         print a run's output (default: the latest run), following it until the run ends
+ovr kill HOST RUN...        kill runs' whole process trees
 ovr get HOST SRC... DEST    copy files and trees from HOST to DEST on this machine; see Copying files back
 ovr clean [HOST...|--all]   remove yours not in use on HOSTs; without HOST, agents downloaded here for other versions
 ovr pair [PROVIDER]         print a one-shot command for a host that must dial in; PROVIDER opens a tunnel first
@@ -137,9 +137,28 @@ examples.
   Failures in `ovr` itself exit with `125`, following the `docker run` convention.
 - `RUN` is the number the host gives each run, shown by `ovr ps`. `ovr -d` (`--detach`) prints it and exits `0` once
   the command has started. `attach` and `logs` exit with the run's code once it ends, so `ovr logs box 12 && deploy`
-  works.
+  works. Without `RUN`, `logs` takes this initiator's most recently started run on `HOST`, whatever its state, and
+  `attach` the most recently started one still running, failing when there is none; either names the run it chose on
+  stderr, as in `ovr: run 14 on box`. `kill` takes one or more runs, reports each it cannot kill, carries on, and
+  exits `125` if any failed.
 - Runs belong to the initiator that started them: `ovr ps` lists only this initiator's runs. Without `HOST` it asks
-  every dialed-in host and every SSH host with an open connection.
+  every dialed-in host and every SSH host with an open connection, and names on stderr the paired hosts it skipped
+  because they are offline, as in `winbox, macmini: offline, not listed`.
+- `ovr hosts` lists every host this initiator can name, sorted by kind and then name:
+
+  ```
+  NAME                           KIND     STATE    PLATFORM        SINCE
+  winbox                         paired   online   windows/x86_64  2h
+  macmini                        paired   offline  -               3d
+  nikhil-pandey/ovr/ci/123/test  trusted  online   linux/x86_64    4m     CI on main, https://github.com/...
+  bigbox                         ssh      online   linux/x86_64    12m
+  ```
+
+  `KIND` is `paired`, `trusted`, or `ssh`. Paired hosts are always listed; trusted hosts and SSH hosts only while
+  connected, so an SSH host appears once a command has used it and goes when its connection closes; `~/.ssh/config`
+  is never read. `SINCE` is how long a host has been connected, or how long ago an offline paired host was last
+  connected. `ovrd` keeps that only in memory, so after it restarts an offline host shows `-` until it has connected
+  once. A trusted host's row ends with what it serves, as in [Names](#trusted-workloads).
 - `ovr clean HOST...` removes this initiator's checkouts and finished runs from each host, and agents of other
   versions uploaded there. Without `HOST` it cleans what this machine keeps as an initiator: agents downloaded for
   other versions. `--all` does both, for every host with an open connection. On a host, `ovrd clean` removes every
@@ -148,7 +167,8 @@ examples.
 - `ovr status` and `ovrd status` report state and check nothing: no probes, no verdicts, exit `0` whatever the
   state. `ovr status` asks the local `ovrd`, starting it as any `ovr` command does, for this initiator's
   fingerprint, the address `ovr pair` would print while it listens, open tunnels, trust rules, how many paired hosts
-  are online, how many trusted and SSH hosts are connected, and its directories and `ovrd.log`, marking those an
+  are online and how many trusted and SSH hosts are connected, counted from the list `ovr hosts` shows, and its
+  directories and `ovrd.log`, marking those an
   `OVR_*` variable moved. `ovrd status` reads only the host's own files, so it never starts an initiator server or
   connects anywhere: the host's name and fingerprint, the paired initiator's address and fingerprint, whether
   `ovrd connect` is running and connected (for how long, or the last failure), whether the login service is
@@ -246,7 +266,8 @@ For hosts that cannot accept SSH, including every Windows workstation:
 - `ovrd connect ADDR` without a code moves a paired host to a new address of the same initiator. It needs no code
   because the pinned key, not the address, identifies the initiator: the host accepts the new address only once the
   initiator there presents that key.
-- The host is addressable by its hostname: `ovr winbox -- dotnet test`. `ovr hosts` lists what is connected.
+- The host is addressable by its hostname: `ovr winbox -- dotnet test`. `ovr hosts` lists it as `paired`, online
+  with its platform and for how long, or offline and when it was last seen while `ovrd` has been running.
 - While it serves, `ovrd connect` records whether it is connected, since when, and the last failure in
   `connect.json` beside `connect.log`, and removes it when it stops; `ovrd status` shows it, and ignores a record
   left by an `ovrd connect` that no longer holds its lock.
@@ -350,8 +371,8 @@ jobs:
   identity gets its name back. The jobs of a matrix share an ID, so that numbering follows the order they connect;
   `ovrd connect ADDR github:FP --name NAME` names a host `OWNER/REPO/WORKFLOW/RUN/JOB/NAME` instead, as in
   `nikhil-pandey/ovr/ci/57/build/windows`. The name contains `/`, so it can never be a paired host's or an SSH
-  destination's, and `ovr hosts` lists it only while it is connected, with its workflow, branch, and a link to the run
-  from the verified token, as in `CI on main, https://github.com/nikhil-pandey/ovr/actions/runs/ID`.
+  destination's, and `ovr hosts` lists it as `trusted` only while it is connected, with its workflow, branch, and a
+  link to the run from the verified token, as in `CI on main, https://github.com/nikhil-pandey/ovr/actions/runs/ID`.
 - **In the background.** Without `--foreground`, `ovrd connect ADDR github:FP` starts itself again in the
   background, logging to `connect-github.log` in the log directory, and returns at once. It retries with the usual
   backoff for as long as the job runs; the runner ends it with the job. A missing `id-token: write` permission is
@@ -725,7 +746,9 @@ disconnect, not a stop.
 - **Attach and logs.** `ovr attach` resumes a run as if it had been started there: output from where the log
   begins, input, resize, Ctrl-C, and the exit code. Any number of clients may attach; all see the output, input is
   interleaved, and the most recent to attach or resize sets the terminal size. `ovr logs` prints the log and
-  follows it until the run ends, without input; Ctrl-C stops following and leaves the run alone.
+  follows it until the run ends, without input; Ctrl-C stops following and leaves the run alone. Both take a run
+  number, or without one choose from this initiator's runs as `ovr ps HOST` lists them: `logs` the most recently
+  started, `attach` the most recently started that is still running.
 - **State.** `ovr ps` shows each run's host, number, checkout (`-` for none), command, age, and state: `running`, `exited CODE`,
   or `lost`. A run is lost when its keeper dies without recording an exit; the agent then kills the run's process
   group, and on Windows the Job Object has already ended it.

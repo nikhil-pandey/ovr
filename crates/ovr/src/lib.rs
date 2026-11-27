@@ -13,7 +13,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 use ovr_proto::frame::Resumed;
 use ovr_proto::ipc::ClientStream;
-use ovr_proto::msg::{Attach, Enter, Exec, Op, Provider, Resize, Response, RunInfo};
+use ovr_proto::msg::{
+    Attach, Enter, Exec, HostKind, Op, Provider, Resize, Response, RunInfo, RunState,
+};
 use ovr_proto::{Frame, FrameKind, print_field};
 
 use crate::session::{End, Io, Mode, Position, Signal, Stream};
@@ -57,7 +59,11 @@ HOST is an SSH destination, or a host that dialed in: see `ovr pair` and `ovr tr
 
 const HOSTS_HELP: &str = "\
 Example:
-  ovr hosts    NAME, STATE, and PLATFORM of each paired host, and of trusted hosts while connected";
+  ovr hosts    NAME, KIND, STATE, PLATFORM, and SINCE of every host
+
+KIND is paired, trusted, or ssh. Paired hosts are always listed; trusted and SSH hosts appear while
+connected. SINCE is how long a host has been connected, or how long ago an offline paired host was last
+seen, while this ovrd has been running.";
 
 const PS_HELP: &str = "\
 Examples:
@@ -65,16 +71,18 @@ Examples:
   ovr ps bigbox    runs on bigbox, connecting to it if needed";
 
 const ATTACH_HELP: &str = "\
-Example:
-  ovr attach bigbox 12    take run 12's terminal back, as if it had been started here";
+Examples:
+  ovr attach bigbox 12    take run 12's terminal back, as if it had been started here
+  ovr attach bigbox       the latest run on bigbox that is still running";
 
 const LOGS_HELP: &str = "\
-Example:
-  ovr logs bigbox 12 && deploy    follow run 12's output, and exit with its code";
+Examples:
+  ovr logs bigbox 12 && deploy    follow run 12's output, and exit with its code
+  ovr logs bigbox                 the latest run on bigbox, whatever its state";
 
 const KILL_HELP: &str = "\
 Example:
-  ovr kill bigbox 12    kill run 12 and every process it started";
+  ovr kill bigbox 12 14    kill runs 12 and 14 and every process they started";
 
 const CLEAN_HELP: &str = "\
 Examples:
@@ -133,7 +141,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// List paired hosts, and trusted hosts while connected.
+    /// List paired hosts, and trusted and SSH hosts while connected.
     #[command(after_help = HOSTS_HELP)]
     Hosts,
     /// List this initiator's runs: running, and finished in the last 7 days.
@@ -142,29 +150,30 @@ pub enum Command {
         /// SSH destination or dialed-in host name; otherwise every host with an open connection.
         host: Option<String>,
     },
-    /// Reconnect this terminal to a run, as if it had been started here.
+    /// Reconnect this terminal to a run, by default the latest still running, as if it had been started here.
     #[command(after_help = ATTACH_HELP)]
     Attach {
         /// SSH destination or dialed-in host name.
         host: String,
         /// Run number, as `ovr -d` prints and `ovr ps` lists.
-        run: u64,
+        run: Option<u64>,
     },
-    /// Print a run's output, following it until the run ends.
+    /// Print a run's output, by default the latest run's, following it until the run ends.
     #[command(after_help = LOGS_HELP)]
     Logs {
         /// SSH destination or dialed-in host name.
         host: String,
         /// Run number, as `ovr -d` prints and `ovr ps` lists.
-        run: u64,
+        run: Option<u64>,
     },
-    /// Kill a run's whole process tree.
+    /// Kill runs' whole process trees.
     #[command(after_help = KILL_HELP)]
     Kill {
         /// SSH destination or dialed-in host name.
         host: String,
         /// Run number, as `ovr -d` prints and `ovr ps` lists.
-        run: u64,
+        #[arg(required = true, value_name = "RUN")]
+        runs: Vec<u64>,
     },
     /// Copy files and trees from HOST to DEST on this machine, skipping files already there.
     #[command(after_help = GET_HELP)]
@@ -325,11 +334,7 @@ pub async fn run(mut cli: Cli) -> Result<i32, Error> {
         (Some(Command::Ps { host }), _) => ps(host).await,
         (Some(Command::Attach { host, run }), _) => attach(host, run, Mode::Drive).await,
         (Some(Command::Logs { host, run }), _) => attach(host, run, Mode::Watch).await,
-        (Some(Command::Kill { host, run }), _) => {
-            let (stream, _) = daemon::open(&host).await?;
-            session::kill(stream, run).await?;
-            Ok(0)
-        }
+        (Some(Command::Kill { host, runs }), _) => kill(&host, runs).await,
         (Some(Command::Clean { hosts, all }), _) => clean(hosts, all).await,
         (Some(Command::Pair { provider }), _) => manage::pair(provider).await,
         (Some(Command::Unpair { host }), _) => manage::unpair(host).await,
@@ -445,7 +450,11 @@ async fn run_on(host: String, run: RunArgs) -> Result<i32, Error> {
     follow(&host, stream, position, io, Mode::Drive).await
 }
 
-async fn attach(host: String, run: u64, mode: Mode) -> Result<i32, Error> {
+async fn attach(host: String, run: Option<u64>, mode: Mode) -> Result<i32, Error> {
+    let run = match run {
+        Some(run) => run,
+        None => latest(&host, mode == Mode::Drive).await?,
+    };
     let (stream, _) = daemon::open(&host).await?;
     let from_start = Attach {
         run,
@@ -467,6 +476,39 @@ async fn attach(host: String, run: u64, mode: Mode) -> Result<i32, Error> {
         stderr: tokio::io::stderr(),
     };
     follow(&host, stream, position, io, mode).await
+}
+
+/// This initiator's most recent run on `host`, or its most recent one still running when `running`, which it names on
+/// stderr.
+async fn latest(host: &str, running: bool) -> Result<u64, Error> {
+    let (stream, initiator) = daemon::open(host).await?;
+    let latest = session::list(stream, &initiator)
+        .await?
+        .into_iter()
+        .filter(|run| !running || run.state == RunState::Running)
+        .max_by_key(|run| (run.started, run.run))
+        .ok_or_else(|| {
+            let which = if running { "running run" } else { "run" };
+            Error::Host(format!("no {which} on {host}; `ovr ps {host}` lists them"))
+        })?;
+    eprintln!("ovr: run {} on {host}", latest.run);
+    Ok(latest.run)
+}
+
+/// Kills each of `runs` on `host`, reporting each failure and carrying on.
+async fn kill(host: &str, runs: Vec<u64>) -> Result<i32, Error> {
+    let mut code = 0;
+    for run in runs {
+        let killed = async {
+            let (stream, _) = daemon::open(host).await?;
+            session::kill(stream, run).await
+        };
+        if let Err(err) = killed.await {
+            eprintln!("ovr: run {run} on {host}: {:?}", miette::Report::new(err));
+            code = FAILURE;
+        }
+    }
+    Ok(code)
 }
 
 type HostStream = Stream<Resumed<ClientStream>>;
@@ -577,14 +619,34 @@ fn detached(host: &str, position: &Position) -> Error {
 
 async fn ps(host: Option<String>) -> Result<i32, Error> {
     let explicit = host.is_some();
-    let hosts = match host {
-        Some(host) => vec![host],
-        None => daemon::connected().await?,
+    let (hosts, offline) = if let Some(host) = host {
+        (vec![host], Vec::new())
+    } else {
+        // Only paired hosts are listed while offline.
+        let hosts = daemon::hosts().await?;
+        let names = |online: bool| -> Vec<String> {
+            hosts
+                .iter()
+                .filter(|host| host.platform.is_some() == online)
+                .map(|host| host.name.clone())
+                .collect()
+        };
+        (names(true), names(false))
     };
-    if hosts.is_empty() {
+    let code = if hosts.is_empty() {
         eprintln!("no host is connected; name one with `ovr ps HOST`");
-        return Ok(0);
+        0
+    } else {
+        list_runs(hosts, explicit).await?
+    };
+    if !offline.is_empty() {
+        eprintln!("{}: offline, not listed", offline.join(", "));
     }
+    Ok(code)
+}
+
+/// Prints this initiator's runs on `hosts`, reporting a host that cannot be reached unless it was named.
+async fn list_runs(hosts: Vec<String>, explicit: bool) -> Result<i32, Error> {
     let mut rows = Vec::new();
     let mut code = 0;
     for host in hosts {
@@ -676,30 +738,38 @@ async fn clean(hosts: Vec<String>, all: bool) -> Result<i32, Error> {
 }
 
 async fn hosts() -> Result<i32, Error> {
-    let hosts = match daemon::request(Op::Hosts).await? {
-        (_, Response::Hosts { hosts }) => hosts,
-        (_, other) => return Err(daemon::unexpected(other)),
-    };
+    let hosts = daemon::hosts().await?;
     if hosts.is_empty() {
-        eprintln!("no dialed-in hosts; run `ovr pair` to add one");
+        eprintln!(
+            "no hosts yet: name any SSH host (`ovr HOST -- CMD`), or pair one with `ovr pair`"
+        );
         return Ok(0);
     }
-    let width = hosts
-        .iter()
-        .map(|host| host.name.len())
-        .fold("NAME".len(), usize::max);
-    println!("{:width$}  STATE    PLATFORM", "NAME");
-    for host in hosts {
-        match (host.platform, host.about) {
-            (Some(platform), about) => println!(
-                "{:width$}  online   {}/{}{}",
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |time| time.as_secs());
+    let header = ["NAME", "KIND", "STATE", "PLATFORM", "SINCE", ""].map(str::to_owned);
+    let table: Vec<[String; 6]> = std::iter::once(header)
+        .chain(hosts.into_iter().map(|host| {
+            let (state, platform) = match host.platform {
+                Some(platform) => ("online", format!("{}/{}", platform.os, platform.arch)),
+                None => ("offline", "-".to_owned()),
+            };
+            [
                 host.name,
-                platform.os,
-                platform.arch,
-                about.map_or_default(|about| format!("  {about}"))
-            ),
-            (None, _) => println!("{:width$}  offline  -", host.name),
-        }
+                host.kind.to_string(),
+                state.to_owned(),
+                platform,
+                host.since.map_or_else(
+                    || "-".to_owned(),
+                    |since| ovr_proto::format_age(now.saturating_sub(since)),
+                ),
+                host.about.unwrap_or_default(),
+            ]
+        }))
+        .collect();
+    for line in ovr_proto::columns(&table) {
+        println!("{line}");
     }
     Ok(0)
 }
@@ -712,15 +782,20 @@ async fn status() -> Result<i32, Error> {
         listening,
         tunnels,
         rules,
-        paired,
-        online,
-        trusted_online,
-        ssh_connected,
+        hosts,
         paths,
     } = response
     else {
         return Err(daemon::unexpected(response));
     };
+    let count = |kind: HostKind| {
+        let of_kind = hosts.iter().filter(|host| host.kind == kind);
+        let online = of_kind.clone().filter(|host| host.platform.is_some());
+        (of_kind.count(), online.count())
+    };
+    let (paired, online) = count(HostKind::Paired);
+    let (_, trusted_online) = count(HostKind::Trusted);
+    let (_, ssh_connected) = count(HostKind::Ssh);
     println!("ovr {}", ovr_proto::VERSION);
     print_field("initiator", [fingerprint]);
     print_field(
