@@ -191,7 +191,12 @@ impl World {
             .env("PATH", &self.host_path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(home.join("connect.log"))?,
+            );
         for var in XDG {
             command.env_remove(var);
         }
@@ -200,6 +205,7 @@ impl World {
         let mut connected = Connected {
             child,
             name: String::new(),
+            log: home.join("connect.log"),
         };
         // Pairing through a tunnel can take a while: the first line comes once the host has reached the initiator.
         let line = BufReader::new(stdout)
@@ -292,6 +298,25 @@ impl Drop for World {
 struct Connected {
     child: std::process::Child,
     name: String,
+    /// Where its log goes, shared with other hosts started in the same home.
+    log: PathBuf,
+}
+
+impl Connected {
+    /// Waits until the host has logged `text`.
+    fn logged(&self, text: &str) -> Result {
+        let deadline = Instant::now() + Duration::from_mins(1);
+        loop {
+            let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+            if log.contains(text) {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                return Err(format!("the host never logged {text:?}:\n{log}").into());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 }
 
 impl Drop for Connected {
@@ -820,6 +845,14 @@ fn dial_in_hosts_pair_directly_then_move_to_a_cloudflare_tunnel() -> Result {
     world.cat(&name)?;
     let wrong = world.connect(&[&addr, "AAAA-AAAA"]);
     assert!(wrong.is_err(), "a wrong code is rejected");
+
+    let unpaired = world.ovr_ok(&["unpair", &name])?;
+    assert!(unpaired.contains("closed its connection"), "{unpaired}");
+    // The host keeps dialing in, and is refused.
+    host.logged("this host is not paired with the initiator")?;
+    let hosts = world.ovr_ok(&["hosts"])?;
+    assert!(!hosts.contains(&name), "{hosts}");
+    drop(host);
 
     assert!(
         world

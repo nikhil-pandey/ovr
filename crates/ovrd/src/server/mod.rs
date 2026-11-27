@@ -15,8 +15,8 @@ use futures::{SinkExt, StreamExt};
 use ovr_proto::lock::Lock;
 use ovr_proto::msg::{HostStatus, Op, Platform, Provider, Request, Response};
 use ovr_proto::{Frame, FrameKind, VERSION, frame, ipc};
-use tokio::sync::Notify;
-use tokio::task::JoinSet;
+use tokio::sync::{Notify, OnceCell};
+use tokio::task::{AbortHandle, JoinSet};
 
 use crate::mux::{Channel, Mux};
 use crate::pairing::Codes;
@@ -49,12 +49,18 @@ pub async fn run() -> Result<(), Error> {
         codes: Mutex::default(),
         trust: Trust::new(dir.clone()),
         admitting: tokio::sync::Mutex::default(),
+        pairing: Mutex::default(),
+        listening: OnceCell::new(),
         tunnels: tunnels::Tunnels::new(dir.clone()),
         dir,
     });
     tracing::info!(version = VERSION, "serving");
-    server.tunnels.restore()?;
-    tokio::spawn(dialin::listen(Arc::clone(&server)));
+    let dials_in = !state::hosts(&server.dir)?.is_empty()
+        || !state::trust_rules(&server.dir)?.is_empty()
+        || !state::tunnels(&server.dir)?.is_empty();
+    if dials_in && let Err(err) = server.listen().await {
+        tracing::error!(%err, "dial-in hosts cannot connect until `ovr pair` or `ovr trust` listens again");
+    }
 
     let restart = Arc::new(Notify::new());
     let mut runs = JoinSet::new();
@@ -69,6 +75,10 @@ pub async fn run() -> Result<(), Error> {
         }
     }
     tracing::info!("a different version was started; exiting after in-flight runs");
+    // The port goes to the new server; hosts already connected keep their connections here until they drop.
+    for accepting in server.listening.get().into_iter().flatten() {
+        accepting.abort();
+    }
     drop(listener);
     drop(lock);
     while runs.join_next().await.is_some() {}
@@ -97,6 +107,10 @@ pub(crate) struct Server {
     trust: Trust,
     /// Held while a federated host is given a name, so that two cannot be given the same one.
     admitting: tokio::sync::Mutex<()>,
+    /// Held while the paired hosts' records change.
+    pairing: Mutex<()>,
+    /// The loops accepting dial-in hosts, once something can dial in.
+    listening: OnceCell<Vec<AbortHandle>>,
     tunnels: tunnels::Tunnels,
 }
 
@@ -168,6 +182,9 @@ async fn handle(server: Arc<Server>, stream: ipc::ServerStream, restart: Arc<Not
             .unwrap_or_else(|err| Response::Failed {
                 message: err.to_string(),
             }),
+        Op::Unpair { host } => server.unpair(&host).unwrap_or_else(|err| Response::Failed {
+            message: err.to_string(),
+        }),
         Op::Tunnels => Response::Tunnels {
             tunnels: server.tunnels.list(),
         },
@@ -182,9 +199,11 @@ async fn handle(server: Arc<Server>, stream: ipc::ServerStream, restart: Arc<Not
         }),
         Op::Trust { rule } => server
             .trust_rule(rule.as_deref(), true)
+            .await
             .unwrap_or_else(|message| Response::Failed { message }),
         Op::Untrust { rule } => server
             .trust_rule(Some(&rule), false)
+            .await
             .unwrap_or_else(|message| Response::Failed { message }),
     };
     if respond(&mut stream, &response).await.is_ok() {
@@ -255,10 +274,15 @@ impl Server {
 
     /// Adds `rule` to the trust rules, or removes it unless `add`, and answers with the rules and what a trusted
     /// workload needs to dial in: this initiator's fingerprint and an address, through an open tunnel if any.
-    fn trust_rule(&self, rule: Option<&str>, add: bool) -> Result<Response, String> {
+    async fn trust_rule(
+        self: &Arc<Self>,
+        rule: Option<&str>,
+        add: bool,
+    ) -> Result<Response, String> {
         if let Some(rule) = rule {
             let rule: Rule = rule.parse()?;
             if add {
+                self.listen().await.map_err(|err| err.to_string())?;
                 self.trust.add(rule).map_err(|err| err.to_string())?;
             } else if !self.trust.remove(&rule).map_err(|err| err.to_string())? {
                 return Err(format!("{rule} is not trusted"));
@@ -296,7 +320,8 @@ impl Server {
     }
 
     /// Issues a pairing code for hosts to dial in directly, or through the tunnel from `tunnel`, opened if needed.
-    async fn pair(&self, tunnel: Option<Provider>) -> Result<Response, Error> {
+    async fn pair(self: &Arc<Self>, tunnel: Option<Provider>) -> Result<Response, Error> {
+        self.listen().await?;
         let addr = match tunnel {
             Some(provider) => self.tunnels.open(provider).await?.to_string(),
             None => format!("{}:{PORT}", local_ip()),
@@ -308,6 +333,40 @@ impl Server {
             .issue()
             .map_err(|_| Error::Invalid("the system random number generator failed".to_owned()))?;
         Ok(Response::Pair { addr, code })
+    }
+
+    /// Forgets the paired host `host` and closes its connection, if open. Its runs keep going on the host.
+    fn unpair(&self, host: &str) -> Result<Response, Error> {
+        // Held until the connection is closed, so a host connecting meanwhile is either closed here or refused.
+        let _pairing = self.pairing.lock().unwrap_or_else(PoisonError::into_inner);
+        if !state::remove_host(&self.dir, host)? {
+            return Err(Error::Invalid(format!(
+                "{host} is not paired; `ovr hosts` lists paired hosts"
+            )));
+        }
+        tracing::info!(name = host, "unpaired");
+        Ok(Response::Unpaired {
+            disconnected: self.dialed.close(host),
+        })
+    }
+
+    /// Listens for dial-in hosts unless already listening, then reopens the tunnels earlier runs recorded, which
+    /// would otherwise forward to whatever else holds the port. Kept for the server's lifetime once it succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the port stays taken, in which case the next call tries again.
+    async fn listen(self: &Arc<Self>) -> Result<(), Error> {
+        self.listening
+            .get_or_try_init(|| async {
+                let accepting = dialin::listen(Arc::clone(self)).await?;
+                if let Err(err) = self.tunnels.restore() {
+                    tracing::error!(%err, "cannot reopen the recorded tunnels");
+                }
+                Ok::<_, Error>(accepting)
+            })
+            .await
+            .map(|_| ())
     }
 }
 
@@ -410,6 +469,20 @@ impl Registry {
             })
             .find(|name| !hosts.contains_key(name))
             .unwrap_or_else(|| base.to_owned())
+    }
+
+    /// Forgets `name` and closes its connection, returning whether it was live.
+    fn close(&self, name: &str) -> bool {
+        let dialed = self
+            .hosts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(name);
+        dialed.is_some_and(|dialed| {
+            let live = dialed.live();
+            dialed.mux.close();
+            live
+        })
     }
 
     /// Marks a connection gone, keeping its name reserved for a while.

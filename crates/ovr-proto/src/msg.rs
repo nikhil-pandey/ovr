@@ -255,6 +255,8 @@ pub enum Op {
     Connected,
     /// Issue a pairing code, for an address through a tunnel from `tunnel` if given, which is opened first.
     Pair { tunnel: Option<Provider> },
+    /// Forget the paired host `host` and close its connection; it is refused when it reconnects.
+    Unpair { host: String },
     /// List open tunnels.
     Tunnels,
     /// Close the tunnel from `provider` and delete what `ovrd` created there.
@@ -285,6 +287,10 @@ pub enum Response {
     Pair {
         addr: String,
         code: String,
+    },
+    /// The host was forgotten; `disconnected` when its connection was open and is now closed.
+    Unpaired {
+        disconnected: bool,
     },
     Tunnels {
         tunnels: Vec<TunnelStatus>,

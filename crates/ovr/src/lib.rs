@@ -89,6 +89,10 @@ Examples:
   ovr pair               prints `ovrd connect ADDR CODE` to run on the host within 10 minutes
   ovr pair cloudflare    the same, through a Cloudflare quick tunnel; or devtunnel, or tailcat";
 
+const UNPAIR_HELP: &str = "\
+Example:
+  ovr unpair winbox    winbox is refused from now on; pair it again with `ovr pair`";
+
 const TRUST_HELP: &str = "\
 Examples:
   ovr trust github:nikhil-pandey/ovr    trust the jobs of one repository
@@ -187,6 +191,12 @@ pub enum Command {
     Pair {
         /// `cloudflare`, `devtunnel` or `tailcat`: open a tunnel with that provider's CLI unless one is open.
         provider: Option<Provider>,
+    },
+    /// Forget a paired host and close its connection; runs already there keep going.
+    #[command(after_help = UNPAIR_HELP)]
+    Unpair {
+        /// Paired host name, as `ovr hosts` lists it.
+        host: String,
     },
     /// Trust workloads matching RULE to dial in without pairing; without RULE, list the rules.
     ///
@@ -313,6 +323,7 @@ pub async fn run(mut cli: Cli) -> Result<i32, Error> {
         }
         (Some(Command::Clean { hosts, all }), _) => clean(hosts, all).await,
         (Some(Command::Pair { provider }), _) => manage::pair(provider).await,
+        (Some(Command::Unpair { host }), _) => manage::unpair(host).await,
         (Some(Command::Trust { rule }), _) => manage::trust(Op::Trust { rule }).await,
         (Some(Command::Untrust { rule }), _) => manage::trust(Op::Untrust { rule }).await,
         (Some(Command::Tunnel { command: None }), _) => manage::tunnels().await,

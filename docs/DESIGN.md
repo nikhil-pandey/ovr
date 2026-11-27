@@ -93,6 +93,7 @@ ovr kill HOST RUN           kill a run's whole process tree
 ovr get HOST SRC... DEST    copy files and trees from HOST to DEST on this machine; see Copying files back
 ovr clean [HOST...|--all]   remove yours not in use on HOSTs; without HOST, agents downloaded here for other versions
 ovr pair [PROVIDER]         print a one-shot command for a host that must dial in; PROVIDER opens a tunnel first
+ovr unpair HOST             forget a paired host and close its connection; runs already there keep going
 ovr tunnel                  list open tunnels and the command that points a paired host at each
 ovr tunnel close PROVIDER   close a tunnel that `ovr pair` opened
 ovr trust [RULE]            trust workloads matching RULE to dial in without pairing; list the rules and how to dial
@@ -204,13 +205,17 @@ For hosts that cannot accept SSH, including every Windows workstation:
  paired with 100.64.0.10:7420; serving as winbox
 ```
 
-- `ovrd` on the initiator listens on `:7420`. Each side has a self-signed Ed25519 certificate; every connection is
-  TLS 1.3 and each side checks the other's certificate fingerprint, so **both keys are pinned**. The host runs
-  `ovrd connect ADDR CODE` once: it sends its name with an HMAC of both fingerprints keyed by the code, and the
-  initiator answers with its own HMAC, so neither side can be impersonated by someone without the code. Codes are
-  single-use and expire after ten minutes, and five wrong guesses revoke every outstanding code. The identity and
-  pairing records live in the data directory (see [Files](#files)); they are a record, like `known_hosts`, not
-  configuration.
+- `ovrd` on the initiator listens on `:7420` only once something can dial in: from its start when a host is paired,
+  a trust rule exists, or a tunnel is open, and otherwise from the first `ovr pair` or `ovr trust RULE`, which fail
+  rather than print an address nothing answers when the port cannot be bound. Once listening, it listens until it
+  exits; an `ovrd` making way for another version stops listening at once, and the new one waits a few seconds for
+  the port.
+- Each side has a self-signed Ed25519 certificate; every connection is TLS 1.3 and each side checks the other's
+  certificate fingerprint, so **both keys are pinned**. The host runs `ovrd connect ADDR CODE` once: it sends its
+  name with an HMAC of both fingerprints keyed by the code, and the initiator answers with its own HMAC, so neither
+  side can be impersonated by someone without the code. Codes are single-use and expire after ten minutes, and five
+  wrong guesses revoke every outstanding code. The identity and pairing records live in the data directory (see
+  [Files](#files)); they are a record, like `known_hosts`, not configuration.
 - Both ends send a heartbeat on the connection every 15 seconds and close it after 45 seconds without one, so a
   vanished peer is noticed within a minute even through a tunnel or proxy, where TCP keepalive only probes the
   nearest hop, which stays up.
@@ -232,6 +237,8 @@ For hosts that cannot accept SSH, including every Windows workstation:
   because the pinned key, not the address, identifies the initiator: the host accepts the new address only once the
   initiator there presents that key.
 - The host is addressable by its hostname: `ovr winbox -- dotnet test`. `ovr hosts` lists what is connected.
+- `ovr unpair winbox` forgets the host and closes its connection. Runs already there keep going, but this initiator
+  no longer reaches them; the host's `ovrd connect` keeps dialing in and is refused until it is paired again.
 - Reachability is the network's job. On Tailscale, `100.x.y.z` is the initiator's stable address and the WireGuard
   layer already authenticates peers; the pinned keys are defense in depth and also make the design work over any
   other overlay, a plain LAN, or a tunnel.
@@ -259,8 +266,8 @@ Microsoft Dev Tunnels, or `tailcat` for Tailcat.
   the provider's CLI installed, and for Dev Tunnels logged in; the host needs the CLI installed.
 - **The initiator's `ovrd` owns the tunnel.** `ovr pair PROVIDER` opens a tunnel to `:7420` unless one for that
   provider is already open, then prints the host's command with the tunnel's address. From then on `ovrd` restarts
-  the provider's CLI when it exits and reopens the tunnel whenever `ovrd` starts, so the tunnel outlives the
-  terminal that asked for it. Only `ovr tunnel close PROVIDER` closes it, which also deletes what `ovrd` created at
+  the provider's CLI when it exits and reopens the tunnel whenever `ovrd` starts, once it holds `:7420`, so the
+  tunnel outlives the terminal that asked for it and never forwards to another process on the port. Only `ovr tunnel close PROVIDER` closes it, which also deletes what `ovrd` created at
   the provider; if that deletion fails, the tunnel stays open. Open tunnels are recorded in the data directory as
   soon as they are created at the provider, so none is forgotten.
 - **The host's `ovrd connect` owns the forwarder.** Given a tunnel address, it starts the provider's local forwarder
@@ -737,7 +744,8 @@ caches such as sccache or bazel-remote are a per-host concern and work unchanged
   tunnel's public address is not a secret, and no provider credential is ever printed or logged.
 - SSH hosts: authentication and host verification are OpenSSH's, using your existing configuration.
 - Dial-in hosts: mutual TLS 1.3 with keys pinned at pairing. A host serves only the initiator it paired with; the
-  initiator accepts only hosts it paired. Pairing codes are one-shot, expiring, and rate-limited.
+  initiator accepts only hosts it paired. Pairing codes are one-shot, expiring, and rate-limited. An initiator with
+  nothing paired, trusted, or tunnelled opens no port.
 - Trusted workloads: the same TLS, with the initiator pinned by the fingerprint the host is given, and the host
   admitted by a provider token for this initiator's audience that a trust rule matches. Anyone who can run a trusted
   workflow can make a host appear, but a host only receives work: a trusted host is named `OWNER/REPO/WORKFLOW/RUN/JOB`,

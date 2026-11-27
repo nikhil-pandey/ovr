@@ -2,7 +2,7 @@
 
 use std::net::Ipv4Addr;
 use std::sync::{Arc, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use ovr_proto::frame::{self, Framed};
@@ -10,6 +10,7 @@ use ovr_proto::msg::{Accepted, Banner, Failure, Federated, Pair, PairOk};
 use ovr_proto::{Frame, FrameKind, PROTOCOL_VERSION};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::AbortHandle;
 use tokio_rustls::TlsAcceptor;
 
 use super::{PORT, Server};
@@ -20,35 +21,40 @@ use crate::{Error, pairing, state, tls};
 /// Bounds the handshake and first frame, so idle connections cannot pile up.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Accepts dial-in hosts until the server exits, retrying while the port is taken, e.g. by an exiting `ovrd`.
-pub async fn listen(server: Arc<Server>) {
-    let acceptor = match server.identity.server_config() {
-        Ok(config) => TlsAcceptor::from(config),
-        Err(err) => {
-            tracing::error!(%err, "dial-in disabled: unusable identity");
-            return;
-        }
-    };
-    let mut warned = false;
+/// How long to wait for the dial-in port to be free.
+const BIND_WAIT: Duration = Duration::from_secs(5);
+
+/// Binds the dial-in port and accepts hosts on it until the returned tasks are aborted. Retries briefly while the port
+/// is taken, as by the `ovrd` of another version that is handing over to this one.
+///
+/// # Errors
+///
+/// Returns an error when the identity is unusable or the port is still taken after [`BIND_WAIT`].
+pub async fn listen(server: Arc<Server>) -> Result<Vec<AbortHandle>, Error> {
+    let acceptor = TlsAcceptor::from(server.identity.server_config()?);
+    let deadline = Instant::now() + BIND_WAIT;
     let listener = loop {
         match TcpListener::bind(("0.0.0.0", PORT)).await {
             Ok(listener) => break listener,
-            Err(err) => {
-                if !warned {
-                    tracing::warn!(%err, "cannot listen on port {PORT}; retrying");
-                    warned = true;
-                }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+            Err(err) if Instant::now() >= deadline => {
+                return Err(Error::Host(format!(
+                    "cannot listen for dial-in hosts on port {PORT}: {err}"
+                )));
             }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     };
     tracing::info!("listening for dial-in hosts on port {PORT}");
+    let mut accepting = Vec::new();
     // Where the platform allows a more specific address beside the wildcard one (macOS), claim loopback too, so a
     // `devtunnel connect` on this machine cannot take it and loop dial-ins to this server back into the tunnel.
     if let Ok(loopback) = TcpListener::bind((Ipv4Addr::LOCALHOST, PORT)).await {
-        tokio::spawn(accept(loopback, Arc::clone(&server), acceptor.clone()));
+        accepting.push(
+            tokio::spawn(accept(loopback, Arc::clone(&server), acceptor.clone())).abort_handle(),
+        );
     }
-    accept(listener, server, acceptor).await;
+    accepting.push(tokio::spawn(accept(listener, server, acceptor)).abort_handle());
+    Ok(accepting)
 }
 
 async fn accept(listener: TcpListener, server: Arc<Server>, acceptor: TlsAcceptor) {
@@ -117,13 +123,19 @@ where
         )));
     };
     let name = valid_name(&request.hostname)?;
-    state::add_host(
-        &server.dir,
-        PairedHost {
-            name: name.clone(),
-            fingerprint: host.to_owned(),
-        },
-    )?;
+    {
+        let _pairing = server
+            .pairing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state::add_host(
+            &server.dir,
+            PairedHost {
+                name: name.clone(),
+                fingerprint: host.to_owned(),
+            },
+        )?;
+    }
     let mac = pairing::Proof::initiator(initiator, host).sign(&code);
     stream
         .send(Frame::json(FrameKind::PairOk, &PairOk { mac })?)
@@ -170,13 +182,27 @@ where
     stream.send(Frame::empty(FrameKind::Accept)).await?;
 
     let mux = Mux::open_with_heartbeat(frame::resume(stream));
-    let id = server.dialed.insert(
-        &paired.name,
-        fingerprint,
-        mux.clone(),
-        banner.platform,
-        None,
-    );
+    // Registered only while still paired, under the lock `ovr unpair` holds, so an unpaired host never stays connected.
+    let id = {
+        let _pairing = server
+            .pairing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !state::hosts(&server.dir)?.contains(&paired) {
+            mux.close();
+            return Err(Error::Invalid(format!(
+                "{} was unpaired while connecting",
+                paired.name
+            )));
+        }
+        server.dialed.insert(
+            &paired.name,
+            fingerprint,
+            mux.clone(),
+            banner.platform,
+            None,
+        )
+    };
     tracing::info!(
         name = paired.name,
         version = banner.version,

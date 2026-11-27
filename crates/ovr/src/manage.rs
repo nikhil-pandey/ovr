@@ -19,6 +19,22 @@ pub async fn pair(tunnel: Option<Provider>) -> Result<i32, Error> {
     }
 }
 
+/// `ovr unpair HOST`: forgets a paired host and closes its connection; its runs keep going there.
+pub async fn unpair(host: String) -> Result<i32, Error> {
+    match daemon::request(Op::Unpair { host: host.clone() }).await? {
+        (_, Response::Unpaired { disconnected }) => {
+            let closed = if disconnected {
+                " and closed its connection"
+            } else {
+                ""
+            };
+            println!("unpaired {host}{closed}; runs already there keep going");
+            Ok(0)
+        }
+        (_, other) => Err(daemon::unexpected(other)),
+    }
+}
+
 /// `ovr trust` and `ovr untrust`: changes the rules, if asked to, then lists them and how a workload dials in.
 pub async fn trust(op: Op) -> Result<i32, Error> {
     let changed = match &op {

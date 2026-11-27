@@ -68,6 +68,22 @@ pub fn add_host(dir: &Path, host: PairedHost) -> io::Result<()> {
     write(&hosts_path(dir), &hosts)
 }
 
+/// Forgets the host paired as `name`, returning whether there was one.
+///
+/// # Errors
+///
+/// Returns an error when the records cannot be read or written.
+pub fn remove_host(dir: &Path, name: &str) -> io::Result<bool> {
+    let mut hosts = hosts(dir)?;
+    let before = hosts.len();
+    hosts.retain(|known| known.name != name);
+    if hosts.len() == before {
+        return Ok(false);
+    }
+    write(&hosts_path(dir), &hosts)?;
+    Ok(true)
+}
+
 /// # Errors
 ///
 /// Returns an error when the file exists but cannot be read or parsed.
