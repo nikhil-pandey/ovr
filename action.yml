@@ -5,15 +5,15 @@ branding:
   icon: terminal
   color: gray-dark
 
-# The job needs `permissions: id-token: write`, and the initiator `ovrd trust github:OWNER/REPO`, which prints this
+# The job needs `permissions: id-token: write`, and the initiator `ovr trust github:OWNER/REPO`, which prints this
 # action's inputs. Nothing here fails the job: when the initiator is away, the background `ovrd` keeps retrying
 # until the job ends.
 inputs:
   addr:
-    description: The initiator's address, as `ovrd trust` prints it, such as `tailcat:ADDRESS`, `devtunnel:ID`, or `host:7420`.
+    description: The initiator's address, as `ovr trust` prints it, such as `tailcat:ADDRESS`, `devtunnel:ID`, or `host:7420`.
     required: true
   initiator:
-    description: The initiator's fingerprint, as `ovrd trust` prints it.
+    description: The initiator's fingerprint, as `ovr trust` prints it.
     required: true
   name:
     description: >-

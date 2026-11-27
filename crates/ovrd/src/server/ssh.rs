@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use ovr_proto::msg::Banner;
+use ovr_proto::msg::{Banner, HostKind, HostStatus, Platform};
 use ovr_proto::{FrameKind, PROTOCOL_VERSION, VERSION, frame};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -49,6 +49,9 @@ pub struct Pool {
 struct Connection {
     mux: Mux,
     usage: Arc<Usage>,
+    platform: Platform,
+    /// Seconds since the Unix epoch.
+    since: u64,
 }
 
 struct Usage {
@@ -103,20 +106,24 @@ impl Pool {
 }
 
 impl Pool {
-    /// Destinations with an open connection, in order.
-    pub fn connected(&self) -> Vec<String> {
+    /// Destinations with an open connection.
+    pub fn connected(&self) -> Vec<HostStatus> {
         let hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut names: Vec<String> = hosts
+        hosts
             .iter()
-            .filter(|(_, slot)| {
+            .filter_map(|(name, slot)| {
                 // A slot being connected right now is not open yet.
-                slot.try_lock()
-                    .is_ok_and(|slot| slot.as_ref().is_some_and(|c| !c.mux.is_closed()))
+                let slot = slot.try_lock().ok()?;
+                let connection = slot.as_ref().filter(|c| !c.mux.is_closed())?;
+                Some(HostStatus {
+                    name: name.clone(),
+                    kind: HostKind::Ssh,
+                    platform: Some(connection.platform.clone()),
+                    since: Some(connection.since),
+                    about: None,
+                })
             })
-            .map(|(name, _)| name.clone())
-            .collect();
-        names.sort();
-        names
+            .collect()
     }
 }
 
@@ -203,7 +210,12 @@ async fn start(host: &str) -> Result<Option<Connection>, Error> {
         Arc::clone(&usage),
         host.to_owned(),
     ));
-    Ok(Some(Connection { mux, usage }))
+    Ok(Some(Connection {
+        mux,
+        usage,
+        platform: banner.platform,
+        since: crate::agent::runs::now(),
+    }))
 }
 
 /// Ends the connection when it has been idle too long, and the mux when SSH exits.
@@ -255,7 +267,7 @@ async fn install(host: &str) -> Result<(), Error> {
     let uname = ssh_output(host, "uname -sm").await?;
     let target = target::from_uname(&uname).ok_or_else(|| {
         Error::Host(format!(
-            "{host} runs {}, which ovr cannot reach over SSH; dial in instead with `ovrd pair`",
+            "{host} runs {}, which ovr cannot reach over SSH; dial in instead with `ovr pair`",
             uname.trim()
         ))
     })?;

@@ -1,4 +1,4 @@
-//! `ovrd`: the initiator server and the host agent for `ovr`.
+//! `ovrd`: the host side of `ovr`, and the initiator server `ovr` starts.
 
 pub mod agent;
 mod autostart;
@@ -9,57 +9,57 @@ mod mux;
 mod pairing;
 mod server;
 mod state;
+mod status;
 mod target;
 mod tls;
 mod trust;
 mod tunnel;
 
 use std::io;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use futures::{SinkExt, StreamExt};
-use ovr_proto::msg::{Op, Provider, Request, Response};
-use ovr_proto::{Frame, FrameKind, VERSION, frame, ipc};
 
-/// Server and host agent for `ovr`.
+const EXAMPLES: &str = "\
+Examples:
+  ovrd connect 100.64.0.10:7420 7KQX-M4RT      pair with the initiator, then serve it, at login too
+  ovrd connect devtunnel:quiet-river-x1y2z3    move this paired host to a new address
+  ovrd status                                  whether this host is paired and connected, and its runs
+  ovrd disconnect                              stop serving at login and forget the initiator
+  ovrd clean                                   remove checkouts and finished runs not in use
+
+On your own machine, use `ovr`: it starts the initiator server, and `ovr pair` prints the connect command.";
+
+const CONNECT_HELP: &str = "\
+Examples:
+  ovrd connect 100.64.0.10:7420 7KQX-M4RT                pair, then serve, at login too
+  ovrd connect devtunnel:quiet-river-x1y2z3              move to a new address of the same initiator
+  ovrd connect                                           serve the paired initiator
+  ovrd connect cloudflare:NAME 7KQX-M4RT --foreground    serve until stopped, installing nothing
+  ovrd connect ADDR github:FINGERPRINT --name windows    in a GitHub Actions job, in the background
+
+ADDR and CODE come from `ovr pair` on the initiator, `github:FINGERPRINT` from `ovr trust`.";
+
+/// Serve `ovr` runs on this host, and the initiator server `ovr` starts.
 #[derive(Debug, Parser)]
-#[command(name = "ovrd", version)]
+#[command(name = "ovrd", version, arg_required_else_help = true, after_help = EXAMPLES)]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Option<Command>,
+    pub command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Print a one-shot command for a host that must dial in, through a tunnel from PROVIDER if given.
-    Pair {
-        /// `cloudflare`, `devtunnel` or `tailcat`: open a tunnel with that provider's CLI unless one is open.
-        provider: Option<Provider>,
-    },
-    /// List open tunnels and the command that points a paired host at each.
-    Tunnel {
-        #[command(subcommand)]
-        command: Option<TunnelCommand>,
-    },
-    /// Trust workloads matching RULE, such as GitHub Actions jobs of a repository, to dial in without pairing.
-    /// Without RULE, list the rules. Either way, print what a trusted workload needs to dial in.
-    Trust {
-        /// `github:OWNER/REPO`, or `github:OWNER` for every repository of OWNER.
-        rule: Option<String>,
-    },
-    /// Stop trusting workloads matching RULE.
-    Untrust {
-        /// A rule as `ovrd trust` lists it.
-        rule: String,
-    },
-    /// On a host: pair with the initiator at ADDR, then keep serving it. Without a code, move a paired host to ADDR.
-    /// Without arguments, serve the paired initiator.
+    /// Pair with an initiator and serve it, at every login too.
+    ///
+    /// With a pairing code, pair with the initiator at ADDR, then keep serving it, at every login too. Without a
+    /// code, move a paired host to ADDR, a new address of the same initiator. Without arguments, serve the paired
+    /// initiator.
+    #[command(after_help = CONNECT_HELP)]
     Connect {
-        /// `host:port`, `cloudflare:HOSTNAME`, `devtunnel:ID`, or `tailcat:ADDRESS`, as printed by `ovrd pair` or `ovrd tunnel`.
+        /// `host:port`, `cloudflare:HOSTNAME`, `devtunnel:ID`, or `tailcat:ADDRESS`, as printed by `ovr pair` or `ovr tunnel`.
         addr: Option<tunnel::Addr>,
-        /// Pairing code printed by `ovrd pair`, or `github:FINGERPRINT` printed by `ovrd trust` to serve as this
+        /// Pairing code printed by `ovr pair`, or `github:FINGERPRINT` printed by `ovr trust` to serve as this
         /// GitHub Actions job, in the background until the job ends.
         #[arg(requires = "addr")]
         code: Option<String>,
@@ -74,18 +74,35 @@ pub enum Command {
         #[arg(long, hide = true, conflicts_with = "addr")]
         service: bool,
     },
-    /// Serve runs over stdin and stdout; started by `ovrd` over SSH.
+    /// Stop serving the initiator at login and forget it; runs here keep going.
+    ///
+    /// Stops and removes the login service that `ovrd connect` installed, and forgets the paired initiator, so
+    /// `ovrd connect` must pair again. Runs, checkouts, and this host's identity stay. An `ovrd connect` started in
+    /// the foreground keeps serving until it is stopped.
+    #[command(
+        after_help = "Example:\n  ovrd disconnect    on a host, to stop serving its initiator"
+    )]
+    Disconnect,
+    /// Show this host's state: its initiator, connection, login service, and runs.
+    ///
+    /// Reads this host's own files only: it contacts no initiator and starts nothing.
+    #[command(after_help = "Example:\n  ovrd status    on a host, before looking in connect.log")]
+    Status,
+    /// Remove every initiator's checkouts and finished runs on this machine, keeping those in use.
+    ///
+    /// Also removes agents of other versions uploaded over SSH. Checkouts being synced, and runs still running or
+    /// followed by a client, stay with their checkouts.
+    #[command(after_help = "Example:\n  ovrd clean    on a host, to free its disk")]
+    Clean,
+    /// Run the initiator server; started by `ovr`.
+    #[command(hide = true)]
+    Serve,
+    /// Serve runs over stdin and stdout; started by the initiator server over SSH.
     #[command(hide = true)]
     Agent,
     /// Keep the run in DIR: own its command and log, and serve attached clients; started by the agent.
     #[command(hide = true)]
     Keep { dir: std::path::PathBuf },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum TunnelCommand {
-    /// Close the tunnel `ovrd pair PROVIDER` opened, and delete what was created for it at the provider.
-    Close { provider: Provider },
 }
 
 #[derive(Debug, thiserror::Error, miette::Diagnostic)]
@@ -137,21 +154,14 @@ pub enum Error {
 /// Returns an error when the server or agent fails.
 pub async fn run(cli: Cli) -> Result<(), Error> {
     match cli.command {
-        None => until_stopped(server::run()).await,
-        Some(Command::Pair { provider }) => pair(provider).await,
-        Some(Command::Trust { rule }) => trust(Op::Trust { rule }).await,
-        Some(Command::Untrust { rule }) => trust(Op::Untrust { rule }).await,
-        Some(Command::Tunnel { command: None }) => tunnels().await,
-        Some(Command::Tunnel {
-            command: Some(TunnelCommand::Close { provider }),
-        }) => close_tunnel(provider).await,
-        Some(Command::Connect {
+        Command::Serve => until_stopped(server::run()).await,
+        Command::Connect {
             addr,
             code,
             name,
             foreground,
             ..
-        }) => {
+        } => {
             until_stopped(host::connect(
                 addr,
                 code.as_deref(),
@@ -160,8 +170,11 @@ pub async fn run(cli: Cli) -> Result<(), Error> {
             ))
             .await
         }
-        Some(Command::Agent) => Ok(agent::serve_stdio().await?),
-        Some(Command::Keep { dir }) => agent::keeper::main(dir).await,
+        Command::Disconnect => host::disconnect(),
+        Command::Status => status::status(),
+        Command::Clean => clean().await,
+        Command::Agent => Ok(agent::serve_stdio().await?),
+        Command::Keep { dir } => agent::keeper::main(dir).await,
     }
 }
 
@@ -200,163 +213,15 @@ async fn stopped() {
     }
 }
 
-/// Asks the running server, started if needed, for a pairing code.
-async fn pair(tunnel: Option<Provider>) -> Result<(), Error> {
-    if let Some(provider) = tunnel {
-        eprintln!("opening a {provider} tunnel unless one is open...");
+/// `ovrd clean`: removes every initiator's checkouts and finished runs here, without the initiator server.
+async fn clean() -> Result<(), Error> {
+    let config = agent::Config::detect()?;
+    let cleaned = tokio::task::spawn_blocking(move || agent::clean::clean(&config, None))
+        .await
+        .map_err(io::Error::from)??;
+    println!("{cleaned}");
+    for checkout in &cleaned.kept {
+        println!("kept {checkout}: in use");
     }
-    match request(Op::Pair { tunnel }).await? {
-        Response::Pair { addr, code } => {
-            println!("run this on the host within 10 minutes:\n  ovrd connect {addr} {code}");
-            Ok(())
-        }
-        other => Err(unexpected(other)),
-    }
-}
-
-/// `ovrd trust` and `ovrd untrust`: changes the rules, if asked to, then lists them and how a workload dials in.
-async fn trust(op: Op) -> Result<(), Error> {
-    let changed = match &op {
-        Op::Trust { rule: Some(rule) } => Some(format!("trusting {rule}")),
-        Op::Untrust { rule } => Some(format!("no longer trusting {rule}")),
-        _ => None,
-    };
-    match request(op).await? {
-        Response::Trust {
-            rules,
-            initiator,
-            addr,
-        } => {
-            if let Some(changed) = changed {
-                println!("{changed}");
-            }
-            if rules.is_empty() {
-                println!(
-                    "no workload is trusted; `ovrd trust github:OWNER/REPO` trusts a repository's jobs"
-                );
-                return Ok(());
-            }
-            println!("trusted:");
-            for rule in &rules {
-                println!("  {rule}");
-            }
-            let repo = rules
-                .iter()
-                .find_map(|rule| {
-                    rule.strip_prefix("github:")
-                        .filter(|spec| spec.contains('/'))
-                })
-                .unwrap_or("OWNER/REPO");
-            println!(
-                "\nstore where this machine is as repository variables (or organization variables, with --org):\n  \
-                 gh variable set OVR_ADDR --repo {repo} --body {addr}\n  \
-                 gh variable set OVR_INITIATOR --repo {repo} --body {initiator}\n\n\
-                 then add a step to a job with `permissions: id-token: write`:\n  \
-                 - if: failure() || runner.debug == '1'\n    \
-                 uses: nikhil-pandey/ovr@v{VERSION}\n    \
-                 with:\n      \
-                 addr: ${{{{ vars.OVR_ADDR }}}}\n      \
-                 initiator: ${{{{ vars.OVR_INITIATOR }}}}\n      \
-                 hold: 30m\n\n\
-                 or run `ovrd connect {addr} github:{initiator}` in any step"
-            );
-            if !addr.starts_with("devtunnel:") && !addr.starts_with("tailcat:") {
-                println!(
-                    "\nGitHub-hosted runners reach {addr} only through a tunnel or your tailnet; \
-                     `ovrd pair devtunnel` opens a tunnel whose address stays the same"
-                );
-            }
-            Ok(())
-        }
-        other => Err(unexpected(other)),
-    }
-}
-
-/// `ovrd tunnel`: lists open tunnels.
-async fn tunnels() -> Result<(), Error> {
-    match request(Op::Tunnels).await? {
-        Response::Tunnels { tunnels } if tunnels.is_empty() => {
-            println!("no tunnels are open; `ovrd pair PROVIDER` opens one");
-            Ok(())
-        }
-        Response::Tunnels { tunnels } => {
-            for tunnel in tunnels {
-                match tunnel.addr {
-                    Some(addr) => println!("{:<10}  ovrd connect {addr}", tunnel.provider),
-                    None => println!("{:<10}  (restarting)", tunnel.provider),
-                }
-            }
-            Ok(())
-        }
-        other => Err(unexpected(other)),
-    }
-}
-
-async fn close_tunnel(provider: Provider) -> Result<(), Error> {
-    match request(Op::CloseTunnel { provider }).await? {
-        Response::TunnelClosed => {
-            println!("closed the {provider} tunnel");
-            Ok(())
-        }
-        other => Err(unexpected(other)),
-    }
-}
-
-/// Sends `op` to the running server, started if needed, and returns its response. A server of another version is
-/// asked to make way first, as `ovr` does.
-async fn request(op: Op) -> Result<Response, Error> {
-    let program = std::env::current_exe()?;
-    let request = Frame::json(
-        FrameKind::Request,
-        &Request {
-            version: VERSION.to_owned(),
-            op,
-        },
-    )?;
-    // Servers before protocol 3 read the whole request before its version, and close on an operation they do not
-    // know without answering; one they all know gets them to restart.
-    let known = Frame::json(
-        FrameKind::Request,
-        &Request {
-            version: VERSION.to_owned(),
-            op: Op::Hosts,
-        },
-    )?;
-    let mut last = Error::Disconnected;
-    let mut probed = false;
-    for _ in 0..3 {
-        match exchange(&program, request.clone()).await {
-            Ok(Some(Response::Restart)) => {}
-            Ok(Some(response)) => return Ok(response),
-            Ok(None) if !probed => {
-                probed = true;
-                let probe = exchange(&program, known.clone()).await;
-                if !matches!(probe, Ok(Some(Response::Restart))) {
-                    return Err(Error::Disconnected);
-                }
-            }
-            Ok(None) => last = Error::Disconnected,
-            Err(err) => last = err,
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    Err(last)
-}
-
-/// Sends one request on a new connection, returning the response, if any came.
-async fn exchange(program: &Path, request: Frame) -> Result<Option<Response>, Error> {
-    let mut stream = frame::framed(ipc::connect_or_spawn(program).await?);
-    stream.send(request).await?;
-    match stream.next().await {
-        Some(frame) => Ok(Some(frame?.expect(FrameKind::Response)?)),
-        None => Ok(None),
-    }
-}
-
-fn unexpected(response: Response) -> Error {
-    match response {
-        Response::Failed { message } => Error::Host(message),
-        Response::Restart => Error::Host("ovrd was restarting; try again".to_owned()),
-        other => Error::Host(format!("unexpected response: {other:?}")),
-    }
+    Ok(())
 }

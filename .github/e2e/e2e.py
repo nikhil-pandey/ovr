@@ -268,12 +268,12 @@ def cmd_pair(args: argparse.Namespace) -> None:
         )
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=True)
-        # One after another: `ovrd pair` opens the tunnel once and reuses it.
+        # One after another: `ovr pair` opens the tunnel once and reuses it.
         for host in (host for host in HOSTS if host.endswith("-paired")):
-            printed = await arun(["ovrd", "pair", PROVIDER], private_output=True)
+            printed = await arun(["ovr", "pair", PROVIDER], private_output=True)
             found = re.search(r"^\s*ovrd connect (\S+) (\S+)\s*$", printed, re.MULTILINE)
             if not found:
-                raise SystemExit("ovrd pair printed no recognizable connect command")
+                raise SystemExit("ovr pair printed no recognizable connect command")
             addr, code = found.groups()
             say("initiator", f"pairing {tag(host)} through {addr}")
             await asyncio.to_thread(
@@ -297,11 +297,11 @@ def cmd_pair(args: argparse.Namespace) -> None:
             # Trusted jobs need no pairing, and the address and fingerprint they dial are not secret. Trusting before
             # any pairing would leave the tunnel unopened, so it opens one first.
             if "paired" not in KINDS:
-                await arun(["ovrd", "pair", PROVIDER], private_output=True)
-            printed = await arun(["ovrd", "trust", f"github:{os.environ['GITHUB_REPOSITORY']}"])
+                await arun(["ovr", "pair", PROVIDER], private_output=True)
+            printed = await arun(["ovr", "trust", f"github:{os.environ['GITHUB_REPOSITORY']}"])
             values = dict(re.findall(r"gh variable set (OVR_ADDR|OVR_INITIATOR) .*--body (\S+)", printed))
             if len(values) != 2:
-                raise SystemExit(f"ovrd trust printed no address and fingerprint:\n{printed}")
+                raise SystemExit(f"ovr trust printed no address and fingerprint:\n{printed}")
             (out / "trust").write_text(f"{values['OVR_ADDR']} {values['OVR_INITIATOR']}\n")
             say("initiator", f"trusting this repository's jobs through {values['OVR_ADDR']}")
 
@@ -653,15 +653,15 @@ def cmd_hosts(args: argparse.Namespace) -> None:
         hosts = {}
         for line in listing.splitlines():
             parts = line.split()
-            if len(parts) < 3 or parts[1] != "online":
+            if len(parts) < 4 or parts[2] != "online":
                 continue
-            name, os_name = parts[0], parts[2].split("/")[0]
-            if name.startswith(f"{job}/"):
+            name, kind, os_name = parts[0], parts[1], parts[3].split("/")[0]
+            if kind == "trusted" and name.startswith(f"{job}/"):
                 if not line.endswith(f"/actions/runs/{os.environ['GITHUB_RUN_ID']}"):
                     raise SystemExit(f"{name} does not show this run:\n{listing}")
                 # A trusted job names itself after its OS; any other name means it dialed in twice.
                 hosts[f"{os_name}-trusted" if name == f"{job}/{os_name}" else name] = name
-            elif "/" not in name:
+            elif kind == "paired":
                 hosts[f"{os_name}-paired"] = name
         if extra := set(hosts) - set(HOSTS):
             raise SystemExit(f"unexpected hosts {', '.join(sorted(extra))}:\n{listing}")

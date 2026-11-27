@@ -1,4 +1,4 @@
-//! Pairing records in the data directory, written atomically and readable only by the user.
+//! Pairing records in the data directory, and other JSON records, written atomically and readable only by the user.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,9 +21,11 @@ pub struct PairedHost {
 pub struct Initiator {
     pub addr: String,
     pub fingerprint: String,
+    /// The name this host paired under, which the initiator keeps for it whatever the host is later called.
+    pub name: String,
 }
 
-/// A tunnel the initiator keeps open, as recorded by `ovrd pair PROVIDER`.
+/// A tunnel the initiator keeps open, as recorded by `ovr pair PROVIDER`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tunnel {
     pub provider: Provider,
@@ -68,6 +70,22 @@ pub fn add_host(dir: &Path, host: PairedHost) -> io::Result<()> {
     write(&hosts_path(dir), &hosts)
 }
 
+/// Forgets the host paired as `name`, returning whether there was one.
+///
+/// # Errors
+///
+/// Returns an error when the records cannot be read or written.
+pub fn remove_host(dir: &Path, name: &str) -> io::Result<bool> {
+    let mut hosts = hosts(dir)?;
+    let before = hosts.len();
+    hosts.retain(|known| known.name != name);
+    if hosts.len() == before {
+        return Ok(false);
+    }
+    write(&hosts_path(dir), &hosts)?;
+    Ok(true)
+}
+
 /// # Errors
 ///
 /// Returns an error when the file exists but cannot be read or parsed.
@@ -80,6 +98,19 @@ pub fn initiator(dir: &Path) -> io::Result<Option<Initiator>> {
 /// Returns an error when the record cannot be written.
 pub fn set_initiator(dir: &Path, initiator: &Initiator) -> io::Result<()> {
     write(&initiator_path(dir), initiator)
+}
+
+/// Forgets the initiator this host dials, returning it if there was one.
+///
+/// # Errors
+///
+/// Returns an error when the record cannot be read or removed.
+pub fn forget_initiator(dir: &Path) -> io::Result<Option<Initiator>> {
+    let initiator = initiator(dir)?;
+    if initiator.is_some() {
+        std::fs::remove_file(initiator_path(dir))?;
+    }
+    Ok(initiator)
 }
 
 /// # Errors
@@ -110,7 +141,10 @@ pub fn set_trust_rules(dir: &Path, rules: &[Rule]) -> io::Result<()> {
     write(&trust_path(dir), &rules)
 }
 
-fn read<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read or parsed.
+pub fn read<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|err| {
             io::Error::new(
@@ -123,7 +157,12 @@ fn read<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     }
 }
 
-fn write<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+/// Replaces `path` with `value` as JSON, atomically and readable only by the owner.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be written.
+pub fn write<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
     bytes.push(b'\n');
     write_private(path, &bytes)

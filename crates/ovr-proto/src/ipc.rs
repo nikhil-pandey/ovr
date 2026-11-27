@@ -68,7 +68,7 @@ pub async fn connect_to(endpoint: &Path) -> io::Result<ClientStream> {
     }
 }
 
-/// Connects to `ovrd`, starting `program` in the background first if it is not running.
+/// Connects to `ovrd`, starting `program serve` in the background first if it is not running.
 ///
 /// # Errors
 ///
@@ -89,10 +89,10 @@ pub async fn connect_or_spawn(program: &Path) -> io::Result<ClientStream> {
     }
 }
 
-/// Starts `program` detached from this process, its terminal, and its signals, logging to `ovrd.log`.
+/// Starts `program serve` detached from this process, its terminal, and its signals, logging to `ovrd.log`.
 fn spawn(program: &Path) -> io::Result<()> {
     let log = std::fs::File::create(paths::log_dir()?.join("ovrd.log"))?;
-    spawn_detached(program, &[], log)
+    spawn_detached(program, &["serve".into()], log)
 }
 
 /// Starts `program` with `args` detached from this process, its terminal, and its signals, with stderr going to

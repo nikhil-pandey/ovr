@@ -99,6 +99,21 @@ pub struct Cleaned {
     pub kept: Vec<String>,
 }
 
+/// What was removed, as in `removed 1 checkout, 2 runs, 0 agents; freed 1.5 GiB`.
+impl std::fmt::Display for Cleaned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = |n: u64, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+        write!(
+            f,
+            "removed {}, {}, {}; freed {}",
+            count(self.checkouts, "checkout"),
+            count(self.runs, "run"),
+            count(self.agents, "agent"),
+            crate::format_bytes(self.bytes)
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunInfo {
     pub run: u64,
@@ -123,6 +138,18 @@ pub enum RunState {
     },
     /// The keeper died without recording how the command ended.
     Lost,
+}
+
+/// As `ovr ps` lists it: `running`, `exited 0`, `failed`, or `lost`.
+impl std::fmt::Display for RunState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Running => f.write_str("running"),
+            Self::Exited { code } => write!(f, "exited {code}"),
+            Self::Failed { .. } => f.write_str("failed"),
+            Self::Lost => f.write_str("lost"),
+        }
+    }
 }
 
 /// `RESIZE`: the client's terminal changed size.
@@ -234,23 +261,25 @@ pub struct Request {
 pub enum Op {
     /// Open a stream to `host`'s agent. After [`Response::Opened`] the socket carries it verbatim.
     Open { host: String },
-    /// List paired hosts.
+    /// List paired hosts, and trusted and SSH hosts while connected.
     Hosts,
-    /// List hosts with an open connection: dialed-in hosts that are online and SSH hosts in use.
-    Connected,
     /// Issue a pairing code, for an address through a tunnel from `tunnel` if given, which is opened first.
     Pair { tunnel: Option<Provider> },
+    /// Forget the paired host `host` and close its connection; it is refused when it reconnects.
+    Unpair { host: String },
     /// List open tunnels.
     Tunnels,
     /// Close the tunnel from `provider` and delete what `ovrd` created there.
     CloseTunnel { provider: Provider },
-    /// Remove every checkout and finished run on this machine, and downloaded and uploaded agents of other versions.
-    Clean,
+    /// Remove agents downloaded for other versions.
+    CleanDownloads,
     /// Trust workloads matching `rule`, as in `github:OWNER/REPO`, to dial in without pairing; without one, list the
     /// rules.
     Trust { rule: Option<String> },
     /// Stop trusting workloads matching `rule`.
     Untrust { rule: String },
+    /// Report the initiator's state.
+    Status,
 }
 
 /// `RESPONSE`: the local `ovrd`'s answer to a [`Request`].
@@ -261,26 +290,45 @@ pub enum Response {
     Opened {
         initiator: String,
     },
+    /// Sorted by kind, then name.
     Hosts {
         hosts: Vec<HostStatus>,
-    },
-    Connected {
-        hosts: Vec<String>,
     },
     Pair {
         addr: String,
         code: String,
     },
+    /// The host was forgotten; `disconnected` when its connection was open and is now closed.
+    Unpaired {
+        disconnected: bool,
+    },
     Tunnels {
         tunnels: Vec<TunnelStatus>,
     },
     TunnelClosed,
-    Cleaned(Cleaned),
+    /// How many downloaded agents were removed, and the bytes they held.
+    DownloadsCleaned {
+        agents: u64,
+        bytes: u64,
+    },
     /// The trust rules, this initiator's fingerprint, and the address trusted workloads should dial.
     Trust {
         rules: Vec<String>,
         initiator: String,
         addr: String,
+    },
+    /// The initiator's state, as `ovr status` reports it.
+    Status {
+        /// This initiator's fingerprint, which hosts pin.
+        fingerprint: String,
+        /// The address `ovr pair` prints, while listening for dial-in hosts.
+        listening: Option<String>,
+        tunnels: Vec<TunnelStatus>,
+        rules: Vec<String>,
+        /// As [`Response::Hosts`] lists them.
+        hosts: Vec<HostStatus>,
+        /// The data, cache, and state directories, and `ovrd.log`.
+        paths: Vec<Location>,
     },
     /// `ovrd` is a different version and is exiting; reconnect to start the matching one.
     Restart,
@@ -289,14 +337,72 @@ pub enum Response {
     },
 }
 
+/// A directory or file of `ovr`'s, and the `OVR_*` variable that moved it, if one did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Location {
+    pub name: String,
+    pub path: String,
+    pub moved_by: Option<String>,
+}
+
+impl Location {
+    /// `path`, named `name`, which `var` moves when set.
+    #[must_use]
+    pub fn new(name: &str, path: &std::path::Path, var: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            path: path.display().to_string(),
+            moved_by: crate::paths::overridden(var).map(|_| var.to_owned()),
+        }
+    }
+}
+
+/// The path, then the variable that moved it, as in `/nvme/ovr  (OVR_CHECKOUTS)`.
+impl std::fmt::Display for Location {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.path)?;
+        match &self.moved_by {
+            Some(var) => write!(f, "  ({var})"),
+            None => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostStatus {
     pub name: String,
+    pub kind: HostKind,
     /// Present while the host is connected.
     pub platform: Option<Platform>,
+    /// Seconds since the Unix epoch: when the host connected, or for an offline paired host, when it was last
+    /// connected, if since `ovrd` started.
+    pub since: Option<u64>,
     /// What a trusted host serves, such as its workflow run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub about: Option<String>,
+}
+
+/// How the initiator reaches a host. Ordered as `ovr hosts` lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostKind {
+    /// Dials in, paired with a code.
+    Paired,
+    /// Dials in with a token a trust rule admits.
+    Trusted,
+    /// Reached over SSH.
+    Ssh,
+}
+
+/// As `ovr hosts` lists it: `paired`, `trusted`, or `ssh`.
+impl std::fmt::Display for HostKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Paired => "paired",
+            Self::Trusted => "trusted",
+            Self::Ssh => "ssh",
+        })
+    }
 }
 
 /// A tunnel provider, whose CLI `ovrd` runs to reach the initiator from networks that cannot.

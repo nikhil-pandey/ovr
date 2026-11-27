@@ -153,22 +153,28 @@ impl World {
         Ok(self.ovr(args).output()?)
     }
 
-    /// Runs the initiator's `ovrd`, failing unless it succeeds, and returns its output.
-    fn ovrd(&self, args: &[&str]) -> Result<String> {
+    /// Runs `ovr`, failing unless it succeeds, and returns its output.
+    fn ovr_ok(&self, args: &[&str]) -> Result<String> {
+        let output = self.run(args)?;
+        if !output.status.success() {
+            return Err(format!("ovr {args:?} failed: {}", text(&output.stderr)).into());
+        }
+        Ok(text(&output.stdout))
+    }
+
+    /// Runs `ovrd` on the SSH host, as its user would there, and returns its output.
+    fn host_ovrd(&self, args: &[&str]) -> Result<Output> {
         let mut command = Command::new(&self.ovrd);
         command
             .args(args)
-            .env("HOME", self.file("initiator"))
-            .env("PATH", &self.path)
+            .current_dir(self.host())
+            .env("HOME", self.host())
+            .env("PATH", &self.host_path)
             .stdin(Stdio::null());
         for var in XDG {
             command.env_remove(var);
         }
-        let output = command.output()?;
-        if !output.status.success() {
-            return Err(format!("ovrd {args:?} failed: {}", text(&output.stderr)).into());
-        }
-        Ok(text(&output.stdout))
+        Ok(command.output()?)
     }
 
     /// Starts `ovrd connect ARGS --foreground` on a dial-in host with a home of its own, and waits until it serves.
@@ -185,7 +191,12 @@ impl World {
             .env("PATH", &self.host_path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(home.join("connect.log"))?,
+            );
         for var in XDG {
             command.env_remove(var);
         }
@@ -194,6 +205,7 @@ impl World {
         let mut connected = Connected {
             child,
             name: String::new(),
+            log: home.join("connect.log"),
         };
         // Pairing through a tunnel can take a while: the first line comes once the host has reached the initiator.
         let line = BufReader::new(stdout)
@@ -286,6 +298,25 @@ impl Drop for World {
 struct Connected {
     child: std::process::Child,
     name: String,
+    /// Where its log goes, shared with other hosts started in the same home.
+    log: PathBuf,
+}
+
+impl Connected {
+    /// Waits until the host has logged `text`.
+    fn logged(&self, text: &str) -> Result {
+        let deadline = Instant::now() + Duration::from_mins(1);
+        loop {
+            let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+            if log.contains(text) {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                return Err(format!("the host never logged {text:?}:\n{log}").into());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 }
 
 impl Drop for Connected {
@@ -308,7 +339,7 @@ struct Tunnel<'a>(&'a World, &'static str);
 
 impl Drop for Tunnel<'_> {
     fn drop(&mut self) {
-        let _ = self.0.ovrd(&["tunnel", "close", self.1]);
+        let _ = self.0.ovr_ok(&["tunnel", "close", self.1]);
     }
 }
 
@@ -319,7 +350,7 @@ fn dial_in() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The address and code in the command `ovrd pair` prints.
+/// The address and code in the command `ovr pair` prints.
 fn pairing(printed: &str) -> Result<(String, String)> {
     let line = printed
         .lines()
@@ -461,11 +492,13 @@ fn runs_in_the_foreground_and_the_background() -> Result {
     );
 
     assert_eq!(world.run(&["kill", "box", &run])?.status.code(), Some(0));
-    let logs = world.run(&["logs", "box", &run])?;
+    // Without RUN, the latest run.
+    let logs = world.run(&["logs", "box"])?;
     assert_eq!(
         (logs.status.code(), text(&logs.stdout).as_str()),
         (Some(128 + 9), "begun\n")
     );
+    assert!(text(&logs.stderr).contains(&format!("ovr: run {run} on box")));
     let ps = text(&world.run(&["ps"])?.stdout);
     assert_eq!(row(&ps, "sleep 30"), Some((run, "exited 137".to_owned())));
     Ok(())
@@ -633,8 +666,25 @@ fn cleans_hosts_and_this_machine_but_not_what_is_running() -> Result {
         (here.status.code(), text(&here.stdout).as_str()),
         (
             Some(0),
-            "this machine: removed 0 checkouts, 0 runs, 0 agents; freed 0 B\n"
+            "this machine: removed 0 downloaded agents; freed 0 B\n"
         )
+    );
+
+    // On the host, `ovrd clean` removes every initiator's, without an initiator server there.
+    let run = world
+        .ovr_ok(&["-d", "box", "--", "true"])?
+        .trim()
+        .to_owned();
+    let lock = world.run_dir(&run).join("lock");
+    wait_for("the keeper to exit", || {
+        ovr_proto::lock::Lock::try_exclusive(&lock).is_ok_and(|held| held.is_some())
+    })?;
+    let there = world.host_ovrd(&["clean"])?;
+    let report = text(&there.stdout);
+    assert!(
+        there.status.success() && report.starts_with("removed 1 checkout, 1 run, 0 agents; freed "),
+        "{report}{}",
+        text(&there.stderr)
     );
     Ok(())
 }
@@ -780,16 +830,16 @@ fn dial_in_hosts_pair_directly_then_move_to_a_cloudflare_tunnel() -> Result {
     let _port = dial_in();
     let world = World::new()?;
 
-    let (_, code) = pairing(&world.ovrd(&["pair"])?)?;
+    let (_, code) = pairing(&world.ovr_ok(&["pair"])?)?;
     let host = world.connect(&["127.0.0.1:7420", &code])?;
     world.cat(&host.name)?;
     let name = host.name.clone();
     drop(host);
 
     let _tunnel = Tunnel(&world, "cloudflare");
-    let (addr, _) = pairing(&world.ovrd(&["pair", "cloudflare"])?)?;
+    let (addr, _) = pairing(&world.ovr_ok(&["pair", "cloudflare"])?)?;
     assert!(addr.starts_with("cloudflare:"), "{addr}");
-    let listed = world.ovrd(&["tunnel"])?;
+    let listed = world.ovr_ok(&["tunnel"])?;
     assert!(listed.contains(&format!("ovrd connect {addr}")), "{listed}");
 
     let host = world.connect(&[&addr])?;
@@ -798,12 +848,20 @@ fn dial_in_hosts_pair_directly_then_move_to_a_cloudflare_tunnel() -> Result {
     let wrong = world.connect(&[&addr, "AAAA-AAAA"]);
     assert!(wrong.is_err(), "a wrong code is rejected");
 
+    let unpaired = world.ovr_ok(&["unpair", &name])?;
+    assert!(unpaired.contains("closed its connection"), "{unpaired}");
+    // The host keeps dialing in, and is refused.
+    host.logged("this host is not paired with the initiator")?;
+    let hosts = world.ovr_ok(&["hosts"])?;
+    assert!(!hosts.contains(&name), "{hosts}");
+    drop(host);
+
     assert!(
         world
-            .ovrd(&["tunnel", "close", "cloudflare"])?
+            .ovr_ok(&["tunnel", "close", "cloudflare"])?
             .contains("closed")
     );
-    assert!(world.ovrd(&["tunnel"])?.contains("no tunnels are open"));
+    assert!(world.ovr_ok(&["tunnel"])?.contains("no tunnels are open"));
     Ok(())
 }
 
@@ -814,18 +872,18 @@ fn dial_in_hosts_pair_through_a_dev_tunnel() -> Result {
     let world = World::new()?;
 
     let _tunnel = Tunnel(&world, "devtunnel");
-    let (addr, code) = pairing(&world.ovrd(&["pair", "devtunnel"])?)?;
+    let (addr, code) = pairing(&world.ovr_ok(&["pair", "devtunnel"])?)?;
     let id = addr
         .strip_prefix("devtunnel:")
         .ok_or_else(|| format!("not a dev tunnel: {addr}"))?
         .to_owned();
-    let (again, _) = pairing(&world.ovrd(&["pair", "devtunnel"])?)?;
+    let (again, _) = pairing(&world.ovr_ok(&["pair", "devtunnel"])?)?;
     assert_eq!(again, addr, "an open tunnel is reused");
 
     let host = world.connect(&[&addr, &code])?;
     world.cat(&host.name)?;
 
-    world.ovrd(&["tunnel", "close", "devtunnel"])?;
+    world.ovr_ok(&["tunnel", "close", "devtunnel"])?;
     let show = Command::new("devtunnel")
         .args(["show", &id])
         .stdout(Stdio::null())
@@ -849,7 +907,7 @@ fn tailcat_hosts_reconnect_after_restart_and_close_rotates_the_address() -> Resu
     )?;
     std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))?;
     let _tunnel = Tunnel(&world, "tailcat");
-    let (addr, code) = pairing(&world.ovrd(&["pair", "tailcat"])?)?;
+    let (addr, code) = pairing(&world.ovr_ok(&["pair", "tailcat"])?)?;
     let public = addr
         .strip_prefix("tailcat:")
         .ok_or("missing tailcat prefix")?;
@@ -867,13 +925,13 @@ fn tailcat_hosts_reconnect_after_restart_and_close_rotates_the_address() -> Resu
     wait_for("the replacement Tailcat listener", || {
         std::fs::read_to_string(&pid_path).is_ok_and(|new| !new.trim().is_empty() && new != pid)
     })?;
-    assert_eq!(pairing(&world.ovrd(&["pair", "tailcat"])?)?.0, addr);
+    assert_eq!(pairing(&world.ovr_ok(&["pair", "tailcat"])?)?.0, addr);
 
     let host = world.connect(&[&addr, &code])?;
     world.cat(&host.name)?;
 
     world.stop_server();
-    let (restored, _) = pairing(&world.ovrd(&["pair", "tailcat"])?)?;
+    let (restored, _) = pairing(&world.ovr_ok(&["pair", "tailcat"])?)?;
     assert_eq!(restored, addr);
     world.cat(&host.name)?;
     std::fs::write(world.file("repo/msg.txt"), "after restart\n")?;
@@ -882,9 +940,9 @@ fn tailcat_hosts_reconnect_after_restart_and_close_rotates_the_address() -> Resu
     assert_eq!(text(&changed.stdout), "after restart\n");
     drop(host);
 
-    world.ovrd(&["tunnel", "close", "tailcat"])?;
-    assert!(world.ovrd(&["tunnel"])?.contains("no tunnels are open"));
-    let (fresh, _) = pairing(&world.ovrd(&["pair", "tailcat"])?)?;
+    world.ovr_ok(&["tunnel", "close", "tailcat"])?;
+    assert!(world.ovr_ok(&["tunnel"])?.contains("no tunnels are open"));
+    let (fresh, _) = pairing(&world.ovr_ok(&["pair", "tailcat"])?)?;
     assert_ne!(fresh, addr);
     let stale = Command::new("tailcat")
         .args(["--key=new", "ping", "--timeout=5s", public])

@@ -126,7 +126,7 @@ jobs:
         name: Close the tunnel
         run: |
           mkdir -p finished && echo finished >finished/finished
-          ovrd tunnel close "$TUNNEL_PROVIDER" || true
+          ovr tunnel close "$TUNNEL_PROVIDER" || true
           mkdir -p logs && cp ~/.local/state/ovr/ovrd.log logs/ 2>/dev/null || true
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

@@ -1,5 +1,7 @@
 //! `ovrd connect` on a dial-in host: pair once, then keep a connection to the initiator open and serve runs over it.
 
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,11 +11,13 @@ use ovr_proto::lock::Lock;
 use ovr_proto::msg::{Accepted, Failure, Federated, Pair, PairOk};
 use ovr_proto::{Frame, FrameKind};
 use rustls::pki_types::ServerName;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
+use crate::agent::runs::now;
 use crate::mux::Incoming;
 use crate::state::{self, Initiator};
 use crate::tls::{self, Identity};
@@ -48,33 +52,111 @@ pub async fn connect(
     name: Option<&str>,
     foreground: bool,
 ) -> Result<(), Error> {
-    match (addr, code) {
+    match (&addr, code) {
         (Some(addr), Some(code)) if code.contains(':') => {
             let federation = code.parse().map_err(Error::Invalid)?;
-            return federated(addr, federation, name, foreground).await;
+            return federated(addr.clone(), federation, name, foreground).await;
         }
         _ if name.is_some() => {
             return Err(Error::Invalid(
                 "--name names a host serving as a workload, with PROVIDER:FINGERPRINT".to_owned(),
             ));
         }
-        (Some(addr), Some(code)) => pair(&addr, code).await?,
-        (Some(addr), None) => move_to(&addr).await?,
-        (None, _) => return serve().await,
+        _ => {}
+    }
+    let dir = ovr_proto::paths::data_dir()?;
+    // Serving without an address needs a pairing, whoever holds the lock.
+    if addr.is_none() {
+        paired(&dir)?;
+    }
+    // Only a login service may already be serving when this pairs or moves, as installing restarts it: anything else
+    // holding the lock fails here, before the pairing changes under it.
+    let lock = Lock::try_exclusive(&dir.join("connect.lock"))?;
+    if lock.is_none()
+        && (foreground || addr.is_none() || !matches!(autostart::installed(), Ok(Some(_))))
+    {
+        return Err(already_serving(&dir)?);
+    }
+    match (addr, code) {
+        (Some(addr), Some(code)) => pair(&dir, &addr, code).await?,
+        (Some(addr), None) => move_to(&dir, &addr).await?,
+        (None, _) => return serve(&dir, lock).await,
     }
     if foreground {
-        return serve().await;
+        return serve(&dir, lock).await;
     }
+    // The service takes the lock over.
+    drop(lock);
     match autostart::install() {
         Ok(()) => {
-            println!("ovrd connect now runs in the background and at every login");
+            println!(
+                "ovrd connect now runs in the background and at every login, serving as {}; log: {}",
+                paired(&dir)?.name,
+                log_path()?.display()
+            );
             Ok(())
         }
         Err(err) => {
             eprintln!("cannot start ovrd connect at login ({err}); serving until interrupted");
-            serve().await
+            serve(&dir, None).await
         }
     }
+}
+
+/// `ovrd disconnect`: stops and removes the login service and forgets the paired initiator. Run keepers, checkouts,
+/// and this host's identity stay, and so do runs still running.
+///
+/// # Errors
+///
+/// Returns an error when the service manager rejects the removal or the pairing cannot be removed.
+pub fn disconnect() -> Result<(), Error> {
+    let dir = ovr_proto::paths::data_dir()?;
+    let service = autostart::uninstall()?;
+    let initiator = state::forget_initiator(&dir)?;
+    let mut done = vec![service.map_or_else(
+        || "no login service was installed".to_owned(),
+        |service| format!("removed {service}"),
+    )];
+    done.push(initiator.as_ref().map_or_else(
+        || "not paired".to_owned(),
+        |initiator| {
+            format!(
+                "forgot initiator {} ({})",
+                initiator.addr, initiator.fingerprint
+            )
+        },
+    ));
+    println!("{}", done.join("; "));
+    if let Some(Initiator { name, .. }) = &initiator {
+        println!("the initiator lists this host as {name} until `ovr unpair {name}` runs there");
+    }
+    // Removing the service stopped its `ovrd connect`, which may take a moment to let go of the lock; one started
+    // by hand keeps holding it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while Lock::try_exclusive(&dir.join("connect.lock"))?.is_none() {
+        if std::time::Instant::now() >= deadline {
+            println!(
+                "an ovrd connect started in a terminal is still serving; stop it to disconnect now"
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
+}
+
+fn log_path() -> io::Result<PathBuf> {
+    Ok(ovr_proto::paths::log_dir()?.join("connect.log"))
+}
+
+/// The error for a second `ovrd connect` while one is serving.
+fn already_serving(dir: &Path) -> Result<Error, Error> {
+    let addr = state::initiator(dir)?.map_or_else(|| "the paired initiator".to_owned(), |i| i.addr);
+    Ok(Error::Invalid(format!(
+        "ovrd connect is already serving {addr}; ovrd status shows whether it is connected, and connect.log at {} \
+         has details",
+        log_path()?.display()
+    )))
 }
 
 /// Serves the initiator at `addr` as a workload `federation`'s provider vouches for, such as a GitHub Actions job,
@@ -140,14 +222,14 @@ async fn federated(
 }
 
 /// Pairs with the initiator at `addr` using `code`.
-async fn pair(addr: &Addr, code: &str) -> Result<(), Error> {
+async fn pair(dir: &Path, addr: &Addr, code: &str) -> Result<(), Error> {
     let code = pairing::normalize(code).ok_or_else(|| {
         Error::Invalid(format!(
             "{code:?} is not a pairing code; it looks like 7KQX-M4RT"
         ))
     })?;
-    let dir = ovr_proto::paths::data_dir()?;
-    let identity = Identity::load_or_create(&dir)?;
+    let previous = state::initiator(dir)?;
+    let identity = Identity::load_or_create(dir)?;
     let (_forwarder, mut stream, initiator) = dial(&identity, addr).await?;
 
     let hostname = agent::hostname();
@@ -167,11 +249,21 @@ async fn pair(addr: &Addr, code: &str) -> Result<(), Error> {
             "{addr} did not prove it issued the code; something may be intercepting the connection"
         )));
     }
+    if let Some(previous) = previous.filter(|previous| previous.fingerprint != initiator) {
+        eprintln!(
+            "replacing the pairing with {} ({}): a host serves one initiator; that initiator will see {name} \
+             offline until it runs ovr unpair {name}",
+            previous.addr,
+            previous.fingerprint,
+            name = previous.name
+        );
+    }
     state::set_initiator(
-        &dir,
+        dir,
         &Initiator {
             addr: addr.to_string(),
             fingerprint: initiator,
+            name: hostname.clone(),
         },
     )?;
     println!("paired with {addr}; serving as {hostname}");
@@ -179,10 +271,9 @@ async fn pair(addr: &Addr, code: &str) -> Result<(), Error> {
 }
 
 /// Points this host at `addr` once the initiator there proves it is the one this host paired with.
-async fn move_to(addr: &Addr) -> Result<(), Error> {
-    let dir = ovr_proto::paths::data_dir()?;
-    let mut initiator = paired(&dir)?;
-    let identity = Identity::load_or_create(&dir)?;
+async fn move_to(dir: &Path, addr: &Addr) -> Result<(), Error> {
+    let mut initiator = paired(dir)?;
+    let identity = Identity::load_or_create(dir)?;
     let (_forwarder, _stream, fingerprint) = dial(&identity, addr).await?;
     if fingerprint != initiator.fingerprint {
         return Err(Error::Pairing(format!(
@@ -190,35 +281,86 @@ async fn move_to(addr: &Addr) -> Result<(), Error> {
         )));
     }
     initiator.addr = addr.to_string();
-    state::set_initiator(&dir, &initiator)?;
-    println!("moved to {addr}; serving as {}", agent::hostname());
+    state::set_initiator(dir, &initiator)?;
+    println!("moved to {addr}; serving as {}", initiator.name);
     Ok(())
 }
 
-fn paired(dir: &std::path::Path) -> Result<Initiator, Error> {
+fn paired(dir: &Path) -> Result<Initiator, Error> {
     state::initiator(dir)?.ok_or_else(|| {
         Error::Invalid(
-            "not paired; run the `ovrd connect ADDR CODE` command `ovrd pair` prints".to_owned(),
+            "not paired; run the `ovrd connect ADDR CODE` command `ovr pair` prints".to_owned(),
         )
     })
 }
 
-/// Serves the paired initiator forever, reconnecting with backoff.
-///
-/// # Errors
-///
-/// Returns an error when this host is not paired or another `ovrd connect` is already serving.
-pub async fn serve() -> Result<(), Error> {
-    let dir = ovr_proto::paths::data_dir()?;
-    let Some(_lock) = Lock::try_exclusive(&dir.join("connect.lock"))? else {
-        return Err(Error::Invalid("ovrd connect is already running".to_owned()));
+/// Serves the paired initiator forever, reconnecting with backoff, holding `connect.lock` if given or taking it.
+async fn serve(dir: &Path, lock: Option<Lock>) -> Result<(), Error> {
+    let _lock = match lock {
+        Some(lock) => lock,
+        None => match Lock::try_exclusive(&dir.join("connect.lock"))? {
+            Some(lock) => lock,
+            None => return Err(already_serving(dir)?),
+        },
     };
-    let initiator = paired(&dir)?;
+    let initiator = paired(dir)?;
     let addr: Addr = initiator.addr.parse().map_err(Error::Invalid)?;
-    let identity = Identity::load_or_create(&dir)?;
+    let identity = Identity::load_or_create(dir)?;
     let config = Arc::new(agent::Config::detect()?);
     tracing::info!(%addr, "serving");
     keep_serving(&identity, &addr, &initiator.fingerprint, None, &config).await
+}
+
+/// Whether `ovrd connect` is connected to the paired initiator, as it records in `connect.json` for `ovrd status`.
+/// `since` is in seconds since the Unix epoch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Connection {
+    Connected {
+        since: u64,
+    },
+    /// Not connected since serving started or the last connection ended; `error` is why the last attempt failed,
+    /// if one has.
+    Retrying {
+        since: u64,
+        error: Option<String>,
+    },
+}
+
+/// `connect.json` in the state directory, beside `connect.log`.
+fn connection_path() -> io::Result<PathBuf> {
+    Ok(ovr_proto::paths::log_dir()?.join("connect.json"))
+}
+
+/// What the last `ovrd connect` recorded, which is stale unless one still holds `connect.lock`.
+///
+/// # Errors
+///
+/// Returns an error when the record exists but cannot be read.
+pub fn connection() -> io::Result<Option<Connection>> {
+    state::read(&connection_path()?)
+}
+
+/// Records [`Connection`] changes while serving the paired initiator, and removes the record when serving ends.
+/// Workloads record nothing: several may serve at once, and none holds `connect.lock`.
+struct Report(Option<PathBuf>);
+
+impl Report {
+    fn write(&self, connection: &Connection) {
+        if let Some(path) = &self.0
+            && let Err(err) = state::write(path, connection)
+        {
+            tracing::warn!(%err, path = %path.display(), "cannot record the connection");
+        }
+    }
+}
+
+impl Drop for Report {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// A workload a host serves as, and the label that tells it apart from others of that workload.
@@ -240,9 +382,15 @@ async fn keep_serving(
         Addr::Direct(_) => MAX_BACKOFF,
         Addr::Tunnel { .. } => MAX_TUNNEL_BACKOFF,
     };
+    let report = Report(match workload {
+        Some(_) => None,
+        None => Some(connection_path()?),
+    });
     let mut backoff = Duration::from_secs(1);
-    // Retries come every few seconds while the initiator is away, so only a new reason is logged.
+    // Retries come every few seconds while the initiator is away, so only a new reason is logged and recorded.
     let mut reported = None;
+    let mut since = now();
+    report.write(&Connection::Retrying { since, error: None });
     loop {
         match attach(identity, addr, pinned, workload).await {
             Ok((forwarder, stream, name)) => {
@@ -251,11 +399,14 @@ async fn keep_serving(
                 } else {
                     tracing::info!("connected");
                 }
+                report.write(&Connection::Connected { since: now() });
                 backoff = Duration::from_secs(1);
                 reported = None;
                 agent::serve(Incoming::accept_with_heartbeat(stream), Arc::clone(config)).await;
                 drop(forwarder);
                 tracing::info!("disconnected");
+                since = now();
+                report.write(&Connection::Retrying { since, error: None });
             }
             Err(err) => {
                 let reason = err.to_string();
@@ -263,6 +414,10 @@ async fn keep_serving(
                     tracing::debug!(%reason, "still cannot reach the initiator");
                 } else {
                     tracing::info!(%reason, "cannot reach the initiator; retrying until it answers");
+                    report.write(&Connection::Retrying {
+                        since,
+                        error: Some(reason.clone()),
+                    });
                     reported = Some(reason);
                 }
                 tokio::time::sleep(backoff).await;
@@ -292,7 +447,7 @@ async fn attach(
         return Err(Error::Pairing(match workload {
             Some(_) => format!(
                 "{addr} presented a different identity than the fingerprint this host was given; check it with \
-                 `ovrd trust` on the initiator"
+                 `ovr trust` on the initiator"
             ),
             None => format!(
                 "{addr} presented a different identity than when paired; pair again if the initiator was reset"

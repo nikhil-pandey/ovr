@@ -1,5 +1,5 @@
-//! Tunnels to the dial-in port that the initiator keeps open: opened by `ovrd pair PROVIDER`, restarted whenever the
-//! provider's CLI exits, reopened whenever `ovrd` starts, and closed only by `ovrd tunnel close PROVIDER`.
+//! Tunnels to the dial-in port that the initiator keeps open: opened by `ovr pair PROVIDER`, restarted whenever the
+//! provider's CLI exits, reopened whenever `ovrd` starts, and closed only by `ovr tunnel close PROVIDER`.
 
 use std::collections::HashMap;
 use std::io;
@@ -15,7 +15,7 @@ use tokio::time::Instant;
 use crate::tunnel::{self, Addr, Running};
 use crate::{Error, state};
 
-/// How long `ovrd pair` waits for a tunnel that is already open but restarting.
+/// How long `ovr pair` waits for a tunnel that is already open but restarting.
 const RESTART_WAIT: Duration = Duration::from_secs(60);
 
 /// Restart delays, and how long a tunnel must stay up for them to start over.
@@ -135,7 +135,7 @@ impl Tunnels {
                             tracing::warn!(%provider, %err, "cannot update the tunnel records");
                         }
                     }
-                    // Kept, and retried, rather than forgotten at the provider; `ovrd tunnel close` deletes it.
+                    // Kept, and retried, rather than forgotten at the provider; `ovr tunnel close` deletes it.
                     Err(err) => {
                         tracing::warn!(%provider, %err, "cannot delete the tunnel; keeping it open");
                         self.open
@@ -303,7 +303,7 @@ async fn replace(records: &Records, record: &Mutex<state::Tunnel>) -> bool {
         provider = %new.provider,
         old = old.id.as_deref().unwrap_or_default(),
         new = new.id.as_deref().unwrap_or_default(),
-        "the tunnel was gone, so a new one replaces it; `ovrd tunnel` shows the command that moves paired hosts to it"
+        "the tunnel was gone, so a new one replaces it; `ovr tunnel` shows the command that moves paired hosts to it"
     );
     *record.lock().unwrap_or_else(PoisonError::into_inner) = new;
     true

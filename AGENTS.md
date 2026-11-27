@@ -5,8 +5,10 @@ source of truth for behaviour; read it before changing anything user-visible.
 
 ## Layout
 
-- `crates/ovr`: the CLI. Snapshots the tree and hands the run to the local `ovrd`.
-- `crates/ovrd`: the server. Initiator-side host connections, and the agent that runs on hosts.
+- `crates/ovr`: the CLI, every command typed on the initiator. Snapshots the tree and hands the run to the local
+  `ovrd`.
+- `crates/ovrd`: the server. Initiator-side host connections (`ovrd serve`, started by `ovr`), the agent that runs on
+  hosts, and the commands typed on a host.
 - `crates/ovr-proto`: what both binaries share: the wire format, running `git`, where files live, and finding and
   starting the local `ovrd`.
 - `action.yml`: the GitHub action that connects a job to an initiator through `ovrd connect ADDR github:FP`. It stays

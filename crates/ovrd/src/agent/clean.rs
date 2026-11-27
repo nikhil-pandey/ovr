@@ -132,7 +132,9 @@ pub fn remove(path: &Path) -> u64 {
     }
 }
 
-fn size(path: &Path) -> u64 {
+/// The bytes of the files at `path` and below, counting what can be read.
+#[must_use]
+pub fn size(path: &Path) -> u64 {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return 0;
     };

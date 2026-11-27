@@ -52,7 +52,7 @@ impl<W: Write> Report<W> {
             self.out,
             "fetching: {}, {} so far",
             count(stats.files, "file"),
-            crate::bytes(stats.bytes)
+            ovr_proto::format_bytes(stats.bytes)
         );
         let _ = self.out.flush();
         self.drawn = Some(Instant::now());
@@ -82,8 +82,8 @@ fn summary(stats: &Stats, dest: &Path, elapsed: Duration) -> String {
         let _ = write!(
             line,
             ", {} sent as {}",
-            crate::bytes(stats.bytes),
-            crate::bytes(stats.wire)
+            ovr_proto::format_bytes(stats.bytes),
+            ovr_proto::format_bytes(stats.wire)
         );
     }
     let _ = write!(line, " in {:.1} s", elapsed.as_secs_f64());

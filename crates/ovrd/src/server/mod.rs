@@ -13,10 +13,10 @@ use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use ovr_proto::lock::Lock;
-use ovr_proto::msg::{HostStatus, Op, Platform, Provider, Request, Response};
-use ovr_proto::{Frame, FrameKind, VERSION, frame, ipc};
-use tokio::sync::Notify;
-use tokio::task::JoinSet;
+use ovr_proto::msg::{HostKind, HostStatus, Location, Op, Platform, Provider, Request, Response};
+use ovr_proto::{Frame, FrameKind, VERSION, frame, ipc, paths};
+use tokio::sync::{Notify, OnceCell};
+use tokio::task::{AbortHandle, JoinSet};
 
 use crate::mux::{Channel, Mux};
 use crate::pairing::Codes;
@@ -49,12 +49,18 @@ pub async fn run() -> Result<(), Error> {
         codes: Mutex::default(),
         trust: Trust::new(dir.clone()),
         admitting: tokio::sync::Mutex::default(),
+        pairing: Mutex::default(),
+        listening: OnceCell::new(),
         tunnels: tunnels::Tunnels::new(dir.clone()),
         dir,
     });
     tracing::info!(version = VERSION, "serving");
-    server.tunnels.restore()?;
-    tokio::spawn(dialin::listen(Arc::clone(&server)));
+    let dials_in = !state::hosts(&server.dir)?.is_empty()
+        || !state::trust_rules(&server.dir)?.is_empty()
+        || !state::tunnels(&server.dir)?.is_empty();
+    if dials_in && let Err(err) = server.listen().await {
+        tracing::error!(%err, "dial-in hosts cannot connect until `ovr pair` or `ovr trust` listens again");
+    }
 
     let restart = Arc::new(Notify::new());
     let mut runs = JoinSet::new();
@@ -69,6 +75,10 @@ pub async fn run() -> Result<(), Error> {
         }
     }
     tracing::info!("a different version was started; exiting after in-flight runs");
+    // The port goes to the new server; hosts already connected keep their connections here until they drop.
+    for accepting in server.listening.get().into_iter().flatten() {
+        accepting.abort();
+    }
     drop(listener);
     drop(lock);
     while runs.join_next().await.is_some() {}
@@ -97,6 +107,10 @@ pub(crate) struct Server {
     trust: Trust,
     /// Held while a federated host is given a name, so that two cannot be given the same one.
     admitting: tokio::sync::Mutex<()>,
+    /// Held while the paired hosts' records change.
+    pairing: Mutex<()>,
+    /// The loops accepting dial-in hosts, once something can dial in.
+    listening: OnceCell<Vec<AbortHandle>>,
     tunnels: tunnels::Tunnels,
 }
 
@@ -156,11 +170,11 @@ async fn handle(server: Arc<Server>, stream: ipc::ServerStream, restart: Arc<Not
                 }
             }
         },
-        Op::Hosts => server.hosts().unwrap_or_else(|err| Response::Failed {
-            message: err.to_string(),
-        }),
-        Op::Connected => Response::Connected {
-            hosts: server.connected(),
+        Op::Hosts => match server.hosts() {
+            Ok(hosts) => Response::Hosts { hosts },
+            Err(err) => Response::Failed {
+                message: err.to_string(),
+            },
         },
         Op::Pair { tunnel } => server
             .pair(tunnel)
@@ -168,6 +182,9 @@ async fn handle(server: Arc<Server>, stream: ipc::ServerStream, restart: Arc<Not
             .unwrap_or_else(|err| Response::Failed {
                 message: err.to_string(),
             }),
+        Op::Unpair { host } => server.unpair(&host).unwrap_or_else(|err| Response::Failed {
+            message: err.to_string(),
+        }),
         Op::Tunnels => Response::Tunnels {
             tunnels: server.tunnels.list(),
         },
@@ -177,32 +194,30 @@ async fn handle(server: Arc<Server>, stream: ipc::ServerStream, restart: Arc<Not
                 message: err.to_string(),
             },
         },
-        Op::Clean => clean().await.unwrap_or_else(|err| Response::Failed {
+        Op::CleanDownloads => clean_downloads().unwrap_or_else(|err| Response::Failed {
             message: err.to_string(),
         }),
         Op::Trust { rule } => server
             .trust_rule(rule.as_deref(), true)
+            .await
             .unwrap_or_else(|message| Response::Failed { message }),
         Op::Untrust { rule } => server
             .trust_rule(Some(&rule), false)
+            .await
             .unwrap_or_else(|message| Response::Failed { message }),
+        Op::Status => server.status().unwrap_or_else(|err| Response::Failed {
+            message: err.to_string(),
+        }),
     };
     if respond(&mut stream, &response).await.is_ok() {
         let _ = stream.close().await;
     }
 }
 
-/// Cleans this machine: every initiator's checkouts and finished runs, and agents of other versions.
-async fn clean() -> Result<Response, Error> {
-    let config = crate::agent::Config::detect()?;
-    let mut cleaned =
-        tokio::task::spawn_blocking(move || crate::agent::clean::clean(&config, None))
-            .await
-            .map_err(std::io::Error::from)??;
+/// Cleans what this machine keeps as an initiator: agents downloaded for other versions.
+fn clean_downloads() -> Result<Response, Error> {
     let (agents, bytes) = ssh::clean_downloads()?;
-    cleaned.agents += agents;
-    cleaned.bytes += bytes;
-    Ok(Response::Cleaned(cleaned))
+    Ok(Response::DownloadsCleaned { agents, bytes })
 }
 
 async fn respond(
@@ -246,26 +261,44 @@ impl Server {
         Ok((channel, Some(lease)))
     }
 
-    /// Paired hosts, then federated hosts while they are connected.
-    fn hosts(&self) -> io::Result<Response> {
+    /// Paired hosts, then federated and SSH hosts while they are connected, each kind by name.
+    fn hosts(&self) -> io::Result<Vec<HostStatus>> {
         let mut hosts: Vec<HostStatus> = state::hosts(&self.dir)?
             .into_iter()
-            .map(|host| self.dialed.status(host.name))
+            .map(|host| self.dialed.status(host.name, HostKind::Paired))
             .collect();
         for name in self.dialed.names() {
             if !hosts.iter().any(|host| host.name == name) {
-                hosts.push(self.dialed.status(name));
+                let trusted = self.dialed.status(name, HostKind::Trusted);
+                // It may have disconnected since it was named.
+                if trusted.platform.is_some() {
+                    hosts.push(trusted);
+                }
             }
         }
-        Ok(Response::Hosts { hosts })
+        // A paired host's name reaches it rather than an SSH destination of the same name, as in `open`.
+        let ssh: Vec<HostStatus> = self
+            .ssh
+            .connected()
+            .into_iter()
+            .filter(|ssh| !hosts.iter().any(|host| host.name == ssh.name))
+            .collect();
+        hosts.extend(ssh);
+        hosts.sort_by(|a, b| (a.kind, &a.name).cmp(&(b.kind, &b.name)));
+        Ok(hosts)
     }
 
     /// Adds `rule` to the trust rules, or removes it unless `add`, and answers with the rules and what a trusted
     /// workload needs to dial in: this initiator's fingerprint and an address, through an open tunnel if any.
-    fn trust_rule(&self, rule: Option<&str>, add: bool) -> Result<Response, String> {
+    async fn trust_rule(
+        self: &Arc<Self>,
+        rule: Option<&str>,
+        add: bool,
+    ) -> Result<Response, String> {
         if let Some(rule) = rule {
             let rule: Rule = rule.parse()?;
             if add {
+                self.listen().await.map_err(|err| err.to_string())?;
                 self.trust.add(rule).map_err(|err| err.to_string())?;
             } else if !self.trust.remove(&rule).map_err(|err| err.to_string())? {
                 return Err(format!("{rule} is not trusted"));
@@ -295,15 +328,35 @@ impl Server {
         })
     }
 
-    /// Hosts with an open connection: dialed-in hosts that are online, then SSH hosts in use.
-    fn connected(&self) -> Vec<String> {
-        let mut hosts = self.dialed.names();
-        hosts.extend(self.ssh.connected());
-        hosts
+    /// What `ovr status` reports: who this initiator is, who can reach it, and where its files are.
+    fn status(&self) -> io::Result<Response> {
+        let log_dir = paths::log_dir()?;
+        Ok(Response::Status {
+            fingerprint: self.identity.fingerprint.clone(),
+            listening: self
+                .listening
+                .initialized()
+                .then(|| format!("{}:{PORT}", local_ip())),
+            tunnels: self.tunnels.list(),
+            rules: self
+                .trust
+                .rules()?
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            hosts: self.hosts()?,
+            paths: vec![
+                Location::new("data", &self.dir, "OVR_DATA_DIR"),
+                Location::new("cache", &paths::cache_dir()?, "OVR_CACHE_DIR"),
+                Location::new("state", &log_dir, "OVR_STATE_DIR"),
+                Location::new("log", &log_dir.join("ovrd.log"), "OVR_STATE_DIR"),
+            ],
+        })
     }
 
     /// Issues a pairing code for hosts to dial in directly, or through the tunnel from `tunnel`, opened if needed.
-    async fn pair(&self, tunnel: Option<Provider>) -> Result<Response, Error> {
+    async fn pair(self: &Arc<Self>, tunnel: Option<Provider>) -> Result<Response, Error> {
+        self.listen().await?;
         let addr = match tunnel {
             Some(provider) => self.tunnels.open(provider).await?.to_string(),
             None => format!("{}:{PORT}", local_ip()),
@@ -315,6 +368,40 @@ impl Server {
             .issue()
             .map_err(|_| Error::Invalid("the system random number generator failed".to_owned()))?;
         Ok(Response::Pair { addr, code })
+    }
+
+    /// Forgets the paired host `host` and closes its connection, if open. Its runs keep going on the host.
+    fn unpair(&self, host: &str) -> Result<Response, Error> {
+        // Held until the connection is closed, so a host connecting meanwhile is either closed here or refused.
+        let _pairing = self.pairing.lock().unwrap_or_else(PoisonError::into_inner);
+        if !state::remove_host(&self.dir, host)? {
+            return Err(Error::Invalid(format!(
+                "{host} is not paired; `ovr hosts` lists paired hosts"
+            )));
+        }
+        tracing::info!(name = host, "unpaired");
+        Ok(Response::Unpaired {
+            disconnected: self.dialed.close(host),
+        })
+    }
+
+    /// Listens for dial-in hosts unless already listening, then reopens the tunnels earlier runs recorded, which
+    /// would otherwise forward to whatever else holds the port. Kept for the server's lifetime once it succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the port stays taken, in which case the next call tries again.
+    async fn listen(self: &Arc<Self>) -> Result<(), Error> {
+        self.listening
+            .get_or_try_init(|| async {
+                let accepting = dialin::listen(Arc::clone(self)).await?;
+                if let Err(err) = self.tunnels.restore() {
+                    tracing::error!(%err, "cannot reopen the recorded tunnels");
+                }
+                Ok::<_, Error>(accepting)
+            })
+            .await
+            .map(|_| ())
     }
 }
 
@@ -335,6 +422,8 @@ fn local_ip() -> std::net::IpAddr {
 #[derive(Default)]
 struct Registry {
     hosts: Mutex<HashMap<String, Dialed>>,
+    /// When each paired host was last connected, in seconds since the Unix epoch, since this server started.
+    seen: Mutex<HashMap<String, u64>>,
     changed: Notify,
     next_id: AtomicU64,
 }
@@ -345,6 +434,8 @@ struct Dialed {
     mux: Mux,
     platform: Platform,
     about: Option<String>,
+    /// When the host connected, in seconds since the Unix epoch.
+    since: u64,
     /// When the connection was removed; the name stays reserved for the host until [`RESERVE`] has passed.
     released: Option<Instant>,
 }
@@ -383,6 +474,7 @@ impl Registry {
             mux,
             platform,
             about,
+            since: crate::agent::runs::now(),
             released: None,
         };
         let previous = self
@@ -419,11 +511,40 @@ impl Registry {
             .unwrap_or_else(|| base.to_owned())
     }
 
-    /// Marks a connection gone, keeping its name reserved for a while.
+    /// Forgets when `name` was last seen, as for a host that was just paired or unpaired under it.
+    fn forget_seen(&self, name: &str) {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(name);
+    }
+
+    /// Forgets `name` and closes its connection, returning whether it was live.
+    fn close(&self, name: &str) -> bool {
+        self.forget_seen(name);
+        let dialed = self
+            .hosts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(name);
+        dialed.is_some_and(|dialed| {
+            let live = dialed.live();
+            dialed.mux.close();
+            live
+        })
+    }
+
+    /// Marks a connection gone, keeping its name reserved for a while, and a paired host's last-seen time.
     fn remove(&self, name: &str, id: u64) {
         let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(dialed) = hosts.get_mut(name).filter(|dialed| dialed.id == id) {
             dialed.released = Some(Instant::now());
+            if !is_federated(name) {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(name.to_owned(), crate::agent::runs::now());
+            }
         }
     }
 
@@ -446,12 +567,23 @@ impl Registry {
         names
     }
 
-    /// How the host `name` is: connected, with its platform and what it serves, or not.
-    fn status(&self, name: String) -> HostStatus {
+    /// How the host `name` is: connected, with its platform, since when, and what it serves, or last seen when.
+    fn status(&self, name: String, kind: HostKind) -> HostStatus {
         let hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
         let live = hosts.get(&name).filter(|dialed| dialed.live());
+        let since = match live {
+            Some(dialed) => Some(dialed.since),
+            None => self
+                .seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&name)
+                .copied(),
+        };
         HostStatus {
+            kind,
             platform: live.map(|dialed| dialed.platform.clone()),
+            since,
             about: live.and_then(|dialed| dialed.about.clone()),
             name,
         }

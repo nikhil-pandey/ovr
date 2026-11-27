@@ -168,33 +168,63 @@ impl Run {
     ///
     /// Returns an error when the run's files cannot be read.
     pub fn state(&self) -> io::Result<RunState> {
-        if let Some(ended) = self.ended()? {
-            return Ok(ended.into());
-        }
-        // Holding the lock keeps a keeper that is still starting from starting while this decides.
-        let Some(_lock) = self.lock_unkept()? else {
-            return Ok(RunState::Running);
+        let _lock = match self.check()? {
+            Check::Known(state) => return Ok(state),
+            Check::Abandoned(lock) => lock,
         };
-        // The keeper ends the run before letting go of the lock.
-        if let Some(ended) = self.ended()? {
-            return Ok(ended.into());
-        }
-        let pid = std::fs::read_to_string(self.dir.join("pid")).ok();
-        if pid.is_none() && self.age()? < STARTING {
-            return Ok(RunState::Running);
-        }
         #[cfg(unix)]
-        if let Some(group) = pid.and_then(|pid| pid.trim().parse().ok()) {
+        if let Some(group) = std::fs::read_to_string(self.dir.join("pid"))
+            .ok()
+            .and_then(|pid| pid.trim().parse().ok())
+        {
             super::process::kill_group(group);
         }
         self.end(&Ended::Lost)?;
         Ok(RunState::Lost)
     }
 
+    /// The run's state as [`Run::state`] sees it, changing nothing: a run whose keeper is gone without a record is
+    /// lost, but neither recorded as such nor killed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the run's files cannot be read.
+    pub fn peek(&self) -> io::Result<RunState> {
+        Ok(match self.check()? {
+            Check::Known(state) => state,
+            Check::Abandoned(_) => RunState::Lost,
+        })
+    }
+
+    fn check(&self) -> io::Result<Check> {
+        if let Some(ended) = self.ended()? {
+            return Ok(Check::Known(ended.into()));
+        }
+        // Holding the lock keeps a keeper that is still starting from starting while this decides.
+        let Some(lock) = self.lock_unkept()? else {
+            return Ok(Check::Known(RunState::Running));
+        };
+        // The keeper ends the run before letting go of the lock.
+        if let Some(ended) = self.ended()? {
+            return Ok(Check::Known(ended.into()));
+        }
+        if std::fs::read_to_string(self.dir.join("pid")).is_err() && self.age()? < STARTING {
+            return Ok(Check::Known(RunState::Running));
+        }
+        Ok(Check::Abandoned(lock))
+    }
+
     fn age(&self) -> io::Result<Duration> {
         let created = std::fs::metadata(self.dir.join("run.json"))?.modified()?;
         Ok(created.elapsed().unwrap_or_default())
     }
+}
+
+/// What [`Run::check`] found: the run's state, or that its keeper is gone without recording an end, with the
+/// keeper's lock held so that none starts meanwhile.
+enum Check {
+    Known(RunState),
+    Abandoned(Lock),
 }
 
 impl From<Ended> for RunState {

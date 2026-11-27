@@ -4,6 +4,11 @@ use clap::{CommandFactory, Parser};
 fn main() {
     let cli = match ovr::Cli::try_parse() {
         Ok(cli) => cli,
+        // Bare `ovr` prints help, as `ovr --help` does.
+        Err(err) if err.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            let _ = ovr::Cli::command().print_help();
+            std::process::exit(0);
+        }
         Err(mut err) => {
             let code = if err.use_stderr() { ovr::FAILURE } else { 0 };
             let first = std::env::args().nth(1);

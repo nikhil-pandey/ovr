@@ -2,6 +2,7 @@
 
 mod daemon;
 mod fetch;
+mod manage;
 mod session;
 mod snapshot;
 mod terminal;
@@ -12,8 +13,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 use ovr_proto::frame::Resumed;
 use ovr_proto::ipc::ClientStream;
-use ovr_proto::msg::{Attach, Cleaned, Enter, Exec, Op, Resize, Response, RunInfo, RunState};
-use ovr_proto::{Frame, FrameKind};
+use ovr_proto::msg::{
+    Attach, Enter, Exec, HostKind, Op, Provider, Resize, Response, RunInfo, RunState,
+};
+use ovr_proto::{Frame, FrameKind, print_field};
 
 use crate::session::{End, Io, Mode, Position, Signal, Stream};
 use crate::snapshot::{Repository, Snapshot};
@@ -43,16 +46,77 @@ Exits 0 when everything was fetched, 1 when something could not be, and 125 when
 
 const EXAMPLES: &str = "\
 Examples:
-  ovr bigbox -- cargo test          sync this working tree to bigbox, run there, exit with its code
-  ovr bigbox                        a login shell in the synced checkout
-  ovr -d bigbox -- cargo build      in the background; prints the run number for logs, attach, and kill
-  ovr -n bigbox -- cat Cargo.lock   without syncing: in the checkout as bigbox has it
-  ovr get bigbox target/doc out/    copy files back: out/doc/..., skipping what is unchanged
-  ovr ps                            runs on every connected host
+  ovr bigbox -- cargo test                  sync this working tree to bigbox, run there, exit with its code
+  ovr bigbox                                a login shell in the synced checkout
+  ovr --detach bigbox -- cargo build        in the background; prints the run number for logs, attach, and kill
+  ovr --no-sync bigbox -- cat Cargo.lock    without syncing: in the checkout as bigbox has it
+  ovr get bigbox target/doc out/            copy files back: out/doc/..., skipping what is unchanged
+  ovr ps                                    runs on every connected host
 
 Commands run in the same directory relative to the repository root as here. Outside a Git repository
 nothing is synced, and commands run in the host's base directory: its home, or a trusted CI job's workspace.
-HOST is an SSH destination, or a host that dialed in: see `ovrd pair` and `ovrd trust`.";
+HOST is an SSH destination, or a host that dialed in: see `ovr pair` and `ovr trust`.";
+
+const HOSTS_HELP: &str = "\
+Example:
+  ovr hosts    NAME, KIND, STATE, PLATFORM, and SINCE of every host
+
+KIND is paired, trusted, or ssh. Paired hosts are always listed; trusted and SSH hosts appear while
+connected. SINCE is how long a host has been connected, or how long ago an offline paired host was last
+seen, while this ovrd has been running.";
+
+const PS_HELP: &str = "\
+Examples:
+  ovr ps           runs on every host with an open connection
+  ovr ps bigbox    runs on bigbox, connecting to it if needed";
+
+const ATTACH_HELP: &str = "\
+Examples:
+  ovr attach bigbox 12    take run 12's terminal back, as if it had been started here
+  ovr attach bigbox       the latest run on bigbox that is still running";
+
+const LOGS_HELP: &str = "\
+Examples:
+  ovr logs bigbox 12 && deploy    follow run 12's output, and exit with its code
+  ovr logs bigbox                 the latest run on bigbox, whatever its state";
+
+const KILL_HELP: &str = "\
+Example:
+  ovr kill bigbox 12 14    kill runs 12 and 14 and every process they started";
+
+const CLEAN_HELP: &str = "\
+Examples:
+  ovr clean bigbox winbox    this initiator's checkouts and finished runs on bigbox and winbox
+  ovr clean                  agents downloaded here for other versions
+  ovr clean --all            both, on every host with an open connection
+
+On a host, `ovrd clean` removes every initiator's checkouts and finished runs.";
+
+const STATUS_HELP: &str = "\
+Example:
+  ovr status    this initiator's fingerprint, whether hosts can dial in, and where its files are
+
+On a host, `ovrd status` shows whether it is paired and connected, and the runs there.";
+
+const PAIR_HELP: &str = "\
+Examples:
+  ovr pair               prints `ovrd connect ADDR CODE` to run on the host within 10 minutes
+  ovr pair cloudflare    the same, through a Cloudflare quick tunnel; or devtunnel, or tailcat";
+
+const UNPAIR_HELP: &str = "\
+Example:
+  ovr unpair winbox    winbox is refused from now on; pair it again with `ovr pair`";
+
+const TRUST_HELP: &str = "\
+Examples:
+  ovr trust github:nikhil-pandey/ovr    trust the jobs of one repository
+  ovr trust github:nikhil-pandey       trust the jobs of every repository of an owner
+  ovr trust                            list the rules, and how a job dials in";
+
+const TUNNEL_HELP: &str = "\
+Examples:
+  ovr tunnel                     open tunnels, and the command that moves a paired host to each
+  ovr tunnel close cloudflare    close a tunnel and delete what was created for it";
 
 /// Longest wait between attempts to reach a host again.
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
@@ -62,6 +126,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 #[command(
     name = "ovr",
     version,
+    arg_required_else_help = true,
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true,
     after_help = EXAMPLES
@@ -76,19 +141,40 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// List dialed-in hosts.
+    /// List paired hosts, and trusted and SSH hosts while connected.
+    #[command(after_help = HOSTS_HELP)]
     Hosts,
     /// List this initiator's runs: running, and finished in the last 7 days.
+    #[command(after_help = PS_HELP)]
     Ps {
-        /// Only this host; otherwise every host with an open connection.
+        /// SSH destination or dialed-in host name; otherwise every host with an open connection.
         host: Option<String>,
     },
-    /// Reconnect this terminal to a run, as if it had been started here.
-    Attach { host: String, run: u64 },
-    /// Print a run's output, following it until the run ends.
-    Logs { host: String, run: u64 },
-    /// Kill a run's whole process tree.
-    Kill { host: String, run: u64 },
+    /// Reconnect this terminal to a run, by default the latest still running, as if it had been started here.
+    #[command(after_help = ATTACH_HELP)]
+    Attach {
+        /// SSH destination or dialed-in host name.
+        host: String,
+        /// Run number, as `ovr -d` prints and `ovr ps` lists.
+        run: Option<u64>,
+    },
+    /// Print a run's output, by default the latest run's, following it until the run ends.
+    #[command(after_help = LOGS_HELP)]
+    Logs {
+        /// SSH destination or dialed-in host name.
+        host: String,
+        /// Run number, as `ovr -d` prints and `ovr ps` lists.
+        run: Option<u64>,
+    },
+    /// Kill runs' whole process trees.
+    #[command(after_help = KILL_HELP)]
+    Kill {
+        /// SSH destination or dialed-in host name.
+        host: String,
+        /// Run number, as `ovr -d` prints and `ovr ps` lists.
+        #[arg(required = true, value_name = "RUN")]
+        runs: Vec<u64>,
+    },
     /// Copy files and trees from HOST to DEST on this machine, skipping files already there.
     #[command(after_help = GET_HELP)]
     Get {
@@ -100,24 +186,75 @@ pub enum Command {
         /// Where they go on this machine.
         dest: String,
     },
-    /// Remove checkouts and finished runs, keeping those in use, and agents of other versions.
+    /// Remove this initiator's checkouts and finished runs from hosts, keeping those in use.
+    ///
+    /// Without HOST, remove what this machine keeps as an initiator: agents downloaded for other versions.
+    #[command(after_help = CLEAN_HELP)]
     Clean {
-        /// Remove this initiator's from these hosts; otherwise everyone's from this machine.
+        /// SSH destination or dialed-in host name.
+        #[arg(value_name = "HOST")]
         hosts: Vec<String>,
-        /// This machine, and this initiator's from every host with an open connection.
+        /// Clean this machine, and yours on every host with an open connection.
         #[arg(long, conflicts_with = "hosts")]
         all: bool,
+    },
+    /// Print a one-shot command for a host to dial in and pair.
+    ///
+    /// The host runs the printed `ovrd connect ADDR CODE` within 10 minutes. With PROVIDER, ADDR is a tunnel from
+    /// that provider, opened unless one is open; it stays open until `ovr tunnel close PROVIDER`.
+    #[command(after_help = PAIR_HELP)]
+    Pair {
+        /// `cloudflare`, `devtunnel` or `tailcat`: open a tunnel with that provider's CLI unless one is open.
+        provider: Option<Provider>,
+    },
+    /// Forget a paired host and close its connection; runs already there keep going.
+    #[command(after_help = UNPAIR_HELP)]
+    Unpair {
+        /// Paired host name, as `ovr hosts` lists it.
+        host: String,
+    },
+    /// Trust workloads matching RULE to dial in without pairing; without RULE, list the rules.
+    ///
+    /// Trusted workloads, such as the GitHub Actions jobs of a repository, dial in with a token from their identity
+    /// provider instead of a pairing code. Either way, print what a trusted workload needs to dial in.
+    #[command(after_help = TRUST_HELP)]
+    Trust {
+        /// `github:OWNER/REPO`, or `github:OWNER` for every repository of OWNER.
+        rule: Option<String>,
+    },
+    /// Stop trusting workloads matching RULE.
+    Untrust {
+        /// A rule as `ovr trust` lists it.
+        rule: String,
+    },
+    /// List open tunnels and the command that points a paired host at each.
+    #[command(after_help = TUNNEL_HELP)]
+    Tunnel {
+        #[command(subcommand)]
+        command: Option<TunnelCommand>,
+    },
+    /// Show this initiator's state: identity, dial-in address, tunnels, hosts, and files.
+    #[command(after_help = STATUS_HELP)]
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TunnelCommand {
+    /// Close the tunnel `ovr pair PROVIDER` opened, and delete what was created for it at the provider.
+    Close {
+        /// `cloudflare`, `devtunnel` or `tailcat`.
+        provider: Provider,
     },
 }
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
     /// Start the command in the background and print its run number.
-    #[arg(short = 'd')]
+    #[arg(short = 'd', long)]
     pub detach: bool,
 
     /// Do not sync: run in the checkout as the host has it, or in the host's base directory when it has none yet.
-    #[arg(short = 'n')]
+    #[arg(short = 'n', long)]
     pub no_sync: bool,
 
     /// SSH destination or dialed-in host name.
@@ -197,12 +334,20 @@ pub async fn run(mut cli: Cli) -> Result<i32, Error> {
         (Some(Command::Ps { host }), _) => ps(host).await,
         (Some(Command::Attach { host, run }), _) => attach(host, run, Mode::Drive).await,
         (Some(Command::Logs { host, run }), _) => attach(host, run, Mode::Watch).await,
-        (Some(Command::Kill { host, run }), _) => {
-            let (stream, _) = daemon::open(&host).await?;
-            session::kill(stream, run).await?;
-            Ok(0)
-        }
+        (Some(Command::Kill { host, runs }), _) => kill(&host, runs).await,
         (Some(Command::Clean { hosts, all }), _) => clean(hosts, all).await,
+        (Some(Command::Pair { provider }), _) => manage::pair(provider).await,
+        (Some(Command::Unpair { host }), _) => manage::unpair(host).await,
+        (Some(Command::Trust { rule }), _) => manage::trust(Op::Trust { rule }).await,
+        (Some(Command::Untrust { rule }), _) => manage::trust(Op::Untrust { rule }).await,
+        (Some(Command::Tunnel { command: None }), _) => manage::tunnels().await,
+        (Some(Command::Status), _) => status().await,
+        (
+            Some(Command::Tunnel {
+                command: Some(TunnelCommand::Close { provider }),
+            }),
+            _,
+        ) => manage::close_tunnel(provider).await,
         (
             Some(Command::Get {
                 host,
@@ -305,7 +450,11 @@ async fn run_on(host: String, run: RunArgs) -> Result<i32, Error> {
     follow(&host, stream, position, io, Mode::Drive).await
 }
 
-async fn attach(host: String, run: u64, mode: Mode) -> Result<i32, Error> {
+async fn attach(host: String, run: Option<u64>, mode: Mode) -> Result<i32, Error> {
+    let run = match run {
+        Some(run) => run,
+        None => latest(&host, mode == Mode::Drive).await?,
+    };
     let (stream, _) = daemon::open(&host).await?;
     let from_start = Attach {
         run,
@@ -327,6 +476,39 @@ async fn attach(host: String, run: u64, mode: Mode) -> Result<i32, Error> {
         stderr: tokio::io::stderr(),
     };
     follow(&host, stream, position, io, mode).await
+}
+
+/// This initiator's most recent run on `host`, or its most recent one still running when `running`, which it names on
+/// stderr.
+async fn latest(host: &str, running: bool) -> Result<u64, Error> {
+    let (stream, initiator) = daemon::open(host).await?;
+    let latest = session::list(stream, &initiator)
+        .await?
+        .into_iter()
+        .filter(|run| !running || run.state == RunState::Running)
+        .max_by_key(|run| (run.started, run.run))
+        .ok_or_else(|| {
+            let which = if running { "running run" } else { "run" };
+            Error::Host(format!("no {which} on {host}; `ovr ps {host}` lists them"))
+        })?;
+    eprintln!("ovr: run {} on {host}", latest.run);
+    Ok(latest.run)
+}
+
+/// Kills each of `runs` on `host`, reporting each failure and carrying on.
+async fn kill(host: &str, runs: Vec<u64>) -> Result<i32, Error> {
+    let mut code = 0;
+    for run in runs {
+        let killed = async {
+            let (stream, _) = daemon::open(host).await?;
+            session::kill(stream, run).await
+        };
+        if let Err(err) = killed.await {
+            eprintln!("ovr: run {run} on {host}: {:?}", miette::Report::new(err));
+            code = FAILURE;
+        }
+    }
+    Ok(code)
 }
 
 type HostStream = Stream<Resumed<ClientStream>>;
@@ -437,14 +619,34 @@ fn detached(host: &str, position: &Position) -> Error {
 
 async fn ps(host: Option<String>) -> Result<i32, Error> {
     let explicit = host.is_some();
-    let hosts = match host {
-        Some(host) => vec![host],
-        None => daemon::connected().await?,
+    let (hosts, offline) = if let Some(host) = host {
+        (vec![host], Vec::new())
+    } else {
+        // Only paired hosts are listed while offline.
+        let hosts = daemon::hosts().await?;
+        let names = |online: bool| -> Vec<String> {
+            hosts
+                .iter()
+                .filter(|host| host.platform.is_some() == online)
+                .map(|host| host.name.clone())
+                .collect()
+        };
+        (names(true), names(false))
     };
-    if hosts.is_empty() {
+    let code = if hosts.is_empty() {
         eprintln!("no host is connected; name one with `ovr ps HOST`");
-        return Ok(0);
+        0
+    } else {
+        list_runs(hosts, explicit).await?
+    };
+    if !offline.is_empty() {
+        eprintln!("{}: offline, not listed", offline.join(", "));
     }
+    Ok(code)
+}
+
+/// Prints this initiator's runs on `hosts`, reporting a host that cannot be reached unless it was named.
+async fn list_runs(hosts: Vec<String>, explicit: bool) -> Result<i32, Error> {
     let mut rows = Vec::new();
     let mut code = 0;
     for host in hosts {
@@ -469,15 +671,9 @@ fn print_runs(rows: &[(String, RunInfo)]) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |time| time.as_secs());
-    let table: Vec<[String; 6]> = rows
-        .iter()
-        .map(|(host, run)| {
-            let state = match &run.state {
-                RunState::Running => "running".to_owned(),
-                RunState::Exited { code } => format!("exited {code}"),
-                RunState::Failed { .. } => "failed".to_owned(),
-                RunState::Lost => "lost".to_owned(),
-            };
+    let header = ["HOST", "RUN", "STATE", "AGE", "CHECKOUT", "COMMAND"].map(str::to_owned);
+    let table: Vec<[String; 6]> = std::iter::once(header)
+        .chain(rows.iter().map(|(host, run)| {
             let command = if run.argv.is_empty() {
                 "(shell)".to_owned()
             } else {
@@ -486,44 +682,27 @@ fn print_runs(rows: &[(String, RunInfo)]) {
             [
                 host.clone(),
                 run.run.to_string(),
-                state,
-                age(now.saturating_sub(run.started)),
+                run.state.to_string(),
+                ovr_proto::format_age(now.saturating_sub(run.started)),
                 run.checkout.clone().unwrap_or_else(|| "-".to_owned()),
                 command,
             ]
-        })
+        }))
         .collect();
-    let header = ["HOST", "RUN", "STATE", "AGE", "CHECKOUT", "COMMAND"].map(str::to_owned);
-    let mut widths = header.clone().map(|cell| cell.len());
-    for row in &table {
-        for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.len());
-        }
-    }
-    for row in std::iter::once(&header).chain(&table) {
-        let line: Vec<String> = row
-            .iter()
-            .zip(widths)
-            .map(|(cell, width)| format!("{cell:width$}"))
-            .collect();
-        println!("{}", line.join("  ").trim_end());
-    }
-}
-
-fn age(seconds: u64) -> String {
-    match seconds {
-        0..60 => format!("{seconds}s"),
-        60..3600 => format!("{}m", seconds / 60),
-        3600..86400 => format!("{}h", seconds / 3600),
-        _ => format!("{}d", seconds / 86400),
+    for line in ovr_proto::columns(&table) {
+        println!("{line}");
     }
 }
 
 async fn clean(hosts: Vec<String>, all: bool) -> Result<i32, Error> {
     let mut code = 0;
     if all || hosts.is_empty() {
-        match daemon::request(Op::Clean).await? {
-            (_, Response::Cleaned(cleaned)) => report("this machine", &cleaned),
+        match daemon::request(Op::CleanDownloads).await? {
+            (_, Response::DownloadsCleaned { agents, bytes }) => println!(
+                "this machine: removed {agents} downloaded agent{}; freed {}",
+                if agents == 1 { "" } else { "s" },
+                ovr_proto::format_bytes(bytes)
+            ),
             (_, other) => {
                 eprintln!("ovr: this machine: {}", daemon::unexpected(other));
                 code = FAILURE;
@@ -544,7 +723,10 @@ async fn clean(hosts: Vec<String>, all: bool) -> Result<i32, Error> {
         match cleaned.await {
             Ok(cleaned) => {
                 snapshot::forget_host(&cwd, &host).await;
-                report(&host, &cleaned);
+                println!("{host}: {cleaned}");
+                for checkout in &cleaned.kept {
+                    println!("{host}: kept {checkout}: in use");
+                }
             }
             Err(err) => {
                 eprintln!("ovr: {host}: {err}");
@@ -555,55 +737,93 @@ async fn clean(hosts: Vec<String>, all: bool) -> Result<i32, Error> {
     Ok(code)
 }
 
-fn report(target: &str, cleaned: &Cleaned) {
-    let count = |n: u64, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
-    println!(
-        "{target}: removed {}, {}, {}; freed {}",
-        count(cleaned.checkouts, "checkout"),
-        count(cleaned.runs, "run"),
-        count(cleaned.agents, "agent"),
-        bytes(cleaned.bytes)
-    );
-    for checkout in &cleaned.kept {
-        println!("{target}: kept {checkout}: in use");
-    }
-}
-
-#[allow(clippy::cast_precision_loss)]
-pub(crate) fn bytes(bytes: u64) -> String {
-    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
-    if bytes < 1024 {
-        return format!("{bytes} B");
-    }
-    let mut value = bytes as f64 / 1024.0;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    format!("{value:.1} {}", UNITS[unit])
-}
-
 async fn hosts() -> Result<i32, Error> {
-    let hosts = match daemon::request(Op::Hosts).await? {
-        (_, Response::Hosts { hosts }) => hosts,
-        (_, other) => return Err(daemon::unexpected(other)),
-    };
+    let hosts = daemon::hosts().await?;
     if hosts.is_empty() {
-        eprintln!("no dialed-in hosts; run `ovrd pair` to add one");
+        eprintln!(
+            "no hosts yet: name any SSH host (`ovr HOST -- CMD`), or pair one with `ovr pair`"
+        );
+        return Ok(0);
     }
-    let width = hosts.iter().map(|host| host.name.len()).max().unwrap_or(0);
-    for host in hosts {
-        match (host.platform, host.about) {
-            (Some(platform), about) => println!(
-                "{:width$}  online   {}/{}{}",
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |time| time.as_secs());
+    let header = ["NAME", "KIND", "STATE", "PLATFORM", "SINCE", ""].map(str::to_owned);
+    let table: Vec<[String; 6]> = std::iter::once(header)
+        .chain(hosts.into_iter().map(|host| {
+            let (state, platform) = match host.platform {
+                Some(platform) => ("online", format!("{}/{}", platform.os, platform.arch)),
+                None => ("offline", "-".to_owned()),
+            };
+            [
                 host.name,
-                platform.os,
-                platform.arch,
-                about.map_or_default(|about| format!("  {about}"))
-            ),
-            (None, _) => println!("{:width$}  offline", host.name),
-        }
+                host.kind.to_string(),
+                state.to_owned(),
+                platform,
+                host.since.map_or_else(
+                    || "-".to_owned(),
+                    |since| ovr_proto::format_age(now.saturating_sub(since)),
+                ),
+                host.about.unwrap_or_default(),
+            ]
+        }))
+        .collect();
+    for line in ovr_proto::columns(&table) {
+        println!("{line}");
+    }
+    Ok(0)
+}
+
+/// `ovr status`: reports the initiator's state as the local `ovrd` has it, checking nothing.
+async fn status() -> Result<i32, Error> {
+    let (_, response) = daemon::request(Op::Status).await?;
+    let Response::Status {
+        fingerprint,
+        listening,
+        tunnels,
+        rules,
+        hosts,
+        paths,
+    } = response
+    else {
+        return Err(daemon::unexpected(response));
+    };
+    let count = |kind: HostKind| {
+        let of_kind = hosts.iter().filter(|host| host.kind == kind);
+        let online = of_kind.clone().filter(|host| host.platform.is_some());
+        (of_kind.count(), online.count())
+    };
+    let (paired, online) = count(HostKind::Paired);
+    let (_, trusted_online) = count(HostKind::Trusted);
+    let (_, ssh_connected) = count(HostKind::Ssh);
+    println!("ovr {}", ovr_proto::VERSION);
+    print_field("initiator", [fingerprint]);
+    print_field(
+        "listening",
+        [listening.unwrap_or_else(|| {
+            if paired == 0 && rules.is_empty() && tunnels.is_empty() {
+                "not listening (nothing paired or trusted)".to_owned()
+            } else {
+                "not listening".to_owned()
+            }
+        })],
+    );
+    print_field(
+        "tunnels",
+        tunnels.into_iter().map(|tunnel| {
+            let addr = tunnel.addr.unwrap_or_else(|| "(restarting)".to_owned());
+            format!("{:<10}  {addr}", tunnel.provider)
+        }),
+    );
+    print_field("trusted", rules);
+    print_field(
+        "hosts",
+        [format!(
+            "{paired} paired ({online} online), {trusted_online} trusted online, {ssh_connected} ssh connected"
+        )],
+    );
+    for location in paths {
+        print_field(&location.name, [&location]);
     }
     Ok(0)
 }
