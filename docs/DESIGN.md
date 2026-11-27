@@ -98,11 +98,13 @@ ovr tunnel                  list open tunnels and the command that points a pair
 ovr tunnel close PROVIDER   close a tunnel that `ovr pair` opened
 ovr trust [RULE]            trust workloads matching RULE to dial in without pairing; list the rules and how to dial
 ovr untrust RULE            stop trusting workloads matching RULE
+ovr status                  this initiator's fingerprint, listening address, tunnels, trust rules, hosts, and files
 
 # On a host
 ovrd connect ADDR CODE      pair with the initiator at ADDR and keep serving it (printed by `ovr pair`)
 ovrd connect [ADDR]         keep serving the initiator it paired with, at ADDR from now on if given
 ovrd connect ADDR github:FP in a GitHub Actions job: serve the initiator with fingerprint FP while the job runs
+ovrd status                 the paired initiator, whether `ovrd connect` is connected, the login service, and runs
 ovrd clean                  remove every initiator's checkouts and finished runs not in use on this machine
 
 # Internal, hidden from help
@@ -143,6 +145,14 @@ examples.
   other versions. `--all` does both, for every host with an open connection. On a host, `ovrd clean` removes every
   initiator's checkouts and finished runs there, and agents of other versions uploaded to it, without contacting
   or starting an initiator server. See [Cleaning up](#cleaning-up).
+- `ovr status` and `ovrd status` report state and check nothing: no probes, no verdicts, exit `0` whatever the
+  state. `ovr status` asks the local `ovrd`, starting it as any `ovr` command does, for this initiator's
+  fingerprint, the address `ovr pair` would print while it listens, open tunnels, trust rules, how many paired hosts
+  are online, how many trusted and SSH hosts are connected, and its directories and `ovrd.log`, marking those an
+  `OVR_*` variable moved. `ovrd status` reads only the host's own files, so it never starts an initiator server or
+  connects anywhere: the host's name and fingerprint, the paired initiator's address and fingerprint, whether
+  `ovrd connect` is running and connected (for how long, or the last failure), whether the login service is
+  installed and enabled, `connect.log`, the checkouts directory and its size, and every initiator's runs there.
 - `ovr get` exits `0` when everything was fetched, `1` when something could not be, and `125` when `ovr` itself
   fails. See [Copying files back](#copying-files-back).
 - `ADDR` is `host:port`, or a tunnel: `cloudflare:HOSTNAME`, `devtunnel:ID`, or `tailcat:ADDRESS`. `PROVIDER` is
@@ -237,6 +247,9 @@ For hosts that cannot accept SSH, including every Windows workstation:
   because the pinned key, not the address, identifies the initiator: the host accepts the new address only once the
   initiator there presents that key.
 - The host is addressable by its hostname: `ovr winbox -- dotnet test`. `ovr hosts` lists what is connected.
+- While it serves, `ovrd connect` records whether it is connected, since when, and the last failure in
+  `connect.json` beside `connect.log`, and removes it when it stops; `ovrd status` shows it, and ignores a record
+  left by an `ovrd connect` that no longer holds its lock.
 - `ovr unpair winbox` forgets the host and closes its connection. Runs already there keep going, but this initiator
   no longer reaches them; the host's `ovrd connect` keeps dialing in and is refused until it is paired again.
 - Reachability is the network's job. On Tailscale, `100.x.y.z` is the initiator's stable address and the WireGuard

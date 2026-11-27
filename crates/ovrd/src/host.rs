@@ -1,5 +1,7 @@
 //! `ovrd connect` on a dial-in host: pair once, then keep a connection to the initiator open and serve runs over it.
 
+use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,11 +11,13 @@ use ovr_proto::lock::Lock;
 use ovr_proto::msg::{Accepted, Failure, Federated, Pair, PairOk};
 use ovr_proto::{Frame, FrameKind};
 use rustls::pki_types::ServerName;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
+use crate::agent::runs::now;
 use crate::mux::Incoming;
 use crate::state::{self, Initiator};
 use crate::tls::{self, Identity};
@@ -221,6 +225,58 @@ pub async fn serve() -> Result<(), Error> {
     keep_serving(&identity, &addr, &initiator.fingerprint, None, &config).await
 }
 
+/// Whether `ovrd connect` is connected to the paired initiator, as it records in `connect.json` for `ovrd status`.
+/// `since` is in seconds since the Unix epoch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Connection {
+    Connected {
+        since: u64,
+    },
+    /// Not connected since serving started or the last connection ended; `error` is why the last attempt failed,
+    /// if one has.
+    Retrying {
+        since: u64,
+        error: Option<String>,
+    },
+}
+
+/// `connect.json` in the state directory, beside `connect.log`.
+fn connection_path() -> io::Result<PathBuf> {
+    Ok(ovr_proto::paths::log_dir()?.join("connect.json"))
+}
+
+/// What the last `ovrd connect` recorded, which is stale unless one still holds `connect.lock`.
+///
+/// # Errors
+///
+/// Returns an error when the record exists but cannot be read.
+pub fn connection() -> io::Result<Option<Connection>> {
+    state::read(&connection_path()?)
+}
+
+/// Records [`Connection`] changes while serving the paired initiator, and removes the record when serving ends.
+/// Workloads record nothing: several may serve at once, and none holds `connect.lock`.
+struct Report(Option<PathBuf>);
+
+impl Report {
+    fn write(&self, connection: &Connection) {
+        if let Some(path) = &self.0
+            && let Err(err) = state::write(path, connection)
+        {
+            tracing::warn!(%err, path = %path.display(), "cannot record the connection");
+        }
+    }
+}
+
+impl Drop for Report {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// A workload a host serves as, and the label that tells it apart from others of that workload.
 struct Workload {
     provider: Provider,
@@ -240,9 +296,15 @@ async fn keep_serving(
         Addr::Direct(_) => MAX_BACKOFF,
         Addr::Tunnel { .. } => MAX_TUNNEL_BACKOFF,
     };
+    let report = Report(match workload {
+        Some(_) => None,
+        None => Some(connection_path()?),
+    });
     let mut backoff = Duration::from_secs(1);
-    // Retries come every few seconds while the initiator is away, so only a new reason is logged.
+    // Retries come every few seconds while the initiator is away, so only a new reason is logged and recorded.
     let mut reported = None;
+    let mut since = now();
+    report.write(&Connection::Retrying { since, error: None });
     loop {
         match attach(identity, addr, pinned, workload).await {
             Ok((forwarder, stream, name)) => {
@@ -251,11 +313,14 @@ async fn keep_serving(
                 } else {
                     tracing::info!("connected");
                 }
+                report.write(&Connection::Connected { since: now() });
                 backoff = Duration::from_secs(1);
                 reported = None;
                 agent::serve(Incoming::accept_with_heartbeat(stream), Arc::clone(config)).await;
                 drop(forwarder);
                 tracing::info!("disconnected");
+                since = now();
+                report.write(&Connection::Retrying { since, error: None });
             }
             Err(err) => {
                 let reason = err.to_string();
@@ -263,6 +328,10 @@ async fn keep_serving(
                     tracing::debug!(%reason, "still cannot reach the initiator");
                 } else {
                     tracing::info!(%reason, "cannot reach the initiator; retrying until it answers");
+                    report.write(&Connection::Retrying {
+                        since,
+                        error: Some(reason.clone()),
+                    });
                     reported = Some(reason);
                 }
                 tokio::time::sleep(backoff).await;

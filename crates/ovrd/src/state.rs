@@ -1,4 +1,4 @@
-//! Pairing records in the data directory, written atomically and readable only by the user.
+//! Pairing records in the data directory, and other JSON records, written atomically and readable only by the user.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -126,7 +126,10 @@ pub fn set_trust_rules(dir: &Path, rules: &[Rule]) -> io::Result<()> {
     write(&trust_path(dir), &rules)
 }
 
-fn read<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read or parsed.
+pub fn read<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|err| {
             io::Error::new(
@@ -139,7 +142,12 @@ fn read<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     }
 }
 
-fn write<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+/// Replaces `path` with `value` as JSON, atomically and readable only by the owner.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be written.
+pub fn write<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
     bytes.push(b'\n');
     write_private(path, &bytes)

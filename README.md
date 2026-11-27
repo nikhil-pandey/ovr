@@ -50,6 +50,8 @@ ovrd connect ADDR CODE  # on the host: pairs, and serves from then on, at login 
 ovr hosts               # dialed-in hosts, online or not
 ovr winbox -- dotnet build
 ovr unpair winbox       # forget it; it is refused from then on
+ovr status              # on your machine: fingerprint, listening address, tunnels, hosts, files
+ovrd status             # on the host: paired with whom, connected or not, login service, runs
 ```
 
 When the host cannot reach your machine, pair through a tunnel; Cloudflare's needs no account:

@@ -33,27 +33,36 @@ impl Identity {
     ///
     /// Returns an error when the identity cannot be read or written.
     pub fn load_or_create(dir: &Path) -> io::Result<Self> {
-        let (cert_path, key_path) = (dir.join("identity.der"), dir.join("identity.key"));
-        let (cert, key) = match (std::fs::read(&cert_path), std::fs::read(&key_path)) {
-            (Ok(cert), Ok(key)) => (cert, key),
+        if let Some(identity) = Self::load(dir)? {
+            return Ok(identity);
+        }
+        let (cert, key) = generate(&dir.join("identity.der"), &dir.join("identity.key"))?;
+        Ok(Self::new(cert, key))
+    }
+
+    /// Loads the identity from `dir`, or `None` when there is none yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the identity exists but cannot be read.
+    pub fn load(dir: &Path) -> io::Result<Option<Self>> {
+        let (cert, key) = (
+            std::fs::read(dir.join("identity.der")),
+            std::fs::read(dir.join("identity.key")),
+        );
+        match (cert, key) {
+            (Ok(cert), Ok(key)) => Ok(Some(Self::new(cert, key))),
             (Err(cert), Err(key))
                 if cert.kind() == io::ErrorKind::NotFound
                     && key.kind() == io::ErrorKind::NotFound =>
             {
-                generate(&cert_path, &key_path)?
+                Ok(None)
             }
-            (Err(err), _) | (_, Err(err)) => {
-                return Err(io::Error::new(
-                    err.kind(),
-                    format!("cannot load the identity in {}: {err}", dir.display()),
-                ));
-            }
-        };
-        Ok(Self {
-            fingerprint: fingerprint(&cert),
-            cert: cert.into(),
-            key: key.into(),
-        })
+            (Err(err), _) | (_, Err(err)) => Err(io::Error::new(
+                err.kind(),
+                format!("cannot load the identity in {}: {err}", dir.display()),
+            )),
+        }
     }
 
     /// A new identity kept only in memory, for a host that serves one workload and leaves nothing behind.
@@ -63,11 +72,15 @@ impl Identity {
     /// Returns an error when the key cannot be generated.
     pub fn ephemeral() -> io::Result<Self> {
         let (cert, key) = new_certificate()?;
-        Ok(Self {
+        Ok(Self::new(cert, key))
+    }
+
+    fn new(cert: Vec<u8>, key: Vec<u8>) -> Self {
+        Self {
             fingerprint: fingerprint(&cert),
             cert: cert.into(),
             key: key.into(),
-        })
+        }
     }
 
     /// Server side: requires a client certificate, which the caller then checks against the pairing records.

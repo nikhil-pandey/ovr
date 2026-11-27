@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
 use ovr_proto::lock::Lock;
-use ovr_proto::msg::{HostStatus, Op, Platform, Provider, Request, Response};
-use ovr_proto::{Frame, FrameKind, VERSION, frame, ipc};
+use ovr_proto::msg::{HostStatus, Location, Op, Platform, Provider, Request, Response};
+use ovr_proto::{Frame, FrameKind, VERSION, frame, ipc, paths};
 use tokio::sync::{Notify, OnceCell};
 use tokio::task::{AbortHandle, JoinSet};
 
@@ -205,6 +205,9 @@ async fn handle(server: Arc<Server>, stream: ipc::ServerStream, restart: Arc<Not
             .trust_rule(Some(&rule), false)
             .await
             .unwrap_or_else(|message| Response::Failed { message }),
+        Op::Status => server.status().unwrap_or_else(|err| Response::Failed {
+            message: err.to_string(),
+        }),
     };
     if respond(&mut stream, &response).await.is_ok() {
         let _ = stream.close().await;
@@ -309,6 +312,41 @@ impl Server {
             rules,
             initiator: self.identity.fingerprint.clone(),
             addr,
+        })
+    }
+
+    /// What `ovr status` reports: who this initiator is, who can reach it, and where its files are.
+    fn status(&self) -> io::Result<Response> {
+        let paired = state::hosts(&self.dir)?;
+        let connected = self.dialed.names();
+        let online = paired
+            .iter()
+            .filter(|host| connected.contains(&host.name))
+            .count();
+        let log_dir = paths::log_dir()?;
+        Ok(Response::Status {
+            fingerprint: self.identity.fingerprint.clone(),
+            listening: self
+                .listening
+                .initialized()
+                .then(|| format!("{}:{PORT}", local_ip())),
+            tunnels: self.tunnels.list(),
+            rules: self
+                .trust
+                .rules()?
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            paired: paired.len(),
+            online,
+            trusted_online: connected.len() - online,
+            ssh_connected: self.ssh.connected().len(),
+            paths: vec![
+                Location::new("data", &self.dir, "OVR_DATA_DIR"),
+                Location::new("cache", &paths::cache_dir()?, "OVR_CACHE_DIR"),
+                Location::new("state", &log_dir, "OVR_STATE_DIR"),
+                Location::new("log", &log_dir.join("ovrd.log"), "OVR_STATE_DIR"),
+            ],
         })
     }
 

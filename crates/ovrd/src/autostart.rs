@@ -18,6 +18,15 @@ pub fn install() -> io::Result<()> {
     platform::install(&exe)
 }
 
+/// The service, as in `systemd --user ovrd.service, enabled, active`, or `None` when it is not installed.
+///
+/// # Errors
+///
+/// Returns an error when the service manager cannot be asked.
+pub fn installed() -> io::Result<Option<String>> {
+    platform::installed()
+}
+
 /// The installing shell's `PATH`, so the service finds tunnel CLIs installed by Homebrew or into the user's home.
 #[cfg(unix)]
 fn path() -> String {
@@ -38,10 +47,15 @@ fn environment() -> Vec<(&'static str, String)> {
     std::iter::once(("PATH", path())).chain(overrides).collect()
 }
 
-fn run(program: &str, args: &[&str]) -> io::Result<()> {
+/// Runs `program` and returns what it printed, trimmed.
+///
+/// # Errors
+///
+/// Returns an error when it cannot be started or fails.
+fn run(program: &str, args: &[&str]) -> io::Result<String> {
     let output = Command::new(program).args(args).output()?;
     if output.status.success() {
-        Ok(())
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     } else {
         Err(io::Error::other(format!(
             "{program} {} failed: {}",
@@ -54,15 +68,43 @@ fn run(program: &str, args: &[&str]) -> io::Result<()> {
 #[cfg(target_os = "macos")]
 mod platform {
     use std::fmt::Write;
+    use std::path::PathBuf;
 
     use super::{Path, environment, io, run};
 
     const LABEL: &str = "dev.ovr.connect";
 
+    fn plist() -> io::Result<PathBuf> {
+        Ok(ovr_proto::paths::home_dir()?.join(format!("Library/LaunchAgents/{LABEL}.plist")))
+    }
+
+    fn domain() -> String {
+        format!("gui/{}", nix::unistd::getuid())
+    }
+
+    /// Loaded or not, and launchd's state of it, as in `running`.
+    pub fn installed() -> io::Result<Option<String>> {
+        if !plist()?.is_file() {
+            return Ok(None);
+        }
+        // Fails when the agent is not loaded.
+        let state = run("launchctl", &["print", &format!("{}/{LABEL}", domain())]).map_or_else(
+            |_| "not loaded".to_owned(),
+            |printed| {
+                printed
+                    .lines()
+                    .find_map(|line| line.trim().strip_prefix("state = "))
+                    .unwrap_or("loaded")
+                    .to_owned()
+            },
+        );
+        Ok(Some(format!("launchd agent {LABEL}, {state}")))
+    }
+
     pub fn install(exe: &Path) -> io::Result<()> {
-        let dir = ovr_proto::paths::home_dir()?.join("Library/LaunchAgents");
-        std::fs::create_dir_all(&dir)?;
-        let plist = dir.join(format!("{LABEL}.plist"));
+        let plist = plist()?;
+        let dir = plist.parent().ok_or(io::ErrorKind::InvalidInput)?;
+        std::fs::create_dir_all(dir)?;
         let log = ovr_proto::paths::log_dir()?.join("connect.log");
         std::fs::write(
             &plist,
@@ -92,13 +134,14 @@ mod platform {
                     }),
             ),
         )?;
-        let domain = format!("gui/{}", nix::unistd::getuid());
+        let domain = domain();
         // Not loaded yet on first install.
         let _ = run("launchctl", &["bootout", &format!("{domain}/{LABEL}")]);
         run(
             "launchctl",
             &["bootstrap", &domain, &plist.to_string_lossy()],
-        )
+        )?;
+        Ok(())
     }
 
     fn escape(value: &str) -> String {
@@ -112,17 +155,51 @@ mod platform {
 #[cfg(all(unix, not(target_os = "macos")))]
 mod platform {
     use std::fmt::Write;
+    use std::path::PathBuf;
 
     use super::{NAME, Path, environment, io, run};
 
-    pub fn install(exe: &Path) -> io::Result<()> {
-        let dir = directories::BaseDirs::new()
+    fn unit() -> io::Result<PathBuf> {
+        Ok(directories::BaseDirs::new()
             .ok_or_else(|| io::Error::other("cannot determine the home directory"))?
             .config_dir()
-            .join("systemd/user");
-        std::fs::create_dir_all(&dir)?;
+            .join(format!("systemd/user/{NAME}.service")))
+    }
+
+    /// Whether the unit is enabled and active, as in `enabled, active`.
+    pub fn installed() -> io::Result<Option<String>> {
+        if !unit()?.is_file() {
+            return Ok(None);
+        }
+        let shown = run(
+            "systemctl",
+            &[
+                "--user",
+                "show",
+                NAME,
+                "--property=UnitFileState,ActiveState",
+            ],
+        )?;
+        let value = |key: &str| {
+            shown
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .unwrap_or("unknown")
+                .to_owned()
+        };
+        Ok(Some(format!(
+            "systemd --user {NAME}.service, {}, {}",
+            value("UnitFileState="),
+            value("ActiveState=")
+        )))
+    }
+
+    pub fn install(exe: &Path) -> io::Result<()> {
+        let unit = unit()?;
+        let dir = unit.parent().ok_or(io::ErrorKind::InvalidInput)?;
+        std::fs::create_dir_all(dir)?;
         std::fs::write(
-            dir.join(format!("{NAME}.service")),
+            &unit,
             format!(
                 "[Unit]\nDescription=ovr host agent\nAfter=network-online.target\n\n\
                  [Service]\nExecStart=\"{exe}\" connect --service\n{environment}\
@@ -143,13 +220,31 @@ mod platform {
         )?;
         run("systemctl", &["--user", "daemon-reload"])?;
         run("systemctl", &["--user", "enable", NAME])?;
-        run("systemctl", &["--user", "restart", NAME])
+        run("systemctl", &["--user", "restart", NAME])?;
+        Ok(())
     }
 }
 
 #[cfg(windows)]
 mod platform {
     use super::{NAME, Path, io, run};
+
+    /// The task's status as `schtasks` words it, as in `Ready` or `Running`.
+    pub fn installed() -> io::Result<Option<String>> {
+        // One row without a header, `"\ovrd","N/A","Ready"`, whose columns do not depend on the language.
+        let row = match run("schtasks", &["/Query", "/TN", NAME, "/FO", "CSV", "/NH"]) {
+            Ok(row) => row,
+            // The query fails when there is no such task; `run` reports that as `Other`.
+            Err(err) if err.kind() == io::ErrorKind::Other => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        let status = row
+            .lines()
+            .next()
+            .and_then(|line| line.split("\",\"").nth(2))
+            .map_or("unknown", |status| status.trim_matches('"'));
+        Ok(Some(format!("Scheduled Task \"{NAME}\", {status}")))
+    }
 
     pub fn install(exe: &Path) -> io::Result<()> {
         let command = format!("\"{}\" connect --service", exe.display());
@@ -161,6 +256,7 @@ mod platform {
         )?;
         // Replace a running instance from an earlier install.
         let _ = run("schtasks", &["/End", "/TN", NAME]);
-        run("schtasks", &["/Run", "/TN", NAME])
+        run("schtasks", &["/Run", "/TN", NAME])?;
+        Ok(())
     }
 }

@@ -9,6 +9,7 @@ mod mux;
 mod pairing;
 mod server;
 mod state;
+mod status;
 mod target;
 mod tls;
 mod trust;
@@ -23,6 +24,7 @@ const EXAMPLES: &str = "\
 Examples:
   ovrd connect 100.64.0.10:7420 7KQX-M4RT      pair with the initiator, then serve it, at login too
   ovrd connect devtunnel:quiet-river-x1y2z3    move this paired host to a new address
+  ovrd status                                  whether this host is paired and connected, and its runs
   ovrd clean                                   remove checkouts and finished runs not in use
 
 On your own machine, use `ovr`: it starts the initiator server, and `ovr pair` prints the connect command.";
@@ -71,6 +73,11 @@ pub enum Command {
         #[arg(long, hide = true, conflicts_with = "addr")]
         service: bool,
     },
+    /// Show this host's state: its initiator, connection, login service, and runs.
+    ///
+    /// Reads this host's own files only: it contacts no initiator and starts nothing.
+    #[command(after_help = "Example:\n  ovrd status    on a host, before looking in connect.log")]
+    Status,
     /// Remove every initiator's checkouts and finished runs on this machine, keeping those in use.
     ///
     /// Also removes agents of other versions uploaded over SSH. Checkouts being synced, and runs still running or
@@ -153,6 +160,7 @@ pub async fn run(cli: Cli) -> Result<(), Error> {
             ))
             .await
         }
+        Command::Status => status::status(),
         Command::Clean => clean().await,
         Command::Agent => Ok(agent::serve_stdio().await?),
         Command::Keep { dir } => agent::keeper::main(dir).await,

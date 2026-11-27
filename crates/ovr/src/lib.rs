@@ -13,8 +13,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 use ovr_proto::frame::Resumed;
 use ovr_proto::ipc::ClientStream;
-use ovr_proto::msg::{Attach, Enter, Exec, Op, Provider, Resize, Response, RunInfo, RunState};
-use ovr_proto::{Frame, FrameKind};
+use ovr_proto::msg::{Attach, Enter, Exec, Op, Provider, Resize, Response, RunInfo};
+use ovr_proto::{Frame, FrameKind, print_field};
 
 use crate::session::{End, Io, Mode, Position, Signal, Stream};
 use crate::snapshot::{Repository, Snapshot};
@@ -83,6 +83,12 @@ Examples:
   ovr clean --all            both, on every host with an open connection
 
 On a host, `ovrd clean` removes every initiator's checkouts and finished runs.";
+
+const STATUS_HELP: &str = "\
+Example:
+  ovr status    this initiator's fingerprint, whether hosts can dial in, and where its files are
+
+On a host, `ovrd status` shows whether it is paired and connected, and the runs there.";
 
 const PAIR_HELP: &str = "\
 Examples:
@@ -218,6 +224,9 @@ pub enum Command {
         #[command(subcommand)]
         command: Option<TunnelCommand>,
     },
+    /// Show this initiator's state: identity, dial-in address, tunnels, hosts, and files.
+    #[command(after_help = STATUS_HELP)]
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -327,6 +336,7 @@ pub async fn run(mut cli: Cli) -> Result<i32, Error> {
         (Some(Command::Trust { rule }), _) => manage::trust(Op::Trust { rule }).await,
         (Some(Command::Untrust { rule }), _) => manage::trust(Op::Untrust { rule }).await,
         (Some(Command::Tunnel { command: None }), _) => manage::tunnels().await,
+        (Some(Command::Status), _) => status().await,
         (
             Some(Command::Tunnel {
                 command: Some(TunnelCommand::Close { provider }),
@@ -599,15 +609,9 @@ fn print_runs(rows: &[(String, RunInfo)]) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |time| time.as_secs());
-    let table: Vec<[String; 6]> = rows
-        .iter()
-        .map(|(host, run)| {
-            let state = match &run.state {
-                RunState::Running => "running".to_owned(),
-                RunState::Exited { code } => format!("exited {code}"),
-                RunState::Failed { .. } => "failed".to_owned(),
-                RunState::Lost => "lost".to_owned(),
-            };
+    let header = ["HOST", "RUN", "STATE", "AGE", "CHECKOUT", "COMMAND"].map(str::to_owned);
+    let table: Vec<[String; 6]> = std::iter::once(header)
+        .chain(rows.iter().map(|(host, run)| {
             let command = if run.argv.is_empty() {
                 "(shell)".to_owned()
             } else {
@@ -616,36 +620,15 @@ fn print_runs(rows: &[(String, RunInfo)]) {
             [
                 host.clone(),
                 run.run.to_string(),
-                state,
-                age(now.saturating_sub(run.started)),
+                run.state.to_string(),
+                ovr_proto::format_age(now.saturating_sub(run.started)),
                 run.checkout.clone().unwrap_or_else(|| "-".to_owned()),
                 command,
             ]
-        })
+        }))
         .collect();
-    let header = ["HOST", "RUN", "STATE", "AGE", "CHECKOUT", "COMMAND"].map(str::to_owned);
-    let mut widths = header.clone().map(|cell| cell.len());
-    for row in &table {
-        for (width, cell) in widths.iter_mut().zip(row) {
-            *width = (*width).max(cell.len());
-        }
-    }
-    for row in std::iter::once(&header).chain(&table) {
-        let line: Vec<String> = row
-            .iter()
-            .zip(widths)
-            .map(|(cell, width)| format!("{cell:width$}"))
-            .collect();
-        println!("{}", line.join("  ").trim_end());
-    }
-}
-
-fn age(seconds: u64) -> String {
-    match seconds {
-        0..60 => format!("{seconds}s"),
-        60..3600 => format!("{}m", seconds / 60),
-        3600..86400 => format!("{}h", seconds / 3600),
-        _ => format!("{}d", seconds / 86400),
+    for line in ovr_proto::columns(&table) {
+        println!("{line}");
     }
 }
 
@@ -717,6 +700,55 @@ async fn hosts() -> Result<i32, Error> {
             ),
             (None, _) => println!("{:width$}  offline  -", host.name),
         }
+    }
+    Ok(0)
+}
+
+/// `ovr status`: reports the initiator's state as the local `ovrd` has it, checking nothing.
+async fn status() -> Result<i32, Error> {
+    let (_, response) = daemon::request(Op::Status).await?;
+    let Response::Status {
+        fingerprint,
+        listening,
+        tunnels,
+        rules,
+        paired,
+        online,
+        trusted_online,
+        ssh_connected,
+        paths,
+    } = response
+    else {
+        return Err(daemon::unexpected(response));
+    };
+    println!("ovr {}", ovr_proto::VERSION);
+    print_field("initiator", [fingerprint]);
+    print_field(
+        "listening",
+        [listening.unwrap_or_else(|| {
+            if paired == 0 && rules.is_empty() && tunnels.is_empty() {
+                "not listening (nothing paired or trusted)".to_owned()
+            } else {
+                "not listening".to_owned()
+            }
+        })],
+    );
+    print_field(
+        "tunnels",
+        tunnels.into_iter().map(|tunnel| {
+            let addr = tunnel.addr.unwrap_or_else(|| "(restarting)".to_owned());
+            format!("{:<10}  {addr}", tunnel.provider)
+        }),
+    );
+    print_field("trusted", rules);
+    print_field(
+        "hosts",
+        [format!(
+            "{paired} paired ({online} online), {trusted_online} trusted online, {ssh_connected} ssh connected"
+        )],
+    );
+    for location in paths {
+        print_field(&location.name, [&location]);
     }
     Ok(0)
 }

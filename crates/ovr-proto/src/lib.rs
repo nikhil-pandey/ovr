@@ -47,6 +47,50 @@ pub fn format_bytes(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
+/// A duration in seconds for people, in its largest whole unit: `42s`, `3m`, `2h`, `5d`.
+#[must_use]
+pub fn format_age(seconds: u64) -> String {
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m", seconds / 60),
+        3600..86400 => format!("{}h", seconds / 3600),
+        _ => format!("{}d", seconds / 86400),
+    }
+}
+
+/// Lays out `rows`, a header first, in left-aligned columns two spaces apart.
+#[must_use]
+pub fn columns<const N: usize>(rows: &[[String; N]]) -> Vec<String> {
+    let mut widths = [0; N];
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    rows.iter()
+        .map(|row| {
+            let cells: Vec<String> = row
+                .iter()
+                .zip(widths)
+                .map(|(cell, width)| format!("{cell:width$}"))
+                .collect();
+            cells.join("  ").trim_end().to_owned()
+        })
+        .collect()
+}
+
+/// Prints one field of a status report: `label` beside the first line, the others aligned under it, or `none`.
+pub fn print_field(label: &str, lines: impl IntoIterator<Item = impl std::fmt::Display>) {
+    let mut label = label;
+    for line in lines {
+        println!("{label:<11} {line}");
+        label = "";
+    }
+    if !label.is_empty() {
+        println!("{label:<11} none");
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("unknown frame kind {0}")]

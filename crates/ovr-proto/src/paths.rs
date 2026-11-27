@@ -131,8 +131,8 @@ pub fn home_dir() -> io::Result<PathBuf> {
         .ok_or_else(unknown_home)
 }
 
-/// `var` when it holds an absolute path.
-fn overridden(var: &str) -> Option<PathBuf> {
+/// `var` when it holds an absolute path, and so moves a directory.
+pub(crate) fn overridden(var: &str) -> Option<PathBuf> {
     std::env::var_os(var)
         .map(PathBuf::from)
         .filter(|dir| dir.is_absolute())

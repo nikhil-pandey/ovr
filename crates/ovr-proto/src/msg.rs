@@ -140,6 +140,18 @@ pub enum RunState {
     Lost,
 }
 
+/// As `ovr ps` lists it: `running`, `exited 0`, `failed`, or `lost`.
+impl std::fmt::Display for RunState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Running => f.write_str("running"),
+            Self::Exited { code } => write!(f, "exited {code}"),
+            Self::Failed { .. } => f.write_str("failed"),
+            Self::Lost => f.write_str("lost"),
+        }
+    }
+}
+
 /// `RESIZE`: the client's terminal changed size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resize {
@@ -268,6 +280,8 @@ pub enum Op {
     Trust { rule: Option<String> },
     /// Stop trusting workloads matching `rule`.
     Untrust { rule: String },
+    /// Report the initiator's state.
+    Status,
 }
 
 /// `RESPONSE`: the local `ovrd`'s answer to a [`Request`].
@@ -307,11 +321,60 @@ pub enum Response {
         initiator: String,
         addr: String,
     },
+    /// The initiator's state, as `ovr status` reports it.
+    Status {
+        /// This initiator's fingerprint, which hosts pin.
+        fingerprint: String,
+        /// The address `ovr pair` prints, while listening for dial-in hosts.
+        listening: Option<String>,
+        tunnels: Vec<TunnelStatus>,
+        rules: Vec<String>,
+        /// Paired hosts, and how many of them are connected.
+        paired: usize,
+        online: usize,
+        /// Trusted workloads connected now.
+        trusted_online: usize,
+        /// SSH hosts with an open connection.
+        ssh_connected: usize,
+        /// The data, cache, and state directories, and `ovrd.log`.
+        paths: Vec<Location>,
+    },
     /// `ovrd` is a different version and is exiting; reconnect to start the matching one.
     Restart,
     Failed {
         message: String,
     },
+}
+
+/// A directory or file of `ovr`'s, and the `OVR_*` variable that moved it, if one did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Location {
+    pub name: String,
+    pub path: String,
+    pub moved_by: Option<String>,
+}
+
+impl Location {
+    /// `path`, named `name`, which `var` moves when set.
+    #[must_use]
+    pub fn new(name: &str, path: &std::path::Path, var: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            path: path.display().to_string(),
+            moved_by: crate::paths::overridden(var).map(|_| var.to_owned()),
+        }
+    }
+}
+
+/// The path, then the variable that moved it, as in `/nvme/ovr  (OVR_CHECKOUTS)`.
+impl std::fmt::Display for Location {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.path)?;
+        match &self.moved_by {
+            Some(var) => write!(f, "  ({var})"),
+            None => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
