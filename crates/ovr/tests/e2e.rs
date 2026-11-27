@@ -350,7 +350,7 @@ fn dial_in() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The address and code in the command `ovr pair` prints.
+/// The address and `FINGERPRINT-CODE` token in the command `ovr pair` prints.
 fn pairing(printed: &str) -> Result<(String, String)> {
     let line = printed
         .lines()
@@ -845,7 +845,8 @@ fn dial_in_hosts_pair_directly_then_move_to_a_cloudflare_tunnel() -> Result {
     let host = world.connect(&[&addr])?;
     assert_eq!(host.name, name);
     world.cat(&name)?;
-    let wrong = world.connect(&[&addr, "AAAA-AAAA"]);
+    let (fingerprint, _) = code.split_once('-').ok_or("the token has no code")?;
+    let wrong = world.connect(&[&addr, &format!("{fingerprint}-AAAA-AAAA")]);
     assert!(wrong.is_err(), "a wrong code is rejected");
 
     let unpaired = world.ovr_ok(&["unpair", &name])?;

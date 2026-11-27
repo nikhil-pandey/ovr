@@ -38,23 +38,24 @@ const TUNNEL_RETRY: Duration = Duration::from_secs(2);
 
 type Stream = Framed<TlsStream<TcpStream>>;
 
-/// `ovrd connect`: pair with the initiator at `addr` using `code`, or move to `addr` without one, then keep serving
-/// it, in the foreground if asked to or if it cannot be started at login. Without `addr`, serve the paired initiator.
-/// A code of the form `PROVIDER:FINGERPRINT` serves as a workload that provider vouches for instead, telling it
-/// apart from others of the same workload by `name` if given; see [`federated`].
+/// `ovrd connect`: pair with the initiator at `addr` using `token`, `FINGERPRINT-CODE` as `ovr pair` prints it, or
+/// move to `addr` without one, then keep serving it, in the foreground if asked to or if it cannot be started at
+/// login. Without `addr`, serve the paired initiator. A token of the form `PROVIDER:FINGERPRINT` serves as a workload
+/// that provider vouches for instead, telling it apart from others of the same workload by `name` if given; see
+/// [`federated`].
 ///
 /// # Errors
 ///
-/// Returns an error when the initiator is unreachable, rejects the code, or is not the one this host paired with.
+/// Returns an error when the initiator is unreachable, rejects the code, or is not the one expected.
 pub async fn connect(
     addr: Option<Addr>,
-    code: Option<&str>,
+    token: Option<&str>,
     name: Option<&str>,
     foreground: bool,
 ) -> Result<(), Error> {
-    match (&addr, code) {
-        (Some(addr), Some(code)) if code.contains(':') => {
-            let federation = code.parse().map_err(Error::Invalid)?;
+    match (&addr, token) {
+        (Some(addr), Some(token)) if token.contains(':') => {
+            let federation = token.parse().map_err(Error::Invalid)?;
             return federated(addr.clone(), federation, name, foreground).await;
         }
         _ if name.is_some() => {
@@ -77,8 +78,8 @@ pub async fn connect(
     {
         return Err(already_serving(&dir)?);
     }
-    match (addr, code) {
-        (Some(addr), Some(code)) => pair(&dir, &addr, code).await?,
+    match (addr, token) {
+        (Some(addr), Some(token)) => pair(&dir, &addr, token).await?,
         (Some(addr), None) => move_to(&dir, &addr).await?,
         (None, _) => return serve(&dir, lock).await,
     }
@@ -221,34 +222,38 @@ async fn federated(
     .await
 }
 
-/// Pairs with the initiator at `addr` using `code`.
-async fn pair(dir: &Path, addr: &Addr, code: &str) -> Result<(), Error> {
-    let code = pairing::normalize(code).ok_or_else(|| {
-        Error::Invalid(format!(
-            "{code:?} is not a pairing code; it looks like 7KQX-M4RT"
-        ))
+/// Pairs with the initiator at `addr` using `token`, sending its code only once the initiator there presents the
+/// fingerprint the token starts with.
+async fn pair(dir: &Path, addr: &Addr, token: &str) -> Result<(), Error> {
+    // Not echoed: it may hold a live pairing code, and this error can end up in a CI log.
+    let (initiator, code) = pairing::parse(token).ok_or_else(|| {
+        Error::Invalid(
+            "that is not what `ovr pair` prints; it looks like FINGERPRINT-7KQX-M4RT".to_owned(),
+        )
     })?;
     let previous = state::initiator(dir)?;
     let identity = Identity::load_or_create(dir)?;
-    let (_forwarder, mut stream, initiator) = dial(&identity, addr).await?;
+    let (_forwarder, mut stream) = dial(
+        &identity,
+        addr,
+        &initiator,
+        &format!(
+            "{addr} presented a different identity than the one `ovr pair` printed; something may be intercepting \
+             the connection, or it is another initiator"
+        ),
+    )
+    .await?;
 
-    let hostname = agent::hostname();
-    let mac = pairing::Proof::host(&initiator, &identity.fingerprint, &hostname).sign(&code);
     let pair = Pair {
-        hostname: hostname.clone(),
-        mac,
+        hostname: agent::hostname(),
+        code,
     };
     stream.send(Frame::json(FrameKind::Pair, &pair)?).await?;
     let reply = stream.next().await.ok_or(Error::Disconnected)??;
     if reply.kind == FrameKind::Error {
         return Err(Error::Pairing(reply.parse::<Failure>()?.message));
     }
-    let PairOk { mac } = reply.expect(FrameKind::PairOk)?;
-    if !pairing::Proof::initiator(&initiator, &identity.fingerprint).verify(&code, &mac) {
-        return Err(Error::Pairing(format!(
-            "{addr} did not prove it issued the code; something may be intercepting the connection"
-        )));
-    }
+    let PairOk { name } = reply.expect(FrameKind::PairOk)?;
     if let Some(previous) = previous.filter(|previous| previous.fingerprint != initiator) {
         eprintln!(
             "replacing the pairing with {} ({}): a host serves one initiator; that initiator will see {name} \
@@ -263,10 +268,10 @@ async fn pair(dir: &Path, addr: &Addr, code: &str) -> Result<(), Error> {
         &Initiator {
             addr: addr.to_string(),
             fingerprint: initiator,
-            name: hostname.clone(),
+            name: name.clone(),
         },
     )?;
-    println!("paired with {addr}; serving as {hostname}");
+    println!("paired with {addr}; serving as {name}");
     Ok(())
 }
 
@@ -274,12 +279,15 @@ async fn pair(dir: &Path, addr: &Addr, code: &str) -> Result<(), Error> {
 async fn move_to(dir: &Path, addr: &Addr) -> Result<(), Error> {
     let mut initiator = paired(dir)?;
     let identity = Identity::load_or_create(dir)?;
-    let (_forwarder, _stream, fingerprint) = dial(&identity, addr).await?;
-    if fingerprint != initiator.fingerprint {
-        return Err(Error::Pairing(format!(
-            "{addr} is a different initiator than the one this host paired with; pair with it using a code"
-        )));
-    }
+    dial(
+        &identity,
+        addr,
+        &initiator.fingerprint,
+        &format!(
+            "{addr} is a different initiator than the one this host paired with; pair with it using `ovr pair`"
+        ),
+    )
+    .await?;
     initiator.addr = addr.to_string();
     state::set_initiator(dir, &initiator)?;
     println!("moved to {addr}; serving as {}", initiator.name);
@@ -289,7 +297,8 @@ async fn move_to(dir: &Path, addr: &Addr) -> Result<(), Error> {
 fn paired(dir: &Path) -> Result<Initiator, Error> {
     state::initiator(dir)?.ok_or_else(|| {
         Error::Invalid(
-            "not paired; run the `ovrd connect ADDR CODE` command `ovr pair` prints".to_owned(),
+            "not paired; run the `ovrd connect ADDR FINGERPRINT-CODE` command `ovr pair` prints"
+                .to_owned(),
         )
     })
 }
@@ -442,18 +451,16 @@ async fn attach(
     ),
     Error,
 > {
-    let (forwarder, mut stream, fingerprint) = dial(identity, addr).await?;
-    if fingerprint != pinned {
-        return Err(Error::Pairing(match workload {
-            Some(_) => format!(
-                "{addr} presented a different identity than the fingerprint this host was given; check it with \
-                 `ovr trust` on the initiator"
-            ),
-            None => format!(
-                "{addr} presented a different identity than when paired; pair again if the initiator was reset"
-            ),
-        }));
-    }
+    let mismatch = match workload {
+        Some(_) => format!(
+            "{addr} presented a different identity than the fingerprint this host was given; check it with \
+             `ovr trust` on the initiator"
+        ),
+        None => format!(
+            "{addr} presented a different identity than when paired; pair again if the initiator was reset"
+        ),
+    };
+    let (forwarder, mut stream) = dial(identity, addr, pinned, &mismatch).await?;
     let banner = agent::banner();
     let hello = match workload {
         // A fresh token for every connection: they live for minutes, and this one only goes to the pinned initiator.
@@ -486,13 +493,15 @@ async fn attach(
     }
 }
 
-/// Opens TLS to `addr`, through a new forwarder for a tunnel, returning the forwarder, the stream, and the
-/// initiator's fingerprint for the caller to check. A tunnel gets a while to start carrying connections, with a
-/// fresh forwarder for every attempt.
+/// Opens TLS to `addr`, through a new forwarder for a tunnel, returning the forwarder and the stream once the
+/// initiator presents the fingerprint `pinned`, and failing with `mismatch` at once, before anything is sent, when it
+/// presents another. A tunnel gets a while to start carrying connections, with a fresh forwarder for every attempt.
 async fn dial(
     identity: &Identity,
     addr: &Addr,
-) -> Result<(Option<Running>, Stream, String), Error> {
+    pinned: &str,
+    mismatch: &str,
+) -> Result<(Option<Running>, Stream), Error> {
     let deadline = Instant::now()
         + match addr {
             Addr::Direct(_) => Duration::ZERO,
@@ -507,7 +516,8 @@ async fn dial(
             }
         };
         match handshake(identity, &target, addr).await {
-            Ok((stream, fingerprint)) => return Ok((forwarder, stream, fingerprint)),
+            Ok((stream, fingerprint)) if fingerprint == pinned => return Ok((forwarder, stream)),
+            Ok(_) => return Err(Error::Pairing(mismatch.to_owned())),
             Err(err) if Instant::now() < deadline => {
                 drop(forwarder);
                 tracing::debug!(%err, "the tunnel is not carrying connections yet");

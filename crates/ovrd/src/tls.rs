@@ -145,6 +145,14 @@ pub fn peer_fingerprint(certificates: Option<&[CertificateDer<'_>]>) -> Option<S
     certificates?.first().map(|cert| fingerprint(cert))
 }
 
+/// A fingerprint as typed, in canonical lowercase form, if it is one.
+#[must_use]
+pub fn parse_fingerprint(text: &str) -> Option<String> {
+    let fingerprint = text.to_ascii_lowercase();
+    (fingerprint.len() == 64 && fingerprint.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then_some(fingerprint)
+}
+
 fn fingerprint(cert: &[u8]) -> String {
     hex(ring::digest::digest(&ring::digest::SHA256, cert).as_ref())
 }

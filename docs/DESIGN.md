@@ -101,7 +101,7 @@ ovr untrust RULE            stop trusting workloads matching RULE
 ovr status                  this initiator's fingerprint, listening address, tunnels, trust rules, hosts, and files
 
 # On a host
-ovrd connect ADDR CODE      pair with the initiator at ADDR and keep serving it (printed by `ovr pair`)
+ovrd connect ADDR FP-CODE   pair with the initiator at ADDR and keep serving it (printed by `ovr pair`)
 ovrd connect [ADDR]         keep serving the initiator it paired with, at ADDR from now on if given
 ovrd connect ADDR github:FP in a GitHub Actions job: serve the initiator with fingerprint FP while the job runs
 ovrd disconnect             stop serving at login and forget the paired initiator; runs already here keep going
@@ -117,9 +117,9 @@ ovrd keep DIR               a run's keeper; started by the agent
 `ovr` and `ovrd` without arguments print their help, and their `--help` and that of most subcommands end with
 examples.
 
-- `HOST` is a dialed-in host's name (its hostname, as shown by `ovr hosts`) or an SSH destination: an alias from
-  `~/.ssh/config`, `user@hostname`, or a hostname. Dialed-in names win if both match. Subcommand names win over host
-  names; reach a host called `ps` as `user@ps`.
+- `HOST` is a dialed-in host's name (its hostname, numbered if taken, as shown by `ovr hosts`) or an SSH destination:
+  an alias from `~/.ssh/config`, `user@hostname`, or a hostname. Dialed-in names win if both match. Subcommand names
+  win over host names; reach a host called `ps` as `user@ps`.
 - `--` is required before `CMD`, so it is always clear where `ovr`'s arguments end and the command begins.
   Everything after it is passed through verbatim, including flags (`ovr box -- cargo build --release`). Anything
   else after `HOST` is an error that suggests `--`.
@@ -177,8 +177,8 @@ examples.
 - `ovr get` exits `0` when everything was fetched, `1` when something could not be, and `125` when `ovr` itself
   fails. See [Copying files back](#copying-files-back).
 - `ADDR` is `host:port`, or a tunnel: `cloudflare:HOSTNAME`, `devtunnel:ID`, or `tailcat:ADDRESS`. `PROVIDER` is
-  `cloudflare`, `devtunnel`, or `tailcat`. `ovrd connect ADDR CODE --foreground` pairs and serves without installing anything
-  at login, for CI runners and other short-lived hosts.
+  `cloudflare`, `devtunnel`, or `tailcat`. `ovrd connect ADDR FP-CODE --foreground` pairs and serves without
+  installing anything at login, for CI runners and other short-lived hosts.
 
 ## Architecture
 
@@ -192,8 +192,8 @@ examples.
  │ ovrd                                         │         └───────────────────────────────────────┘
  │   ├─ ssh hosts: spawn ssh, upload agent      │
  │   └─ dialed-in hosts: TLS listener :7420     │  TLS    ┌───────────────────────────────────────┐
- │        paired keys, hostname ─► connection   │ ◄─dials─│ winbox                                │
- │                                              │   out   │   ovrd connect <initiator> CODE       │
+ │        paired keys, name ─► connection       │ ◄─dials─│ winbox                                │
+ │                                              │   out   │   ovrd connect <initiator> FP-CODE    │
  │ one agent protocol over either stream        │         │   <checkouts>\<owner>\<repo>-<key>\   │
  └──────────────────────────────────────────────┘         └───────────────────────────────────────┘
 ```
@@ -230,9 +230,9 @@ For hosts that cannot accept SSH, including every Windows workstation:
 ```
  initiator$ ovr pair
  run this on the host within 10 minutes:
-   ovrd connect 100.64.0.10:7420 7KQX-M4RT
+   ovrd connect 100.64.0.10:7420 2bc272ae...fc000972-7KQX-M4RT
 
- winbox> ovrd connect 100.64.0.10:7420 7KQX-M4RT
+ winbox> ovrd connect 100.64.0.10:7420 2bc272ae...fc000972-7KQX-M4RT
  paired with 100.64.0.10:7420; serving as winbox
 ```
 
@@ -242,11 +242,14 @@ For hosts that cannot accept SSH, including every Windows workstation:
   exits; an `ovrd` making way for another version stops listening at once, and the new one waits a few seconds for
   the port.
 - Each side has a self-signed Ed25519 certificate; every connection is TLS 1.3 and each side checks the other's
-  certificate fingerprint, so **both keys are pinned**. The host runs `ovrd connect ADDR CODE` once: it sends its
-  name with an HMAC of both fingerprints keyed by the code, and the initiator answers with its own HMAC, so neither
-  side can be impersonated by someone without the code. Codes are single-use and expire after ten minutes, and five
-  wrong guesses revoke every outstanding code. The identity and pairing records live in the data directory (see
-  [Files](#files)); they are a record, like `known_hosts`, not configuration.
+  certificate fingerprint, so **both keys are pinned**. `ovr pair` prints one argument, `FP-CODE`: the initiator's
+  fingerprint and a one-shot code. The host runs `ovrd connect ADDR FP-CODE` once: right after the TLS handshake it
+  checks that the initiator presents `FP`, and refuses before sending anything if not; only then does it send its
+  hostname and the code, and the initiator records the host's fingerprint under the name it answers with. So the code
+  goes only to the real initiator: whoever is in the path, a tunnel provider included, sees nothing derived from it to
+  guess offline, and like anyone who finds the address can only guess codes online. Codes are single-use and expire
+  after ten minutes, and five wrong guesses revoke every outstanding code. The identity and pairing records live in
+  the data directory (see [Files](#files)); they are a record, like `known_hosts`, not configuration.
 - Both ends send a heartbeat on the connection every 15 seconds and close it after 45 seconds without one, so a
   vanished peer is noticed within a minute even through a tunnel or proxy, where TCP keepalive only probes the
   nearest hop, which stays up.
@@ -268,14 +271,17 @@ For hosts that cannot accept SSH, including every Windows workstation:
 - `ovrd connect ADDR` without a code moves a paired host to a new address of the same initiator. It needs no code
   because the pinned key, not the address, identifies the initiator: the host accepts the new address only once the
   initiator there presents that key.
-- The host is addressable by its hostname: `ovr winbox -- dotnet test`. `ovr hosts` lists it as `paired`, online
-  with its platform and for how long, or offline and when it was last seen while `ovrd` has been running.
+- The host is addressable by the name it paired under, which `ovrd connect` prints and `ovrd status` shows: its
+  hostname, or while another paired host has that name, the first free of `NAME-2`, `NAME-3`, and so on, as in
+  `ovr winbox -- dotnet test`. Pairing the same host again, as known by its key, keeps its name whatever it is
+  called now. `ovr hosts` lists it as `paired`, online with its platform and for how long, or offline and when it was last seen
+  while `ovrd` has been running.
 - While it serves, `ovrd connect` records whether it is connected, since when, and the last failure in
   `connect.json` beside `connect.log`, and removes it when it stops; `ovrd status` shows it, and ignores a record
   left by an `ovrd connect` that no longer holds its lock.
-- A host serves one initiator. `ovrd connect ADDR CODE` with another initiator's code replaces the pairing and says
-  so: the earlier initiator lists the host as offline until it runs `ovr unpair NAME`, `NAME` being the name the host
-  paired under, which the host records and `ovrd status` shows. Pairing or moving while another `ovrd connect`
+- A host serves one initiator. `ovrd connect ADDR FP-CODE` with another initiator's token replaces the pairing and
+  says so: the earlier initiator lists the host as offline until it runs `ovr unpair NAME`, `NAME` being the name
+  the host paired under, which the host records and `ovrd status` shows. Pairing or moving while another `ovrd connect`
   serves fails before anything changes, unless the one serving is the login service, which pairing restarts.
 - `ovr unpair winbox` forgets the host and closes its connection. Runs already there keep going, but this initiator
   no longer reaches them; the host's `ovrd connect` keeps dialing in and is refused until it is paired again.
@@ -298,17 +304,19 @@ Microsoft Dev Tunnels, or `tailcat` for Tailcat.
 ```
  initiator$ ovr pair cloudflare
  run this on the host within 10 minutes:
-   ovrd connect cloudflare:quiet-river-delta.trycloudflare.com 7KQX-M4RT
+   ovrd connect cloudflare:quiet-river-delta.trycloudflare.com 2bc272ae...fc000972-7KQX-M4RT
 
- runner$ ovrd connect cloudflare:quiet-river-delta.trycloudflare.com 7KQX-M4RT --foreground
+ runner$ ovrd connect cloudflare:quiet-river-delta.trycloudflare.com 2bc272ae...fc000972-7KQX-M4RT --foreground
  paired with cloudflare:quiet-river-delta.trycloudflare.com; serving as runner
 ```
 
-- **A tunnel only carries bytes.** Pairing and pinned mutual TLS run end to end through it unchanged, so the
-  provider sees ciphertext and connection metadata, and whoever finds the public address can do no more than a
-  stranger on the same LAN. Tunnels are therefore opened for anonymous access: no account, token, or other
-  credential appears in any printed command or log, and `ovr` never handles a provider login. The initiator needs
-  the provider's CLI installed, and for Dev Tunnels logged in; the host needs the CLI installed.
+- **A tunnel only carries bytes.** Pinned mutual TLS runs end to end through it, and a pairing host checks the
+  initiator's fingerprint before it sends the code, so the provider sees ciphertext and connection metadata, cannot
+  pose as either side, and like whoever finds the public address can do no more than a stranger on the same LAN.
+  Tunnels are therefore opened for anonymous access: no provider account, token, or other credential appears in any
+  printed command or log, and `ovr` never handles a provider login. The pairing code in the printed command is a
+  secret until it is redeemed or expires; `ovrd connect` never echoes it in an error. The initiator needs the provider's CLI installed, and for
+  Dev Tunnels logged in; the host needs the CLI installed.
 - **The initiator's `ovrd` owns the tunnel.** `ovr pair PROVIDER` opens a tunnel to `:7420` unless one for that
   provider is already open, then prints the host's command with the tunnel's address. From then on `ovrd` restarts
   the provider's CLI when it exits and reopens the tunnel whenever `ovrd` starts, once it holds `:7420`, so the
@@ -790,8 +798,10 @@ caches such as sccache or bazel-remote are a per-host concern and work unchanged
 - Tunnels are transport only and anonymous by design: authentication is the pinned mutual TLS inside them, so a
   tunnel's public address is not a secret, and no provider credential is ever printed or logged.
 - SSH hosts: authentication and host verification are OpenSSH's, using your existing configuration.
-- Dial-in hosts: mutual TLS 1.3 with keys pinned at pairing. A host serves only the initiator it paired with; the
-  initiator accepts only hosts it paired. Pairing codes are one-shot, expiring, and rate-limited. An initiator with
+- Dial-in hosts: mutual TLS 1.3 with keys pinned at pairing. The pairing command carries the initiator's
+  fingerprint, so a host sends its code only to that initiator, and a man in the middle gets nothing to guess
+  offline. A host serves only the initiator it paired with; the initiator accepts only hosts it paired, each under
+  its own name. Pairing codes are one-shot, expiring, and rate-limited. An initiator with
   nothing paired, trusted, or tunnelled opens no port.
 - Trusted workloads: the same TLS, with the initiator pinned by the fingerprint the host is given, and the host
   admitted by a provider token for this initiator's audience that a trust rule matches. Anyone who can run a trusted

@@ -1,11 +1,9 @@
-//! One-shot pairing codes. Both sides prove knowledge of the code with a MAC over both TLS fingerprints, so a
-//! man in the middle, who must present different certificates, cannot complete pairing without the code.
+//! One-shot pairing codes. `ovr pair` prints one after the initiator's fingerprint, as `FINGERPRINT-CODE`, so the
+//! host checks whom it dialed before it sends the code, and only the initiator ever sees it.
 
 use std::time::{Duration, Instant};
 
-use ring::hmac;
-
-use crate::tls::hex;
+use crate::tls;
 
 /// How long a printed code stays valid.
 pub const LIFETIME: Duration = Duration::from_mins(10);
@@ -42,26 +40,34 @@ impl Codes {
         Ok(format!("{}-{}", &code[..LEN / 2], &code[LEN / 2..]))
     }
 
-    /// Consumes the code that `verify` accepts, if any is outstanding. Repeated failures revoke every code.
-    pub fn redeem(&mut self, verify: impl Fn(&str) -> bool) -> Option<String> {
+    /// Consumes `code`, in canonical form, returning whether it was outstanding. Repeated failures revoke every
+    /// code.
+    pub fn redeem(&mut self, code: &str) -> bool {
         self.issued
             .retain(|(_, issued)| issued.elapsed() < LIFETIME);
-        if let Some(index) = self.issued.iter().position(|(code, _)| verify(code)) {
+        if let Some(index) = self.issued.iter().position(|(issued, _)| issued == code) {
             self.failures = 0;
-            return Some(self.issued.swap_remove(index).0);
+            self.issued.swap_remove(index);
+            return true;
         }
         self.failures += 1;
         if self.failures >= MAX_FAILURES {
             self.issued.clear();
             self.failures = 0;
         }
-        None
+        false
     }
 }
 
-/// Canonical form of a typed code: case, dashes, and look-alike letters do not matter.
+/// Splits `FINGERPRINT-CODE`, as `ovr pair` prints it, into the initiator's fingerprint and the canonical code.
 #[must_use]
-pub fn normalize(input: &str) -> Option<String> {
+pub fn parse(token: &str) -> Option<(String, String)> {
+    let (fingerprint, code) = token.trim().split_once('-')?;
+    Some((tls::parse_fingerprint(fingerprint)?, normalize(code)?))
+}
+
+/// Canonical form of a typed code: case, dashes, and look-alike letters do not matter.
+fn normalize(input: &str) -> Option<String> {
     let code: String = input
         .chars()
         .filter(|c| *c != '-' && !c.is_whitespace())
@@ -72,59 +78,6 @@ pub fn normalize(input: &str) -> Option<String> {
         })
         .collect();
     (code.len() == LEN && code.bytes().all(|b| ALPHABET.contains(&b))).then_some(code)
-}
-
-/// What one side signs with the code to prove it took part in this exchange.
-pub struct Proof(Vec<u8>);
-
-impl Proof {
-    /// The host's proof: it knows the code and saw these fingerprints.
-    #[must_use]
-    pub fn host(initiator: &str, host: &str, hostname: &str) -> Self {
-        Self::of(&["ovr pair v1", initiator, host, hostname])
-    }
-
-    /// The initiator's proof in reply.
-    #[must_use]
-    pub fn initiator(initiator: &str, host: &str) -> Self {
-        Self::of(&["ovr pair ok v1", initiator, host])
-    }
-
-    /// Length-prefixed parts, so that no two different part lists produce the same message.
-    fn of(parts: &[&str]) -> Self {
-        let mut message = Vec::new();
-        for part in parts {
-            message.extend_from_slice(&(part.len() as u64).to_le_bytes());
-            message.extend_from_slice(part.as_bytes());
-        }
-        Self(message)
-    }
-
-    /// The hex MAC to send.
-    #[must_use]
-    pub fn sign(&self, code: &str) -> String {
-        hex(hmac::sign(&key(code), &self.0).as_ref())
-    }
-
-    /// Whether `mac` is this proof signed with `code`, compared in constant time.
-    #[must_use]
-    pub fn verify(&self, code: &str, mac: &str) -> bool {
-        unhex(mac).is_some_and(|tag| hmac::verify(&key(code), &self.0, &tag).is_ok())
-    }
-}
-
-fn key(code: &str) -> hmac::Key {
-    hmac::Key::new(hmac::HMAC_SHA256, code.as_bytes())
-}
-
-fn unhex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
-        .collect()
 }
 
 #[cfg(test)]
@@ -144,35 +97,15 @@ mod tests {
     fn codes_are_single_use_and_revoked_after_repeated_failures()
     -> Result<(), ring::error::Unspecified> {
         let mut codes = Codes::default();
-        let first = normalize(&codes.issue()?);
-        let second = normalize(&codes.issue()?);
+        let first = codes.issue()?.replace('-', "");
+        let second = codes.issue()?.replace('-', "");
 
-        assert_eq!(
-            codes.redeem(|candidate| Some(candidate) == first.as_deref()),
-            first
-        );
-        assert_eq!(
-            codes.redeem(|candidate| Some(candidate) == first.as_deref()),
-            None
-        );
+        assert!(codes.redeem(&first));
+        assert!(!codes.redeem(&first));
         for _ in 1..MAX_FAILURES {
-            assert_eq!(codes.redeem(|_| false), None);
+            assert!(!codes.redeem("00000000"));
         }
-        assert_eq!(
-            codes.redeem(|candidate| Some(candidate) == second.as_deref()),
-            None,
-            "the fifth failure revoked it"
-        );
+        assert!(!codes.redeem(&second), "the fifth failure revoked it");
         Ok(())
-    }
-
-    #[test]
-    fn proofs_bind_the_code_and_both_identities() {
-        let mac = Proof::host("initiator", "host", "winbox").sign("7KQXM4RT");
-        assert!(Proof::host("initiator", "host", "winbox").verify("7KQXM4RT", &mac));
-        assert!(!Proof::host("initiator", "host", "winbox").verify("7KQXM4RU", &mac));
-        assert!(!Proof::host("mitm", "host", "winbox").verify("7KQXM4RT", &mac));
-        assert!(!Proof::initiator("initiator", "host").verify("7KQXM4RT", &mac));
-        assert!(!Proof::host("initiator", "host", "winbox").verify("7KQXM4RT", "zz"));
     }
 }

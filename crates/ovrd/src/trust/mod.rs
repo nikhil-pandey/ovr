@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::state;
+use crate::{state, tls};
 
 /// Bounds each request to a provider.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -115,13 +115,11 @@ impl FromStr for Federation {
     fn from_str(spec: &str) -> Result<Self, String> {
         let (provider, initiator) = spec
             .split_once(':')
-            .ok_or_else(|| format!("{spec:?} is not PROVIDER:FINGERPRINT"))?;
-        let initiator = initiator.to_ascii_lowercase();
-        if initiator.len() != 64 || !initiator.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(format!(
-                "{initiator:?} is not an initiator fingerprint; `ovr trust` prints it"
-            ));
-        }
+            .ok_or_else(|| "expected PROVIDER:FINGERPRINT, as `ovr trust` prints it".to_owned())?;
+        // Not echoed: a mistyped pairing token may hold a live code.
+        let initiator = tls::parse_fingerprint(initiator).ok_or_else(|| {
+            "expected PROVIDER:FINGERPRINT with the initiator's fingerprint, as `ovr trust` prints it".to_owned()
+        })?;
         Ok(Self {
             provider: provider.parse()?,
             initiator,

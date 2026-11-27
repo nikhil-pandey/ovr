@@ -15,8 +15,7 @@ use tokio_rustls::TlsAcceptor;
 
 use super::{PORT, Server};
 use crate::mux::{self, Mux};
-use crate::state::PairedHost;
-use crate::{Error, pairing, state, tls};
+use crate::{Error, state, tls};
 
 /// Bounds the handshake and first frame, so idle connections cannot pile up.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -94,7 +93,8 @@ async fn handle(server: &Server, acceptor: &TlsAcceptor, tcp: TcpStream) -> Resu
     }
 }
 
-/// Completes `ovrd connect ADDR CODE` when the host proves it holds a code issued here.
+/// Completes `ovrd connect ADDR FINGERPRINT-CODE` for a host that holds a code issued here, which it sends only
+/// after checking this initiator's fingerprint.
 async fn pair<S>(
     server: &Server,
     stream: &mut Framed<S>,
@@ -105,14 +105,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request: Pair = frame.parse()?;
-    let initiator = &server.identity.fingerprint;
-    let proof = pairing::Proof::host(initiator, host, &request.hostname);
-    let code = server
+    let redeemed = server
         .codes
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .redeem(|code| proof.verify(code, &request.mac));
-    let Some(code) = code else {
+        .redeem(&request.code);
+    if !redeemed {
         let message = "the pairing code is wrong or has expired; run `ovr pair` again".to_owned();
         stream
             .send(Frame::json(FrameKind::Error, &Failure { message })?)
@@ -121,25 +119,22 @@ where
             "failed pairing attempt from {}",
             request.hostname
         )));
-    };
-    let name = valid_name(&request.hostname)?;
-    {
+    }
+    let hostname = valid_name(&request.hostname)?;
+    let name = {
         let _pairing = server
             .pairing
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        state::add_host(
-            &server.dir,
-            PairedHost {
-                name: name.clone(),
-                fingerprint: host.to_owned(),
-            },
-        )?;
+        let name = state::add_host(&server.dir, &hostname, host)?;
         server.dialed.forget_seen(&name);
-    }
-    let mac = pairing::Proof::initiator(initiator, host).sign(&code);
+        name
+    };
     stream
-        .send(Frame::json(FrameKind::PairOk, &PairOk { mac })?)
+        .send(Frame::json(
+            FrameKind::PairOk,
+            &PairOk { name: name.clone() },
+        )?)
         .await?;
     stream.close().await?;
     tracing::info!(name, "paired");

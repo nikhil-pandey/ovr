@@ -100,7 +100,7 @@ On a host, `ovrd status` shows whether it is paired and connected, and the runs 
 
 const PAIR_HELP: &str = "\
 Examples:
-  ovr pair               prints `ovrd connect ADDR CODE` to run on the host within 10 minutes
+  ovr pair               prints `ovrd connect ADDR FINGERPRINT-CODE` to run on the host within 10 minutes
   ovr pair cloudflare    the same, through a Cloudflare quick tunnel; or devtunnel, or tailcat";
 
 const UNPAIR_HELP: &str = "\
@@ -200,7 +200,7 @@ pub enum Command {
     },
     /// Print a one-shot command for a host to dial in and pair.
     ///
-    /// The host runs the printed `ovrd connect ADDR CODE` within 10 minutes. With PROVIDER, ADDR is a tunnel from
+    /// The host runs the printed `ovrd connect ADDR FINGERPRINT-CODE` within 10 minutes. With PROVIDER, ADDR is a tunnel from
     /// that provider, opened unless one is open; it stays open until `ovr tunnel close PROVIDER`.
     #[command(after_help = PAIR_HELP)]
     Pair {
