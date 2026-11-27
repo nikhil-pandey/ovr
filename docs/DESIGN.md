@@ -250,6 +250,11 @@ For hosts that cannot accept SSH, including every Windows workstation:
   guess offline, and like anyone who finds the address can only guess codes online. Codes are single-use and expire
   after ten minutes, and five wrong guesses revoke every outstanding code. The identity and pairing records live in
   the data directory (see [Files](#files)); they are a record, like `known_hosts`, not configuration.
+- The port may face the internet through a tunnel, so `ovrd` bounds concurrent handshakes: the TLS handshake and
+  the first message's read must finish within 10 seconds, and at most 64 connections across its listeners may be at
+  that stage at once; more are closed as soon as they are accepted. Once the first message arrives the slot is free
+  again, before admission, and admitted hosts are not limited. This protects `ovrd`'s resources, not availability:
+  a flood can keep hosts from connecting until its connections time out, and they retry.
 - Both ends send a heartbeat on the connection every 15 seconds and close it after 45 seconds without one, so a
   vanished peer is noticed within a minute even through a tunnel or proxy, where TCP keepalive only probes the
   nearest hop, which stays up.
@@ -801,8 +806,9 @@ caches such as sccache or bazel-remote are a per-host concern and work unchanged
 - Dial-in hosts: mutual TLS 1.3 with keys pinned at pairing. The pairing command carries the initiator's
   fingerprint, so a host sends its code only to that initiator, and a man in the middle gets nothing to guess
   offline. A host serves only the initiator it paired with; the initiator accepts only hosts it paired, each under
-  its own name. Pairing codes are one-shot, expiring, and rate-limited. An initiator with
-  nothing paired, trusted, or tunnelled opens no port.
+  its own name. Pairing codes are one-shot, expiring, and rate-limited. Concurrent TLS handshakes and first-message
+  reads are capped and time out; a flood through a public tunnel can still delay hosts until it stops. An initiator
+  with nothing paired, trusted, or tunnelled opens no port.
 - Trusted workloads: the same TLS, with the initiator pinned by the fingerprint the host is given, and the host
   admitted by a provider token for this initiator's audience that a trust rule matches. Anyone who can run a trusted
   workflow can make a host appear, but a host only receives work: a trusted host is named `OWNER/REPO/WORKFLOW/RUN/JOB`,
