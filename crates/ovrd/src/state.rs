@@ -21,6 +21,8 @@ pub struct PairedHost {
 pub struct Initiator {
     pub addr: String,
     pub fingerprint: String,
+    /// The name this host paired under, which the initiator keeps for it whatever the host is later called.
+    pub name: String,
 }
 
 /// A tunnel the initiator keeps open, as recorded by `ovr pair PROVIDER`.
@@ -96,6 +98,19 @@ pub fn initiator(dir: &Path) -> io::Result<Option<Initiator>> {
 /// Returns an error when the record cannot be written.
 pub fn set_initiator(dir: &Path, initiator: &Initiator) -> io::Result<()> {
     write(&initiator_path(dir), initiator)
+}
+
+/// Forgets the initiator this host dials, returning it if there was one.
+///
+/// # Errors
+///
+/// Returns an error when the record cannot be read or removed.
+pub fn forget_initiator(dir: &Path) -> io::Result<Option<Initiator>> {
+    let initiator = initiator(dir)?;
+    if initiator.is_some() {
+        std::fs::remove_file(initiator_path(dir))?;
+    }
+    Ok(initiator)
 }
 
 /// # Errors

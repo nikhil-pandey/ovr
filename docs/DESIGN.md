@@ -104,6 +104,7 @@ ovr status                  this initiator's fingerprint, listening address, tun
 ovrd connect ADDR CODE      pair with the initiator at ADDR and keep serving it (printed by `ovr pair`)
 ovrd connect [ADDR]         keep serving the initiator it paired with, at ADDR from now on if given
 ovrd connect ADDR github:FP in a GitHub Actions job: serve the initiator with fingerprint FP while the job runs
+ovrd disconnect             stop serving at login and forget the paired initiator; runs already here keep going
 ovrd status                 the paired initiator, whether `ovrd connect` is connected, the login service, and runs
 ovrd clean                  remove every initiator's checkouts and finished runs not in use on this machine
 
@@ -257,8 +258,9 @@ For hosts that cannot accept SSH, including every Windows workstation:
   own reconnect backoff. At info level, only changes in the failure reason are logged; repeated identical failures
   are debug events. Pairing installs it to start at login as
   the logged-in user (Scheduled Task on Windows, a `launchd` agent on macOS, a `systemd --user` unit on Linux),
-  never as SYSTEM or root. Restarting the service leaves run
-  keepers alone (`KillMode=process` on Linux). The service keeps the `PATH` and `OVR_*` directory variables it was
+  never as SYSTEM or root. Restarting or removing the service leaves run keepers alone: `KillMode=process` on
+  Linux, a session of their own on macOS, and on Windows leaving the task's Job Object where it allows. The service
+  keeps the `PATH` and `OVR_*` directory variables it was
   installed from, so it finds tunnel CLIs wherever the user installed them and its files where the user moved them;
   a Scheduled Task reads the user's persistent environment instead. With `--foreground`, or where no service
   manager is available, it serves in the foreground instead and installs nothing. A Linux host that should serve without a login session needs
@@ -271,8 +273,17 @@ For hosts that cannot accept SSH, including every Windows workstation:
 - While it serves, `ovrd connect` records whether it is connected, since when, and the last failure in
   `connect.json` beside `connect.log`, and removes it when it stops; `ovrd status` shows it, and ignores a record
   left by an `ovrd connect` that no longer holds its lock.
+- A host serves one initiator. `ovrd connect ADDR CODE` with another initiator's code replaces the pairing and says
+  so: the earlier initiator lists the host as offline until it runs `ovr unpair NAME`, `NAME` being the name the host
+  paired under, which the host records and `ovrd status` shows. Pairing or moving while another `ovrd connect`
+  serves fails before anything changes, unless the one serving is the login service, which pairing restarts.
 - `ovr unpair winbox` forgets the host and closes its connection. Runs already there keep going, but this initiator
   no longer reaches them; the host's `ovrd connect` keeps dialing in and is refused until it is paired again.
+- `ovrd disconnect` on the host is the other side: it stops and removes the login service, which stops its
+  `ovrd connect`, and forgets the paired initiator, so a later `ovrd connect` must pair again. Run keepers,
+  checkouts, and the host's identity stay, and runs keep going: removing the service leaves keepers alone, as
+  restarting it does. An `ovrd connect` started in a terminal is left serving, and said to be. The initiator lists
+  the host until `ovr unpair` runs there. With nothing installed or paired, it says so and succeeds.
 - Reachability is the network's job. On Tailscale, `100.x.y.z` is the initiator's stable address and the WireGuard
   layer already authenticates peers; the pinned keys are defense in depth and also make the design work over any
   other overlay, a plain LAN, or a tunnel.

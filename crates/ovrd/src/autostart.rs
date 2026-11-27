@@ -18,6 +18,16 @@ pub fn install() -> io::Result<()> {
     platform::install(&exe)
 }
 
+/// Stops and removes the service, returning what it was, as in `the systemd --user unit`, or `None` when none was
+/// installed. Run keepers outlive it, as they outlive a restart.
+///
+/// # Errors
+///
+/// Returns an error when the service manager is unavailable or rejects it.
+pub fn uninstall() -> io::Result<Option<&'static str>> {
+    platform::uninstall()
+}
+
 /// The service, as in `systemd --user ovrd.service, enabled, active`, or `None` when it is not installed.
 ///
 /// # Errors
@@ -144,6 +154,17 @@ mod platform {
         Ok(())
     }
 
+    pub fn uninstall() -> io::Result<Option<&'static str>> {
+        let plist = plist()?;
+        if !plist.is_file() {
+            return Ok(None);
+        }
+        // Fails when the agent is not loaded.
+        let _ = run("launchctl", &["bootout", &format!("{}/{LABEL}", domain())]);
+        std::fs::remove_file(plist)?;
+        Ok(Some("the launchd agent"))
+    }
+
     fn escape(value: &str) -> String {
         value
             .replace('&', "&amp;")
@@ -198,6 +219,7 @@ mod platform {
         let unit = unit()?;
         let dir = unit.parent().ok_or(io::ErrorKind::InvalidInput)?;
         std::fs::create_dir_all(dir)?;
+        let existed = unit.is_file();
         std::fs::write(
             &unit,
             format!(
@@ -218,10 +240,28 @@ mod platform {
                     }),
             ),
         )?;
-        run("systemctl", &["--user", "daemon-reload"])?;
+        if let Err(err) = run("systemctl", &["--user", "daemon-reload"]) {
+            // Without a user manager to load it, a new unit would only be a stale file for `ovrd status` to report.
+            if !existed {
+                let _ = std::fs::remove_file(&unit);
+            }
+            return Err(err);
+        }
         run("systemctl", &["--user", "enable", NAME])?;
         run("systemctl", &["--user", "restart", NAME])?;
         Ok(())
+    }
+
+    pub fn uninstall() -> io::Result<Option<&'static str>> {
+        let unit = unit()?;
+        if !unit.is_file() {
+            return Ok(None);
+        }
+        // Stopping kills only `ovrd connect` itself: the unit's `KillMode=process` leaves run keepers running.
+        run("systemctl", &["--user", "disable", "--now", NAME])?;
+        std::fs::remove_file(unit)?;
+        run("systemctl", &["--user", "daemon-reload"])?;
+        Ok(Some("the systemd --user unit"))
     }
 }
 
@@ -258,5 +298,16 @@ mod platform {
         let _ = run("schtasks", &["/End", "/TN", NAME]);
         run("schtasks", &["/Run", "/TN", NAME])?;
         Ok(())
+    }
+
+    pub fn uninstall() -> io::Result<Option<&'static str>> {
+        if installed()?.is_none() {
+            return Ok(None);
+        }
+        // Ending the task ends its job; run keepers left that job when they started, where it allows it.
+        // Fails when the task is not running.
+        let _ = run("schtasks", &["/End", "/TN", NAME]);
+        run("schtasks", &["/Delete", "/TN", NAME, "/F"])?;
+        Ok(Some("the Scheduled Task"))
     }
 }

@@ -25,6 +25,7 @@ Examples:
   ovrd connect 100.64.0.10:7420 7KQX-M4RT      pair with the initiator, then serve it, at login too
   ovrd connect devtunnel:quiet-river-x1y2z3    move this paired host to a new address
   ovrd status                                  whether this host is paired and connected, and its runs
+  ovrd disconnect                              stop serving at login and forget the initiator
   ovrd clean                                   remove checkouts and finished runs not in use
 
 On your own machine, use `ovr`: it starts the initiator server, and `ovr pair` prints the connect command.";
@@ -73,6 +74,15 @@ pub enum Command {
         #[arg(long, hide = true, conflicts_with = "addr")]
         service: bool,
     },
+    /// Stop serving the initiator at login and forget it; runs here keep going.
+    ///
+    /// Stops and removes the login service that `ovrd connect` installed, and forgets the paired initiator, so
+    /// `ovrd connect` must pair again. Runs, checkouts, and this host's identity stay. An `ovrd connect` started in
+    /// the foreground keeps serving until it is stopped.
+    #[command(
+        after_help = "Example:\n  ovrd disconnect    on a host, to stop serving its initiator"
+    )]
+    Disconnect,
     /// Show this host's state: its initiator, connection, login service, and runs.
     ///
     /// Reads this host's own files only: it contacts no initiator and starts nothing.
@@ -160,6 +170,7 @@ pub async fn run(cli: Cli) -> Result<(), Error> {
             ))
             .await
         }
+        Command::Disconnect => host::disconnect(),
         Command::Status => status::status(),
         Command::Clean => clean().await,
         Command::Agent => Ok(agent::serve_stdio().await?),

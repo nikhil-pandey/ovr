@@ -31,7 +31,10 @@ pub fn status() -> Result<(), Error> {
     field(
         "initiator",
         [match state::initiator(&dir)? {
-            Some(initiator) => format!("{}  {}", initiator.addr, initiator.fingerprint),
+            Some(initiator) => format!(
+                "{}  {}  as {}",
+                initiator.addr, initiator.fingerprint, initiator.name
+            ),
             None => {
                 "not paired; run the `ovrd connect ADDR CODE` command `ovr pair` prints".to_owned()
             }

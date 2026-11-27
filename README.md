@@ -52,6 +52,7 @@ ovr winbox -- dotnet build
 ovr unpair winbox       # forget it; it is refused from then on
 ovr status              # on your machine: fingerprint, listening address, tunnels, hosts, files
 ovrd status             # on the host: paired with whom, connected or not, login service, runs
+ovrd disconnect         # on the host: stop serving and forget your machine; its runs keep going
 ```
 
 When the host cannot reach your machine, pair through a tunnel; Cloudflare's needs no account:
