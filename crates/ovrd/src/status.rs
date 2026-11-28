@@ -36,7 +36,8 @@ pub fn status() -> Result<(), Error> {
                 initiator.addr, initiator.fingerprint, initiator.name
             ),
             None => {
-                "not paired; run the `ovrd connect ADDR CODE` command `ovr pair` prints".to_owned()
+                "not paired; run the `ovrd connect ADDR FINGERPRINT-CODE` command `ovr pair` prints"
+                    .to_owned()
             }
         }],
     );

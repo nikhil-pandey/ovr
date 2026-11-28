@@ -22,23 +22,24 @@ use clap::{Parser, Subcommand};
 
 const EXAMPLES: &str = "\
 Examples:
-  ovrd connect 100.64.0.10:7420 7KQX-M4RT      pair with the initiator, then serve it, at login too
-  ovrd connect devtunnel:quiet-river-x1y2z3    move this paired host to a new address
-  ovrd status                                  whether this host is paired and connected, and its runs
-  ovrd disconnect                              stop serving at login and forget the initiator
-  ovrd clean                                   remove checkouts and finished runs not in use
+  ovrd connect 100.64.0.10:7420 FINGERPRINT-7KQX-M4RT    pair with the initiator, then serve it, at login too
+  ovrd connect devtunnel:quiet-river-x1y2z3              move this paired host to a new address
+  ovrd status                                            whether this host is paired and connected, and its runs
+  ovrd disconnect                                        stop serving at login and forget the initiator
+  ovrd clean                                             remove checkouts and finished runs not in use
 
 On your own machine, use `ovr`: it starts the initiator server, and `ovr pair` prints the connect command.";
 
 const CONNECT_HELP: &str = "\
 Examples:
-  ovrd connect 100.64.0.10:7420 7KQX-M4RT                pair, then serve, at login too
-  ovrd connect devtunnel:quiet-river-x1y2z3              move to a new address of the same initiator
-  ovrd connect                                           serve the paired initiator
-  ovrd connect cloudflare:NAME 7KQX-M4RT --foreground    serve until stopped, installing nothing
-  ovrd connect ADDR github:FINGERPRINT --name windows    in a GitHub Actions job, in the background
+  ovrd connect 100.64.0.10:7420 FINGERPRINT-7KQX-M4RT                pair, then serve, at login too
+  ovrd connect devtunnel:quiet-river-x1y2z3                          move to a new address of the same initiator
+  ovrd connect                                                       serve the paired initiator
+  ovrd connect cloudflare:NAME FINGERPRINT-7KQX-M4RT --foreground    serve until stopped, installing nothing
+  ovrd connect ADDR github:FINGERPRINT --name windows                in a GitHub Actions job, in the background
 
-ADDR and CODE come from `ovr pair` on the initiator, `github:FINGERPRINT` from `ovr trust`.";
+ADDR and FINGERPRINT-CODE come from `ovr pair` on the initiator, `github:FINGERPRINT` from `ovr trust`. The host
+checks that the initiator presents FINGERPRINT before it sends anything.";
 
 /// Serve `ovr` runs on this host, and the initiator server `ovr` starts.
 #[derive(Debug, Parser)]
@@ -52,20 +53,21 @@ pub struct Cli {
 pub enum Command {
     /// Pair with an initiator and serve it, at every login too.
     ///
-    /// With a pairing code, pair with the initiator at ADDR, then keep serving it, at every login too. Without a
-    /// code, move a paired host to ADDR, a new address of the same initiator. Without arguments, serve the paired
+    /// With a pairing token, pair with the initiator at ADDR, then keep serving it, at every login too. Without a
+    /// token, move a paired host to ADDR, a new address of the same initiator. Without arguments, serve the paired
     /// initiator.
     #[command(after_help = CONNECT_HELP)]
     Connect {
         /// `host:port`, `cloudflare:HOSTNAME`, `devtunnel:ID`, or `tailcat:ADDRESS`, as printed by `ovr pair` or `ovr tunnel`.
         addr: Option<tunnel::Addr>,
-        /// Pairing code printed by `ovr pair`, or `github:FINGERPRINT` printed by `ovr trust` to serve as this
-        /// GitHub Actions job, in the background until the job ends.
+        /// `FINGERPRINT-CODE` printed by `ovr pair`: the initiator's fingerprint and a pairing code. Or
+        /// `github:FINGERPRINT` printed by `ovr trust`, to serve as this GitHub Actions job, in the background until
+        /// the job ends.
         #[arg(requires = "addr")]
-        code: Option<String>,
+        token: Option<String>,
         /// With `github:FINGERPRINT`, tell this job's host apart from others of the same job, such as a matrix's:
         /// it is named `OWNER/REPO/WORKFLOW/RUN/JOB/NAME`.
-        #[arg(long, requires = "code")]
+        #[arg(long, requires = "token")]
         name: Option<String>,
         /// Serve in the foreground and install nothing to start at login, as on a CI runner.
         #[arg(long, conflicts_with = "service")]
@@ -157,14 +159,14 @@ pub async fn run(cli: Cli) -> Result<(), Error> {
         Command::Serve => until_stopped(server::run()).await,
         Command::Connect {
             addr,
-            code,
+            token,
             name,
             foreground,
             ..
         } => {
             until_stopped(host::connect(
                 addr,
-                code.as_deref(),
+                token.as_deref(),
                 name.as_deref(),
                 foreground,
             ))

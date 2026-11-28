@@ -16,7 +16,7 @@ pub struct PairedHost {
     pub fingerprint: String,
 }
 
-/// The initiator this host dials, as recorded by `ovrd connect ADDR CODE`.
+/// The initiator this host dials, as recorded by `ovrd connect ADDR FINGERPRINT-CODE`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Initiator {
     pub addr: String,
@@ -57,17 +57,32 @@ pub fn hosts(dir: &Path) -> io::Result<Vec<PairedHost>> {
     Ok(read(&hosts_path(dir))?.unwrap_or_default())
 }
 
-/// Records `host`, replacing an earlier pairing under the same name or with the same identity.
+/// Records the host with `fingerprint` as paired, returning its name: the one it already has if it paired before,
+/// else `hostname`, `hostname-2`, `hostname-3`, and so on, the first no other paired host has.
 ///
 /// # Errors
 ///
 /// Returns an error when the records cannot be read or written.
-pub fn add_host(dir: &Path, host: PairedHost) -> io::Result<()> {
+pub fn add_host(dir: &Path, hostname: &str, fingerprint: &str) -> io::Result<String> {
     let mut hosts = hosts(dir)?;
-    hosts.retain(|known| known.name != host.name && known.fingerprint != host.fingerprint);
-    hosts.push(host);
+    if let Some(known) = hosts.iter().find(|known| known.fingerprint == fingerprint) {
+        return Ok(known.name.clone());
+    }
+    // At most one name per host is taken, so one of these is free.
+    let name = (1..=hosts.len() + 1)
+        .map(|n| match n {
+            1 => hostname.to_owned(),
+            n => format!("{hostname}-{n}"),
+        })
+        .find(|name| hosts.iter().all(|known| &known.name != name))
+        .unwrap_or_else(|| hostname.to_owned());
+    hosts.push(PairedHost {
+        name: name.clone(),
+        fingerprint: fingerprint.to_owned(),
+    });
     hosts.sort_by(|a, b| a.name.cmp(&b.name));
-    write(&hosts_path(dir), &hosts)
+    write(&hosts_path(dir), &hosts)?;
+    Ok(name)
 }
 
 /// Forgets the host paired as `name`, returning whether there was one.
@@ -188,19 +203,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn re_pairing_replaces_records_by_name_or_identity() -> io::Result<()> {
+    fn same_named_hosts_get_numbers_and_re_pairing_keeps_the_name() -> io::Result<()> {
         let dir = tempfile::tempdir()?;
         let host = |name: &str, fingerprint: &str| PairedHost {
             name: name.to_owned(),
             fingerprint: fingerprint.to_owned(),
         };
-        add_host(dir.path(), host("winbox", "a"))?;
-        add_host(dir.path(), host("linux", "b"))?;
-        add_host(dir.path(), host("winbox", "c"))?;
-        add_host(dir.path(), host("renamed", "b"))?;
+        assert_eq!(add_host(dir.path(), "winbox", "a")?, "winbox");
+        assert_eq!(add_host(dir.path(), "winbox", "b")?, "winbox-2");
+        assert_eq!(add_host(dir.path(), "renamed", "a")?, "winbox");
+        assert_eq!(add_host(dir.path(), "winbox", "c")?, "winbox-3");
         assert_eq!(
             hosts(dir.path())?,
-            [host("renamed", "b"), host("winbox", "c")]
+            [
+                host("winbox", "a"),
+                host("winbox-2", "b"),
+                host("winbox-3", "c")
+            ]
         );
         Ok(())
     }

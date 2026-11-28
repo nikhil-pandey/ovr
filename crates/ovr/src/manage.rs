@@ -11,8 +11,8 @@ pub async fn pair(tunnel: Option<Provider>) -> Result<i32, Error> {
         eprintln!("opening a {provider} tunnel unless one is open...");
     }
     match daemon::request(Op::Pair { tunnel }).await? {
-        (_, Response::Pair { addr, code }) => {
-            println!("run this on the host within 10 minutes:\n  ovrd connect {addr} {code}");
+        (_, Response::Pair { addr, token }) => {
+            println!("run this on the host within 10 minutes:\n  ovrd connect {addr} {token}");
             Ok(0)
         }
         (_, other) => Err(daemon::unexpected(other)),

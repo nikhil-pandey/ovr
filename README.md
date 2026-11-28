@@ -45,14 +45,14 @@ ovr get bigbox target/doc out/             # copy files back: out/doc/..., skipp
 Hosts you cannot SSH to dial in instead. Pair one by running the command `ovr pair` prints on it:
 
 ```sh
-ovr pair                # on your machine: prints `ovrd connect ADDR CODE`
-ovrd connect ADDR CODE  # on the host: pairs, and serves from then on, at login too
-ovr hosts               # every host: paired, trusted, and SSH, with state and platform
+ovr pair                   # on your machine: prints `ovrd connect ADDR FP-CODE`
+ovrd connect ADDR FP-CODE  # on the host: pairs, and serves from then on, at login too
+ovr hosts                  # every host: paired, trusted, and SSH, with state and platform
 ovr winbox -- dotnet build
-ovr unpair winbox       # forget it; it is refused from then on
-ovr status              # on your machine: fingerprint, listening address, tunnels, hosts, files
-ovrd status             # on the host: paired with whom, connected or not, login service, runs
-ovrd disconnect         # on the host: stop serving and forget your machine; its runs keep going
+ovr unpair winbox          # forget it; it is refused from then on
+ovr status                 # on your machine: fingerprint, listening address, tunnels, hosts, files
+ovrd status                # on the host: paired with whom, connected or not, login service, runs
+ovrd disconnect            # on the host: stop serving and forget your machine; its runs keep going
 ```
 
 When the host cannot reach your machine, pair through a tunnel; Cloudflare's needs no account:

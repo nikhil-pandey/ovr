@@ -294,9 +294,10 @@ pub enum Response {
     Hosts {
         hosts: Vec<HostStatus>,
     },
+    /// `token` is `FINGERPRINT-CODE`: this initiator's fingerprint and a pairing code.
     Pair {
         addr: String,
-        code: String,
+        token: String,
     },
     /// The host was forgotten; `disconnected` when its connection was open and is now closed.
     Unpaired {
@@ -482,11 +483,12 @@ pub struct Banner {
     pub platform: Platform,
 }
 
-/// `PAIR`: a host redeeming a pairing code. `mac` is hex HMAC-SHA256 keyed by the code; see `ovrd`'s pairing.
+/// `PAIR`: a host redeeming a pairing code, sent only once the initiator presented the fingerprint the code came
+/// with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pair {
     pub hostname: String,
-    pub mac: String,
+    pub code: String,
 }
 
 /// `FEDERATED`: a host that is not paired asks to serve as a workload its identity provider vouches for. `token`
@@ -506,8 +508,9 @@ pub struct Accepted {
     pub name: String,
 }
 
-/// `PAIR_OK`: the initiator proves it knows the code too.
+/// `PAIR_OK`: the name the initiator paired the host under: its hostname, with a number added while another paired
+/// host has that name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairOk {
-    pub mac: String,
+    pub name: String,
 }

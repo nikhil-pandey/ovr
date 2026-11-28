@@ -10,16 +10,23 @@ use ovr_proto::msg::{Accepted, Banner, Failure, Federated, Pair, PairOk};
 use ovr_proto::{Frame, FrameKind, PROTOCOL_VERSION};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::AbortHandle;
 use tokio_rustls::TlsAcceptor;
 
 use super::{PORT, Server};
 use crate::mux::{self, Mux};
-use crate::state::PairedHost;
-use crate::{Error, pairing, state, tls};
+use crate::{Error, state, tls};
 
 /// Bounds the handshake and first frame, so idle connections cannot pile up.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many connections, over both listeners, may be in the TLS handshake or reading the first frame at once. More
+/// are closed at once; a flood can still crowd out hosts until its connections time out.
+const MAX_HANDSHAKES: usize = 64;
+
+/// How long to wait after a failed accept, as when out of file descriptors, before accepting again.
+const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 
 /// How long to wait for the dial-in port to be free.
 const BIND_WAIT: Duration = Duration::from_secs(5);
@@ -45,37 +52,61 @@ pub async fn listen(server: Arc<Server>) -> Result<Vec<AbortHandle>, Error> {
         }
     };
     tracing::info!("listening for dial-in hosts on port {PORT}");
+    let handshakes = Arc::new(Semaphore::new(MAX_HANDSHAKES));
     let mut accepting = Vec::new();
     // Where the platform allows a more specific address beside the wildcard one (macOS), claim loopback too, so a
     // `devtunnel connect` on this machine cannot take it and loop dial-ins to this server back into the tunnel.
     if let Ok(loopback) = TcpListener::bind((Ipv4Addr::LOCALHOST, PORT)).await {
         accepting.push(
-            tokio::spawn(accept(loopback, Arc::clone(&server), acceptor.clone())).abort_handle(),
+            tokio::spawn(accept(
+                loopback,
+                Arc::clone(&server),
+                acceptor.clone(),
+                Arc::clone(&handshakes),
+            ))
+            .abort_handle(),
         );
     }
-    accepting.push(tokio::spawn(accept(listener, server, acceptor)).abort_handle());
+    accepting.push(tokio::spawn(accept(listener, server, acceptor, handshakes)).abort_handle());
     Ok(accepting)
 }
 
-async fn accept(listener: TcpListener, server: Arc<Server>, acceptor: TlsAcceptor) {
+async fn accept(
+    listener: TcpListener,
+    server: Arc<Server>,
+    acceptor: TlsAcceptor,
+    handshakes: Arc<Semaphore>,
+) {
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(err) => {
                 tracing::warn!(%err, "accept failed");
+                tokio::time::sleep(ACCEPT_PAUSE).await;
                 continue;
             }
         };
+        let Ok(permit) = Arc::clone(&handshakes).try_acquire_owned() else {
+            tracing::debug!(%peer, "too many dial-in handshakes; closing");
+            continue;
+        };
         let (server, acceptor) = (Arc::clone(&server), acceptor.clone());
         tokio::spawn(async move {
-            if let Err(err) = handle(&server, &acceptor, tcp).await {
+            if let Err(err) = handle(&server, &acceptor, tcp, permit).await {
                 tracing::info!(%peer, %err, "dial-in connection ended");
             }
         });
     }
 }
 
-async fn handle(server: &Server, acceptor: &TlsAcceptor, tcp: TcpStream) -> Result<(), Error> {
+/// Holds `permit` over the handshake and the first frame's read, and releases it before admission, so an admitted
+/// host's session is not limited.
+async fn handle(
+    server: &Server,
+    acceptor: &TlsAcceptor,
+    tcp: TcpStream,
+    permit: OwnedSemaphorePermit,
+) -> Result<(), Error> {
     mux::tune(&tcp)?;
     let (mut tls, first) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let mut tls = frame::framed(acceptor.accept(tcp).await?);
@@ -84,6 +115,7 @@ async fn handle(server: &Server, acceptor: &TlsAcceptor, tcp: TcpStream) -> Resu
     })
     .await
     .map_err(|_| Error::Invalid("handshake timed out".to_owned()))??;
+    drop(permit);
     let fingerprint = tls::peer_fingerprint(tls.get_ref().get_ref().1.peer_certificates())
         .ok_or_else(|| Error::Invalid("no client certificate".to_owned()))?;
     match first.kind {
@@ -94,7 +126,8 @@ async fn handle(server: &Server, acceptor: &TlsAcceptor, tcp: TcpStream) -> Resu
     }
 }
 
-/// Completes `ovrd connect ADDR CODE` when the host proves it holds a code issued here.
+/// Completes `ovrd connect ADDR FINGERPRINT-CODE` for a host that holds a code issued here, which it sends only
+/// after checking this initiator's fingerprint.
 async fn pair<S>(
     server: &Server,
     stream: &mut Framed<S>,
@@ -105,14 +138,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request: Pair = frame.parse()?;
-    let initiator = &server.identity.fingerprint;
-    let proof = pairing::Proof::host(initiator, host, &request.hostname);
-    let code = server
+    let redeemed = server
         .codes
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .redeem(|code| proof.verify(code, &request.mac));
-    let Some(code) = code else {
+        .redeem(&request.code);
+    if !redeemed {
         let message = "the pairing code is wrong or has expired; run `ovr pair` again".to_owned();
         stream
             .send(Frame::json(FrameKind::Error, &Failure { message })?)
@@ -121,25 +152,22 @@ where
             "failed pairing attempt from {}",
             request.hostname
         )));
-    };
-    let name = valid_name(&request.hostname)?;
-    {
+    }
+    let hostname = valid_name(&request.hostname)?;
+    let name = {
         let _pairing = server
             .pairing
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        state::add_host(
-            &server.dir,
-            PairedHost {
-                name: name.clone(),
-                fingerprint: host.to_owned(),
-            },
-        )?;
+        let name = state::add_host(&server.dir, &hostname, host)?;
         server.dialed.forget_seen(&name);
-    }
-    let mac = pairing::Proof::initiator(initiator, host).sign(&code);
+        name
+    };
     stream
-        .send(Frame::json(FrameKind::PairOk, &PairOk { mac })?)
+        .send(Frame::json(
+            FrameKind::PairOk,
+            &PairOk { name: name.clone() },
+        )?)
         .await?;
     stream.close().await?;
     tracing::info!(name, "paired");

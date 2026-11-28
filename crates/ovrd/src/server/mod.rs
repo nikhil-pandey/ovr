@@ -367,7 +367,8 @@ impl Server {
             .unwrap_or_else(PoisonError::into_inner)
             .issue()
             .map_err(|_| Error::Invalid("the system random number generator failed".to_owned()))?;
-        Ok(Response::Pair { addr, code })
+        let token = format!("{}-{code}", self.identity.fingerprint);
+        Ok(Response::Pair { addr, token })
     }
 
     /// Forgets the paired host `host` and closes its connection, if open. Its runs keep going on the host.
