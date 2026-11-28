@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/nikhil-pandey/ovr/compare/v0.2.7...v0.3.0) - 2026-11-28
+
+### Added
+
+- [**breaking**] harden dial-in pairing and admission ([#25](https://github.com/nikhil-pandey/ovr/pull/25))
+- [**breaking**] split ovr and ovrd by role and make state visible on both sides ([#23](https://github.com/nikhil-pandey/ovr/pull/23))
+
 ## [0.2.7](https://github.com/nikhil-pandey/ovr/compare/v0.2.6...v0.2.7) - 2026-11-18
 
 ### Added
